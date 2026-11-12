@@ -1,0 +1,47 @@
+# Copyright 2026 Felix Kahle
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# How the build script writes `include/kahlnws.h` from the crate's sources: C99 that a C++ compiler reads as well,
+# every name the header declares prefixed `kahlnws_` or `KAHLNWS_`, and every doc comment carried over. The build
+# script adds the overview and the version macros after the includes, and rewrites the docs for a C reader.
+
+language = "C"
+header = """
+// Copyright 2026 Felix Kahle
+// SPDX-License-Identifier: MIT OR Apache-2.0"""
+autogen_warning = """
+// Written by the build from the library's sources: edit those, not this file."""
+include_guard = "KAHLNWS_H_0F9A793A_BC8A_421B_8E0E_B5B356E26F84" # hash to avoid collisions at all costs
+# The `extern "C"` block a C++ compiler needs around the declarations.
+cpp_compat = true
+# Only what the declarations use: `size_t`, the exact-width integers and `char`.
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+documentation = true
+documentation_style = "doxy"
+# A struct is named both by its tag and by its typedef, so `struct kahlnws_problem` and `kahlnws_problem` both work.
+style = "both"
+# Rust's `usize` is C's `size_t` on every target the crate builds for.
+usize_is_size_t = true
+line_length = 120
+
+[export.rename]
+"Solver" = "kahlnws_solver"
+"Problem" = "kahlnws_problem"
+"StatusCode" = "kahlnws_status"
+"Int128" = "kahlnws_int128"
+"UInt128" = "kahlnws_uint128"
+"Refusal" = "kahlnws_refusal"
+"RefusalKind" = "kahlnws_refusal_kind"
+"Work" = "kahlnws_work"
+
+[fn]
+# Every function is declared after `KAHLNWS_API`, and one marked `#[must_use]` also after `KAHLNWS_NODISCARD`; the
+# preamble the build script inserts defines both.
+prefix = "KAHLNWS_API"
+must_use = "KAHLNWS_NODISCARD"
+
+[struct]
+# `KAHLNWS_STATUS_OPTIMAL`, `KAHLNWS_REFUSAL_KIND_TOO_LARGE`: a constant named by its type's name in capitals before
+# its own.
+rename_associated_constant = "ScreamingSnakeCase"

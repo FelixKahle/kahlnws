@@ -1,0 +1,207 @@
+# How it works
+
+For a reader who knows linear programming and wants to know what a solve does, without reading the code first. The
+method is the primal network simplex with a strongly feasible spanning-tree basis, block search for pricing, and a
+threaded tree. The notation is that of [the problem and the guarantees](problem-and-guarantees.md): $n$ nodes, $m$
+arcs, costs $c$, lower bounds $l$, capacities $u$, supplies $b$, potentials $\pi$.
+
+## The problem the solve works on
+
+Two transformations happen before the first pivot.
+
+**Lower bounds are taken out.** Every arc starts at its lower bound, so the solve works on the flow above it,
+$x'_{ij} = x_{ij} - l_{ij}$, within the arc's width $0 \le x'_{ij} \le u_{ij} - l_{ij}$. Each node's supply becomes its
+net supply, what is left to route once every arc carries its lower bound:
+
+```math
+b'_i = b_i - \sum_{(i,j) \in A} l_{ij} + \sum_{(j,i) \in A} l_{ji} .
+```
+
+Here $b$ is `supplies` and $l$ is `lower_bounds`. When the flows are written out, each arc's lower bound is added
+back.
+
+**A root is added.** The network gets one more node, the root, and each node $v$ a root link that joins it to the
+root. The basis is a spanning tree of these $n + 1$ nodes, and the root links make one exist for every problem.
+
+## The starting basis
+
+The solve starts from the star: every node hangs from the root by its own root link, and every arc is out of the tree
+at its lower bound, carrying nothing above it.
+
+- A node of net supply zero or more has a root link that points up, from the node to the root, at cost $0$, carrying
+  its net supply.
+- A node of negative net supply has a root link that points down, from the root to the node, at the root cost $M$,
+  carrying its demand.
+
+The root cost is the least value that a path of arcs can never undercut:
+
+```math
+M = (n - 1) \, C + 1 ,
+```
+
+where $C$ is the largest magnitude of a cost. A path between two nodes has at most $n - 1$ arcs, so its cost lies
+strictly between $-M$ and $M$. Every root link has the capacity $2^{64} - 1$, and the range of the net supplies
+ensures that none of them ever limits a pivot in the direction it points.
+
+This start is feasible for the extended network, so the solve has a single phase. Routing a unit through the root
+costs $M$, more than any path of arcs, so at the end a root link carries flow exactly where no flow of the problem
+exists: that is how the solve decides infeasibility.
+
+## The basis
+
+A basis is a spanning tree of the $n + 1$ nodes, every arc out of the tree standing at one of its bounds, and a flow
+that meets every net supply. The arcs out of the tree fix the flow on the tree links, since a tree has one way to
+route what the arcs out of it leave.
+
+The potentials are those the tree implies: the root's is zero, and every tree link is tight, its reduced cost zero.
+
+```math
+\bar c_{ij} = c_{ij} + \pi_i - \pi_j = 0 \quad \text{for every link } (i,j) \text{ of the tree.}
+```
+
+Here $c$ is `costs` and $\pi$ is `potentials`. An arc out of the tree violates its bound where moving it off that bound
+would lower the cost: an arc at its lower bound with $\bar c_{ij} < 0$, or an arc at its capacity with
+$\bar c_{ij} > 0$. The solve keeps each arc's state as its pricing sign $\sigma_{ij}$, $+1$ at the lower bound and
+$-1$ at the capacity, so that one product decides:
+
+```math
+\text{the arc violates} \iff \sigma_{ij} \, \bar c_{ij} < 0 .
+```
+
+An arc in the tree, or an arc of no width, has the sign $0$ and never violates. Where no arc violates, the flow meets
+the optimality conditions and is optimal.
+
+The basis is strongly feasible: every tree link can carry more flow toward the root, a link that points up carries
+less than its capacity, and a link that points down carries some flow. The leaving rule keeps it so, and that is what
+makes the method end.
+
+## A pivot
+
+A pivot brings one violating arc into the basis.
+
+1. **The cycle.** The entering arc and the tree path between its ends form a cycle. Flow is sent around it in the
+   direction that moves the arc off its bound. The two ends climb toward their deepest common ancestor, the apex: at
+   each step, the end whose subtree is the smaller moves to its parent.
+2. **The ratio test.** On the same climb, each link's room in the direction of the cycle's flow is read: its capacity
+   less its flow where the flow runs the way the link points, its flow otherwise. The step is the least room on the
+   cycle, the entering arc's own width included.
+3. **The leaving link.** Among the links of least room, the last one met when the cycle is walked from the apex in
+   the direction of its flow leaves the tree; the entering arc is met in that walk between the two sides. This is the
+   strongly feasible leaving rule. Where the last of least room met is the entering arc itself, no link leaves and
+   the arc moves to its other bound: a flip.
+4. **The flow update.** The step is sent around the cycle: along the entering arc, down one side of the cycle from
+   the apex and up the other. A step of zero is a degenerate pivot; the flow stays as it was.
+5. **The tree update.** The leaving link cuts a subtree off the tree. That subtree is hung under the far end of the
+   entering arc, by the entering arc. Along the stem, the path from the entering arc's end up to the node whose link
+   left, each node now hangs from the node that was below it; every other node keeps its parent.
+6. **The potentials.** Only the moved subtree's potentials change, all by the same amount, the entering arc's reduced
+   cost or its negation, so that the entering arc becomes tight. Nothing outside the subtree is touched.
+
+A pivot costs the length of the cycle for steps 1 to 4, and the size of the moved subtree and the paths it touches for
+steps 5 and 6. No step passes over the whole tree.
+
+## Why the method ends
+
+Costs and widths are fixed for the solve, so the potentials are a function of the tree. Each pivot is of one of three
+kinds:
+
+- A pivot that sends flow lowers the cost of the flow, root links counted at their costs, by the step times the
+  magnitude of the entering arc's reduced cost: at least one, since both are whole numbers. The cost is an integer
+  bounded below, so there are finitely many such pivots.
+- A degenerate pivot has a leaving link of room zero. Strong feasibility gives every link on the side where the flow
+  runs toward the root room above zero, and the entering arc has width above zero, so the leaving link lies on the
+  other side, and the moved subtree's potentials rise strictly. Within a run of degenerate pivots the sum of the
+  potentials rises at every pivot, so no tree repeats, and there are finitely many trees.
+- A flip sends the arc's whole width, which is above zero: a pivot of the first kind.
+
+An arc whose width is zero is never priced. It carries its lower bound in every flow within the bounds, it would only
+ever enter to send nothing, and it meets the optimality conditions whatever its reduced cost. The argument uses no
+property of the rule that chooses the entering arc, so it holds for every pivot of a solve.
+
+## Choosing the entering arc
+
+### The order of the arcs
+
+The pricing scans the arcs in a dealt order rather than in the order given. With the stride
+
+```math
+s = \max\left(1, \left\lceil \frac{m}{n} \right\rceil\right) ,
+```
+
+arc 0 goes to slot 0, the next arcs to slots $s, 2s, \dots$ below $m$, then to $1, 1 + s, \dots$, and so on. Problems
+often list each node's arcs together, about $m / n$ of them a node; with the stride, consecutive slots hold arcs at
+least that far apart, so a block of slots samples the whole network rather than one corner of it. A stride of one
+keeps the given order.
+
+### Block search
+
+The slots are priced in blocks of
+
+```math
+B = \max\left(1, \left\lfloor \sqrt{m} \right\rfloor\right)
+```
+
+consecutive slots. A search starts at the slot where the last search stopped, wraps around once, and stops at the end
+of the first block in which some arc violated; it enters the most violating arc it has priced, the first met among
+equals. Where no arc violates, the search prices every slot once and the solve ends. A block of one slot would enter
+the first violating arc, a block of all slots the most violating one; $\sqrt{m}$ is the geometric mean of 1 and
+$m$.
+
+### The first pivots
+
+Before block search starts, the solve tries a few arcs chosen from the problem's structure, at most one per node:
+
+- with exactly one node of positive net supply and one of negative, the arcs by which a search backwards from the
+  demand node, over arcs wide enough to carry the whole supply, first reaches each node, until it reaches the supply
+  node: entered in turn, a path of them routes the supply at once;
+- otherwise, the cheapest arc that enters each demand node, the lowest arc among equals.
+
+Only arcs of positive width that are not loops are chosen. Each chosen arc enters only where it violates when its turn
+comes, so the choice changes the path a solve takes, never whether it ends optimal or infeasible, nor the optimal
+cost. The work counts these pivots as
+`first_arc_pivots`.
+
+## The threaded tree
+
+The tree is stored as columns indexed by node, the root last, so that the apex of a cycle is found and a subtree moved
+at the cost of the paths they touch.
+
+| Column | Per | What it holds | What it is for |
+|---|---|---|---|
+| parent | tree node | the node it hangs from; the root's is itself | the climb to the apex, the stem |
+| parent link | node | its link: an arc's slot, or $m + v$ for node $v$'s root link | the ratio test, the flow update |
+| direction | node | whether that link points up to the parent or down from it | the room of a link, the flow update |
+| thread | tree node | the next node in a preorder of the tree | walking a subtree |
+| reverse thread | tree node | the node before it in that preorder | cutting a subtree out |
+| last successor | tree node | the last node of its subtree in the preorder | where a subtree's run ends |
+| subtree size | tree node | the number of nodes in its subtree | choosing which end of a cycle climbs |
+| potential | tree node | its potential; the root's is zero | pricing, and the shift of a moved subtree |
+
+In the preorder each subtree is one contiguous run that starts at its top node and ends at its last successor. The
+tree update cuts the moved subtree's run out of the thread, rethreads the stem, and splices the run in after its new
+parent; the sizes change only on the paths from the two ends of the cycle up to the apex, and the last successors only
+where a run ended where the subtree left or arrived.
+
+## The layout of the columns
+
+Every column the solve reads in a loop is laid out for the way that loop reads it.
+
+- **The priced columns are in slot order.** For each slot the pricing reads the arc's two ends, stored together as
+  two 32-bit indices, its cost, a 64-bit integer, and its state, one byte: 17 bytes, in three columns read in
+  sequence. The only reads out of sequence are the two potentials of the arc's ends.
+- **One index space for arcs and links.** The capacities and the flows are columns of $m + n$ entries: the arcs at
+  their slots, then each node's root link. A tree node's parent link is then the index of its flow and its capacity,
+  so the ratio test and the flow update read them without translating an index.
+- **Widths, not two bounds.** Since the lower bounds are taken out, a link's room is its capacity less its flow, or
+  its flow, depending on the direction the cycle's flow runs on it. Both are formed and one is selected, so the ratio
+  test does not branch on a direction that is up as often as down.
+- **One potential column.** The shift of a moved subtree is one read and one write per node.
+- **Narrow indices.** Every index the tree and the arc columns store, of a node, a slot or a link, has 32 bits.
+  The walks up the tree read one stored index per node, each read depending on the one before, so their speed is
+  that of the cache the columns fit in, and a narrow index halves the bytes. The range checks keep every index below
+  $2^{32}$.
+- **Columns, not records.** Each quantity is its own column, so the one-byte state pads nothing and each loop reads
+  only the columns it needs.
+
+The caller's order is kept at the edge: the flows are written in arc order, read back from the slots, and the
+potentials are answered in node order, since nodes are never renumbered.

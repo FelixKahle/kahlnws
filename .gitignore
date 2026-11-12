@@ -1,0 +1,26 @@
+# Copyright 2026 Felix Kahle
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Build output. `Cargo.lock` is tracked: tests and benchmarks build the same dependency versions on every machine.
+# Proptest's `*.proptest-regressions` files are tracked too: a failure found once is replayed on every run after it.
+/target
+**/*.rs.bk
+
+# Operating systems
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python: the environments the binding's check makes, the build output, the caches of its tools.
+.venv/
+__pycache__/
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

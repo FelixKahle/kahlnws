@@ -1,0 +1,35 @@
+# Copyright 2026 Felix Kahle
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "kahlnws_capi"
+description = "The C interface of kahlnws: its solver behind an opaque handle, its answers as statuses and plain data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# The build script and the text steps it shares with the test target `header_text`.
+build = "build/main.rs"
+
+[lints]
+workspace = true
+
+# A static and a dynamic library for C programs to link, and the Rust library the crate's own tests call the entries
+# through.
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# The solver the entries call.
+kahlnws = { workspace = true }
+
+[build-dependencies]
+# The build script's writer of `include/kahlnws.h` from the crate's sources and `cbindgen.toml`.
+cbindgen = { workspace = true }
+
+[dev-dependencies]
+# The counting allocator, for the test that a reserved solver's solve allocates nothing.
+kahlnws_testing = { workspace = true }

@@ -1,0 +1,32 @@
+# Copyright 2026 Felix Kahle
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# The reference of the C interface, built from the comments of its header: run `doxygen` in this folder and open
+# `../../target/doxygen/html/index.html`. Every setting left out keeps its default; a warning fails the run.
+
+PROJECT_NAME           = kahlnws
+PROJECT_BRIEF          = "A primal network simplex for the min-cost flow problem on exact integers"
+
+INPUT                  = include/kahlnws.h
+# Beside the build's other output, so that nothing generated lies in the source tree.
+OUTPUT_DIRECTORY       = ../../target/doxygen
+GENERATE_LATEX         = NO
+OPTIMIZE_OUTPUT_FOR_C  = YES
+
+# The header declares each struct under a tag and a typedef of the same name: one entry for both.
+TYPEDEF_HIDES_STRUCT   = YES
+# The include guard is no part of the interface.
+EXCLUDE_SYMBOLS        = KAHLNWS_H_*
+
+# Each declaration reads without the two macros that precede it.
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = KAHLNWS_API= KAHLNWS_NODISCARD=
+
+# Everything that is declared is documented, with every parameter and every answer.
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_IF_INCOMPLETE_DOC = YES
+WARN_NO_PARAMDOC       = YES
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
+QUIET                  = YES

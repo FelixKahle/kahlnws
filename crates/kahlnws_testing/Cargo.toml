@@ -1,0 +1,33 @@
+# Copyright 2026 Felix Kahle
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "kahlnws_testing"
+description = "Test infrastructure shared by the kahlnws workspace's tests and benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The LP oracle `lp_optimum`, a model on an LP solver built from bundled sources with cmake; held here so that the
+# library's manifest does not name it. Its features are set once in the workspace.
+culmen = { workspace = true }
+# The tiny-network strategies the property tests of the workspace draw from, and this crate's own property tests; an
+# ordinary dependency, since this crate is only ever a dev-dependency, so no test tool reaches a published manifest.
+proptest = { workspace = true }
+# `izip!` in the brute force's step to the next flow; `zip_eq` in the LP oracle's rows, a network's excesses and the
+# sized assignment shape's demand arcs; `tuple_windows` along the chains of the seeded and the sized supply shape;
+# `iproduct!` over the grid's nodes.
+itertools = { workspace = true }
+# `CertificateBreach`, the breach `check_certificate` names, and `ShapeBreach`, the broken shape a model refuses.
+thiserror = { workspace = true }
+# The generators the sized networks draw each kind of number from, and the seeds of the benchmark networks.
+rand_xoshiro = { workspace = true }
+# Ranges and partial shuffles drawn from them.
+rand = { workspace = true }

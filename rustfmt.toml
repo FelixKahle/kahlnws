@@ -1,0 +1,11 @@
+# Copyright 2026 Felix Kahle
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Formatting for the whole workspace: `cargo fmt --all`.
+
+edition = "2024"
+max_width = 120
+use_small_heuristics = "Max"
+use_field_init_shorthand = true
+use_try_shorthand = true
+newline_style = "Unix"
