@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Min-cost networks drawn from a seed, larger than a brute force enumerates: the supply shape, the assignment shape
-//! and general networks with lower bounds, for the tests that check a solver against the LP oracle. A seed is a list
+//! and general networks with lower bounds, for the tests that check a solver against the LP oracle; and a network
+//! with a few of its numbers moved, for the tests that solve a sequence of networks on the same arcs. A seed is a list
 //! of numbers read cyclically, so a network is a function of its seed alone.
 
 use itertools::Itertools;
@@ -86,6 +87,40 @@ pub fn general(seed: &[u64]) -> MincostNetwork {
     }
 
     construction.network
+}
+
+/// `network` with a few of its numbers moved, drawn from `seed`: the same nodes and the same arcs between the same
+/// ends, one to three of its supplies moved in balanced pairs, from one node to another by 0 to 3 units each, about
+/// one arc in three with its capacity moved by up to 2 units either way and never below its lower bound, and about one
+/// in three with its cost moved by up to 2 either way. A sequence of networks, each perturbed from the last, is what a
+/// solve from the basis of the solve before is tried on. It reads at most [`perturbation_draws`] numbers of `seed`, so
+/// a seed that long gives every draw a number of its own.
+///
+/// # Panics
+/// Panics if `seed` is empty, if the shape of `network` is broken, or if a moved supply or cost passes the range of an
+/// `i64`, which no network of the seeded generators comes near.
+pub fn perturbed(network: &MincostNetwork, seed: &[u64]) -> MincostNetwork {
+    assert!(!seed.is_empty(), "called `perturbed` with an empty seed");
+    if let Err(breach) = network.shaped() {
+        panic!("called `perturbed` on a network of broken shape: {breach}");
+    }
+
+    let mut construction = Construction { draws: Draws::new(seed), network: network.clone() };
+    construction.move_supplies();
+    construction.nudge_arcs();
+
+    construction.network
+}
+
+/// The most numbers [`perturbed`] reads from its seed for a network of `arc_count` arcs: `10 + 4·arc_count`.
+///
+/// # Panics
+/// Panics if the count passes `usize::MAX`, which no network in memory comes near.
+pub const fn perturbation_draws(arc_count: usize) -> usize {
+    // One draw for how many supplies move, three for each of at most three moves (the node it leaves, the node it
+    // reaches and the amount), and at most four per arc: whether its capacity moves and by how much, then whether its
+    // cost moves and by how much.
+    arc_count.strict_mul(4).strict_add(1 + 3 * 3)
 }
 
 /// A network under construction and the draws it is made from.
@@ -283,6 +318,45 @@ impl<'a> Construction<'a> {
         self.network.add_node(-total);
     }
 
+    /// Moves one to three amounts of 0 to 3 units, each from the supply of one drawn node to that of another; a
+    /// network of no node keeps its supplies and takes no draw.
+    ///
+    /// # Panics
+    /// Panics if a supply passes the range of an `i64`.
+    fn move_supplies(&mut self) {
+        let node_count = self.network.node_count();
+        if node_count == 0 {
+            return;
+        }
+
+        for _ in 0..1 + self.draws.below(3) {
+            let (from, to) = (self.draws.index_below(node_count), self.draws.index_below(node_count));
+            let amount = self.draws.supply_below(4);
+
+            let supplies = &mut self.network.supplies;
+            supplies[from] = supplies[from].strict_sub(amount);
+            supplies[to] = supplies[to].strict_add(amount);
+        }
+    }
+
+    /// Arc by arc, one time in three moves its capacity by up to 2 units either way, never below its lower bound, and
+    /// then one time in three its cost by up to 2 either way. A capacity stays within `u64`.
+    ///
+    /// # Panics
+    /// Panics if an arc has no lower bound, or a cost passes the range of an `i64`.
+    fn nudge_arcs(&mut self) {
+        for arc in 0..self.network.arc_count() {
+            if self.draws.below(3) == 0 {
+                let moved = self.network.capacities[arc].saturating_add(self.draws.below(5)).saturating_sub(2);
+                self.network.capacities[arc] = moved.max(self.network.lower_bounds[arc]);
+            }
+            if self.draws.below(3) == 0 {
+                let shift = i64::try_from(self.draws.below(5)).expect("a draw below 5 should fit an i64") - 2;
+                self.network.costs[arc] = self.network.costs[arc].strict_add(shift);
+            }
+        }
+    }
+
     /// One arc of a general network between any two of its nodes: one time in six fixed at a lower bound of 1 to 3,
     /// one time in six of no room, otherwise of a width below 9 above a lower bound that is 1 to 3 one time in four
     /// and zero otherwise; its cost below 20.
@@ -393,6 +467,8 @@ impl Signs {
 
 #[cfg(test)]
 mod tests {
+    use core::iter;
+
     use super::*;
 
     #[test]
@@ -523,6 +599,91 @@ mod tests {
     #[should_panic(expected = "called `general` with an empty seed")]
     fn test_general_refuses_an_empty_seed() {
         let _ = general(&[]);
+    }
+
+    #[test]
+    fn test_perturbed_moves_supplies_capacities_and_costs_by_hand() {
+        // Seed 0, 0, 2, 3, 0, 4, 2, 0, 0: one move, 3 % 4 = 3 units from node 0 to node 2. Arc 0's capacity moves by
+        // 4 − 2 to 7, its cost stays, as 2 % 3 = 2; arc 1's capacity by 0 − 2 to 2, held at its lower bound 3, and its
+        // cost, the seed read again from its start, by 0 − 2 to −3.
+        let network = MincostNetwork::from_arcs(&[3, 0, -3], &[(0, 1, 0, 5, 2), (1, 2, 3, 4, -1)]);
+        let moved = perturbed(&network, &[0, 0, 2, 3, 0, 4, 2, 0, 0]);
+
+        assert_eq!(moved, MincostNetwork::from_arcs(&[0, 0, 0], &[(0, 1, 0, 7, 2), (1, 2, 3, 3, -3)]));
+    }
+
+    #[test]
+    fn test_perturbation_draws_is_exactly_what_a_perturbation_taking_every_draw_reads() {
+        // Seed 2, then zeros: three moves of nothing from node 0 to node 0, then every arc's capacity and cost moved
+        // by 0 − 2, so the perturbation takes every draw it can. A seed of exactly the bound perturbs as the same seed
+        // with more numbers after it; a seed one number short is read again from its start for the last draw, the
+        // last arc's cost moving by 2 − 2 instead of 0 − 2.
+        let network = MincostNetwork::from_arcs(&[3, 0, -3], &[(0, 1, 0, 5, 2), (1, 2, 1, 4, -1), (0, 2, 0, 9, 7)]);
+        let draws = perturbation_draws(network.arc_count());
+        let seed: Vec<u64> = iter::once(2).chain(iter::repeat_n(0, draws - 1)).collect();
+        let longer: Vec<u64> = seed.iter().copied().chain([1, 1, 1, 1]).collect();
+
+        let moved = perturbed(&network, &seed);
+        assert_eq!(draws, 22);
+        assert_eq!(
+            moved,
+            MincostNetwork::from_arcs(&[3, 0, -3], &[(0, 1, 0, 3, 0), (1, 2, 1, 2, -3), (0, 2, 0, 7, 5)])
+        );
+        assert_eq!(perturbed(&network, &longer), moved);
+        assert_ne!(perturbed(&network, &seed[..draws - 1]), moved);
+    }
+
+    #[test]
+    fn test_perturbed_keeps_a_network_of_no_node() {
+        assert_eq!(perturbed(&MincostNetwork::default(), &[5, 1]), MincostNetwork::default());
+    }
+
+    #[test]
+    fn test_perturbed_keeps_the_arcs_and_moves_every_kind_of_number_within_its_range() {
+        let (mut supplies, mut capacities, mut costs) = (false, false, false);
+
+        for first in 0..60_u64 {
+            let seed = [first, first * 7 + 3, first * 13 + 5, first * 31 + 1, 17, 4, 9, 2];
+            for network in [general(&seed), supply_shaped(&seed)] {
+                // Shifts of one spread number, so that the residues the draws take vary from number to number.
+                let spread = (first + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let moved = perturbed(&network, &[spread >> 3, spread >> 13, spread >> 23, spread >> 33, spread >> 43]);
+
+                assert_eq!(
+                    (&moved.tails, &moved.heads, &moved.lower_bounds),
+                    (&network.tails, &network.heads, &network.lower_bounds)
+                );
+                assert_eq!(moved.supplies.iter().sum::<i64>(), 0, "{seed:?}");
+                let supply_moves: i64 =
+                    moved.supplies.iter().zip(&network.supplies).map(|(after, before)| (after - before).abs()).sum();
+                assert!(supply_moves <= 2 * 3 * 3, "at most three moves of at most three units: {supply_moves}");
+
+                for arc in 0..network.arc_count() {
+                    let (before, after, lower) =
+                        (network.capacities[arc], moved.capacities[arc], network.lower_bounds[arc]);
+                    assert!(after >= lower && (after.abs_diff(before) <= 2 || after == lower), "{before} to {after}");
+                    assert!(moved.costs[arc].abs_diff(network.costs[arc]) <= 2);
+                }
+
+                supplies |= moved.supplies != network.supplies;
+                capacities |= moved.capacities != network.capacities;
+                costs |= moved.costs != network.costs;
+            }
+        }
+
+        assert!(supplies && capacities && costs, "{supplies} {capacities} {costs}");
+    }
+
+    #[test]
+    #[should_panic(expected = "called `perturbed` with an empty seed")]
+    fn test_perturbed_refuses_an_empty_seed() {
+        let _ = perturbed(&general(&[3]), &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `perturbed` on a network of broken shape: arc 0 has end 4, outside the 2 nodes")]
+    fn test_perturbed_refuses_a_network_of_broken_shape() {
+        let _ = perturbed(&MincostNetwork::from_arcs(&[0, 0], &[(0, 4, 0, 1, 1)]), &[3]);
     }
 
     #[test]

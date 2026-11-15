@@ -87,6 +87,16 @@ pub(crate) fn version_macros(major: u32, minor: u32, patch: u32, version: u32) -
 /// The most columns a line of the header takes.
 const LINE_WIDTH: usize = 120;
 
+/// `header`, as the generator writes it, made one a C programmer reads: its numbered constants gathered into enums and
+/// every doc comment in Doxygen form, each line within [`LINE_WIDTH`] columns where it stands.
+///
+/// # Panics
+/// Panics where [`enumerate_constants`] or [`doxygen_comments`] finds a form it does not know.
+pub(crate) fn for_c_reader(header: &str) -> String {
+    // The constants are moved into their enums first, so that their docs are wrapped at the indent they end up at.
+    doxygen_comments(&enumerate_constants(header))
+}
+
 /// `header` with every doc comment in Doxygen form, and its backticks dropped.
 ///
 /// A doc comment is a block from a line `/**` to a line `*/`. Its first paragraph becomes its `@brief`. The sections
@@ -589,6 +599,22 @@ int after;
                       #define KAHLNWS_KIND_SECOND 2\n";
 
         let _ = enumerate_constants(header);
+    }
+
+    #[test]
+    fn test_a_constant_whose_brief_fills_a_line_stays_within_the_line_width_in_its_enum() {
+        // At the top level a line of 23 words, `@brief` and 22 times `word`, takes `3 + 6 + 22 · 5 = 119` columns; in
+        // the enum, two columns further in, it must break one word earlier.
+        let brief = "word ".repeat(30);
+        let header = format!("typedef uint32_t kahlnws_kind;\n/**\n * {brief}\n */\n#define KAHLNWS_KIND_FIRST 1\n");
+
+        let read = for_c_reader(&header);
+
+        assert!(read.lines().all(|line| line.len() <= LINE_WIDTH), "a line passes the width:\n{read}");
+        assert!(read.contains("  KAHLNWS_KIND_FIRST = 1,"), "the constant is in its enum:\n{read}");
+        assert_eq!(read.matches("word").count(), 30, "every word is kept");
+        let first = read.lines().find(|line| line.contains("@brief")).expect("the brief is written");
+        assert_eq!(first, format!("   * @brief{}", " word".repeat(21)), "the brief breaks where the enum's width ends");
     }
 
     #[test]

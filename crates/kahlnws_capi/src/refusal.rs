@@ -43,7 +43,7 @@ impl RefusalKind {
     pub const NET_SUPPLY_BEYOND_RANGE: Self = Self(8);
 }
 
-/// Why `kahlnws_solver_solve` refused a problem: the breach, by its kind, and the values that make it one.
+/// Why a solve refused a problem: the breach, by its kind, and the values that make it one.
 ///
 /// A problem with several breaches is refused with the first in the order of the kinds' numbers, where the kinds
 /// about one arc, from `KAHLNWS_REFUSAL_KIND_TAIL_OUTSIDE_NODES` to `KAHLNWS_REFUSAL_KIND_COST_TOTAL_BEYOND_RANGE`,

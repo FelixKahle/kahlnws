@@ -36,6 +36,15 @@ outcome is then the cost:
 >>> flows.tolist()
 [2, 2, 2]
 
+A solver keeps the basis its last solve ended on. `resolve` and `resolve_into` take the same arguments as `solve` and
+`solve_into` and start from it where it serves the problem, the same arcs with other numbers; where it cannot, they
+answer exactly what a solve answers. With one unit less to send, the kept basis carries the optimum at once:
+
+>>> answer = solver.resolve_into(tails=[0, 0, 1], heads=[2, 1, 2], capacities=[3, 4, 2], costs=[5, 1, 1],
+...                              supplies=[3, 0, -3], flows=flows)
+>>> answer.outcome, answer.work.pivots, flows.tolist()
+(9, 0, [1, 2, 2])
+
 A problem no solve admits raises `ProblemError`, a `ValueError` whose attribute `breach` names the breach and holds
 its values:
 

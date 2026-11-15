@@ -14,7 +14,7 @@ build-backend = "maturin"
 [project]
 name = "kahlnws"
 description = "A primal network simplex for the min-cost flow problem on exact integers"
-# The workspace's README, linked into this folder, is the description of the package's page.
+# The package's own page on the index: what it is, how to install it, the smallest call, and where the documents are.
 readme = "README.md"
 # The version is the workspace's, which maturin reads from `Cargo.toml`.
 dynamic = ["version"]
@@ -35,6 +35,12 @@ classifiers = [
 ]
 # No dependency: plain sequences of `int` need nothing more.
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/FelixKahle/kahlnws"
+Documentation = "https://github.com/FelixKahle/kahlnws/blob/main/docs/python-api.md"
+Changelog = "https://github.com/FelixKahle/kahlnws/blob/main/CHANGELOG.md"
+Issues = "https://github.com/FelixKahle/kahlnws/issues"
 
 [project.optional-dependencies]
 # NumPy, for callers who hold their tables as arrays. The package itself never imports it: it reads any buffer. The

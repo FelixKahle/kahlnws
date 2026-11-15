@@ -24,10 +24,12 @@
 //!
 //! The compilers are the system's: `CC` and `CXX` where set, `cc` and `c++` otherwise. The libraries a static library
 //! needs beside it are the ones `rustc --print native-static-libs` names for an empty static library of the `rustc`
-//! on the path, which is the toolchain the build uses unless the caller chose another. Where a tool is not found, the
-//! test that needs it says so on standard error and passes; it never passes without saying. The C and C++ programs run
-//! as children of the test process, so whatever limits the test's process group runs under hold for them too. Every
-//! file a test writes has a name of its own, since the tests of this file run at once.
+//! on the path, which is the toolchain the build uses unless the caller chose another. The static library is the one
+//! the cargo that built the tests builds from the crate's sources, for the tests' target and in their profile family,
+//! once for every test of the file, into a target directory under the tests' own folder. Where a tool is not found,
+//! the test that needs it says so on standard error and passes; it never passes without saying. The C and C++
+//! programs, and that cargo, run as children of the test process, so whatever limits the test's process group runs
+//! under hold for them too. Every file a test writes has a name of its own, since the tests of this file run at once.
 
 use std::env;
 use std::ffi::OsString;
@@ -91,12 +93,20 @@ const CPP_PROGRAMS: [&str; 2] = ["network_simplex", "int128"];
 /// What the C++ header refuses to compile beside the form it compiles: the case's name, the body refused, the body
 /// allowed, and a piece of the compiler's error that says why. Each body follows [`CPP_SNIPPET_PRELUDE`]. Every other
 /// refusal of the header is shown by a static assertion in `tests/network_simplex.cpp`.
-const FORBIDDEN: [(&str, &str, &str, &str); 1] = [(
-    "ignored",
-    "solver.try_solve(problem); return 0;",
-    "return solver.try_solve(problem).has_value() ? 0 : 1;",
-    "ignoring return value",
-)];
+const FORBIDDEN: [(&str, &str, &str, &str); 2] = [
+    (
+        "ignored",
+        "solver.try_solve(problem); return 0;",
+        "return solver.try_solve(problem).has_value() ? 0 : 1;",
+        "ignoring return value",
+    ),
+    (
+        "ignored-resolve",
+        "solver.try_resolve(problem); return 0;",
+        "return solver.try_resolve(problem).has_value() ? 0 : 1;",
+        "ignoring return value",
+    ),
+];
 
 /// The start of every C++ snippet [`FORBIDDEN`] compiles: a problem of one arc, viewed from vectors, and a solver; the
 /// body and a closing brace follow.
@@ -299,7 +309,14 @@ fn test_the_reference_of_the_c_header_builds_without_a_warning() {
 
     let reference = fs::read_to_string(folder.join("html").join("kahlnws_8h.html"))
         .expect("the page of the header should be written");
-    for entry in ["kahlnws_solver_new", "kahlnws_solver_solve", "kahlnws_refusal_message", "kahlnws_cost_bound"] {
+    let entries = [
+        "kahlnws_solver_new",
+        "kahlnws_solver_solve",
+        "kahlnws_solver_resolve",
+        "kahlnws_refusal_message",
+        "kahlnws_cost_bound",
+    ];
+    for entry in entries {
         assert!(reference.contains(entry), "the reference of the header should describe {entry}");
     }
 }
@@ -321,15 +338,85 @@ fn test_the_header_s_version_is_the_library_s() {
     assert_eq!(parts, env!("CARGO_PKG_VERSION"), "the parts are the crate's version");
 }
 
-/// The static library, which the build makes beside the test binary, as a crate type of the library the test links.
+/// The target tuple the tests were built for, as the build script hands it on.
+const TARGET_TUPLE: &str = env!("KAHLNWS_CAPI_TARGET");
+
+/// The family of profiles the tests were built in: the one cargo's built-in `dev` or `release` profile heads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Profile {
+    /// A profile that inherits from `dev`, which cargo names `debug` to a build script.
+    Dev,
+    /// A profile that inherits from `release`.
+    Release,
+}
+
+impl Profile {
+    /// The family of the profile the tests were built in, from the build script's `PROFILE`, which it hands on.
+    ///
+    /// # Panics
+    /// Panics if the build script handed on a name other than `debug` or `release`.
+    fn of_tests() -> Self {
+        match env!("KAHLNWS_CAPI_PROFILE") {
+            "debug" => Self::Dev,
+            "release" => Self::Release,
+            other => panic!("cargo should name the profile of a build `debug` or `release`, not `{other}`"),
+        }
+    }
+
+    /// The flags that choose the profile on cargo's command line.
+    fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Dev => &[],
+            Self::Release => &["--release"],
+        }
+    }
+
+    /// The folder of the target directory, under the target tuple's, where cargo places what the profile builds.
+    fn folder(self) -> &'static str {
+        match self {
+            Self::Dev => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
+/// The static library of the crate's current sources, for the target and in the profile family of the tests, built
+/// once for every test of the file.
 ///
 /// # Panics
-/// Panics if the test binary has no folder, or the library is not in it.
-fn static_library() -> PathBuf {
-    let test_binary = env::current_exe().expect("the test binary should know its path");
-    let folder = test_binary.parent().expect("the test binary should lie in a folder");
-    let library = folder.join("libkahlnws_capi.a");
-    assert!(library.is_file(), "the static library should be built at {}", library.display());
+/// Panics if cargo cannot be started or fails to build the library, or the library is not where cargo places it.
+fn static_library() -> &'static Path {
+    static LIBRARY: OnceLock<PathBuf> = OnceLock::new();
+
+    LIBRARY.get_or_init(built_static_library)
+}
+
+/// Builds the crate's library with the cargo that built the tests, for their target and in their profile family, into
+/// a target directory under the tests' own folder, and answers the path of its static library.
+///
+/// # Panics
+/// Panics if cargo cannot be started or fails to build the library, or the library is not where cargo places it.
+fn built_static_library() -> PathBuf {
+    // The copy of the library cargo made beside the test lies in its build directory, whose layout cargo keeps to
+    // itself; a library asked for by name lies in the target directory, at `<tuple>/<profile folder>/` where the
+    // command names the target, which is cargo's documented place for its users. The target directory is the tests'
+    // own: a build of this package alone resolves the features of its dependencies apart from the workspace's test
+    // build, so in the shared one it would replace the artifacts that build left; and here the command alone chooses
+    // the target and the profile, and so the layout. It builds the library alone, never the tests that call it.
+    let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("static_library");
+    let profile = Profile::of_tests();
+
+    run(Command::new(env!("CARGO"))
+        .args(["build", "--locked", "--lib", "--package", env!("CARGO_PKG_NAME"), "--target", TARGET_TUPLE])
+        .args(profile.flags())
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .current_dir(CRATE_DIR)
+        // Its build script would otherwise rewrite the committed header while other tests of the file read it.
+        .env_remove("KAHLNWS_WRITE_HEADER"));
+
+    let library = target_dir.join(TARGET_TUPLE).join(profile.folder()).join("libkahlnws_capi.a");
+    assert!(library.is_file(), "cargo should have built the static library at {}", library.display());
 
     library
 }
@@ -387,8 +474,12 @@ fn compiled(compiler: &OsString, language: Language, standard: &str, name: &str,
 #[test]
 fn test_a_status_or_a_solver_ignored_fails_to_compile_and_one_used_compiles() {
     const TEST: &str = "test_a_status_or_a_solver_ignored_fails_to_compile_and_one_used_compiles";
-    let answers =
-        ["kahlnws_solver_new()", "kahlnws_solver_reserve(0, 1, 1)", "kahlnws_solver_solve(0, 0, 0, 0, 0, 0, 0)"];
+    let answers = [
+        "kahlnws_solver_new()",
+        "kahlnws_solver_reserve(0, 1, 1)",
+        "kahlnws_solver_solve(0, 0, 0, 0, 0, 0, 0)",
+        "kahlnws_solver_resolve(0, 0, 0, 0, 0, 0, 0)",
+    ];
 
     for (language, standard) in [(Language::C, "-std=c99"), (Language::Cpp, "-std=c++17")] {
         let Some(compiler) = language.compiler() else {
@@ -627,7 +718,16 @@ struct Example {
 /// only 20 of shop 2's 30, so warehouse 0 sends at least 10 there, saving 3 each, and its other 10 to shop 1, saving 6
 /// each: 615 - 30 - 60 = 525. With every lane cut to 5, each warehouse sends at most 15, below warehouse 1's 30, so no
 /// flow exists.
-const EXAMPLES: [Example; 4] = [
+///
+/// The pivots of those three days. A fresh solve starts from the star, every lane empty, and tries warehouse 0's lanes
+/// first, the cheapest into each shop: 6, 5 and 7 pivots. A resolve keeps the tree the day before ended on. Day 1
+/// ends with warehouse 1's lanes and the empty lane from warehouse 0 to shop 2 in the tree, and the lane from
+/// warehouse 0 to shop 1 full out of it. On day 2 that tree carries the optimum, but the lane from warehouse 1 to
+/// shop 1, empty, can carry nothing back up the tree, so shop 1 hangs from the root; the full lane into it from
+/// warehouse 0 then violates and enters, sending nothing: 1 pivot. On day 3 the lane from warehouse 1 to shop 2 cannot
+/// carry the 30 asked for and leaves the tree full, 5 units left on root links; the lane from warehouse 1 to shop 1
+/// enters and sends them round: 1 pivot.
+const EXAMPLES: [Example; 5] = [
     Example {
         name: "transport",
         prints: &[
@@ -642,6 +742,15 @@ const EXAMPLES: [Example; 4] = [
         throws: &[],
     },
     Example { name: "reuse", prints: &["day 1: cost 465", "day 2: cost 430", "day 3: cost 525"], throws: &[] },
+    Example {
+        name: "resolve",
+        prints: &[
+            "day 1: cost 465, pivots 6 (a fresh solve: 6)",
+            "day 2: cost 430, pivots 1 (a fresh solve: 5)",
+            "day 3: cost 525, pivots 1 (a fresh solve: 7)",
+        ],
+        throws: &[],
+    },
     Example {
         name: "outcomes",
         // The library's message of the refusal: the last lane enters node 5 of a problem of 5 nodes.

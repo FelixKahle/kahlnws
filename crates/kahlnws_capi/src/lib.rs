@@ -14,6 +14,16 @@
 //! `kahlnws_work`; on a refusal, it reads the breach from the `kahlnws_refusal`, or its text from
 //! `kahlnws_refusal_message`. It frees the solver with `kahlnws_solver_free`.
 //!
+//! Solving again. A solver keeps the basis its last solve ended on, optimal or infeasible. A program that solves a
+//! problem again after some of its numbers changed calls `kahlnws_solver_resolve`, with the same arguments as
+//! `kahlnws_solver_solve`: it starts from that basis where it serves, where the problem has the node and arc counts of
+//! that solve and every arc its tail and its head and the supplies the basis leaves stay within range. Where only some
+//! numbers changed it then often makes far fewer pivots, and the same problem again, where the kept basis serves, makes
+//! none. Where the basis cannot serve, it answers exactly as `kahlnws_solver_solve` does. Both entries answer the same
+//! status, the same cost, and potentials that prove the flow optimal; only `kahlnws_solver_solve` answers the flows
+//! among tied optima, the potentials and the work as a function of the problem alone, while `kahlnws_solver_resolve`
+//! answers a function of the problem and of the solves before it.
+//!
 //! Ownership. The library owns only the solvers it makes, from `kahlnws_solver_new` to `kahlnws_solver_free`. Every
 //! other pointer belongs to the caller: a call reads or writes through it while it runs, and keeps none.
 //!
@@ -59,7 +69,8 @@
 //! later that includes `kahlnws.h` and puts everything in `namespace kahlnws`. A `kahlnws::network_simplex` solves a
 //! `kahlnws::problem` of six named views; `try_solve` answers the flows, the potentials and the cost owned, and
 //! `try_solve_into` writes them into buffers the caller holds, each as a `kahlnws::result` that holds the answer or a
-//! `kahlnws::error`. Where exceptions are enabled, `solve` and `solve_into` throw instead. The tests in
+//! `kahlnws::error`; `try_resolve` and `try_resolve_into` answer alike from the kept basis. Where exceptions are
+//! enabled, `solve`, `solve_into`, `resolve` and `resolve_into` throw instead. The tests in
 //! `tests/header.rs` build `tests/network_simplex.cpp` and `tests/int128.cpp` against it in C++11, 14, 17 and 20, and
 //! C++23 where the compiler has it, with exceptions and without.
 
@@ -84,6 +95,7 @@ pub use status::StatusCode;
 pub use work::Work;
 
 use guard::{guarded, status_of};
+use solver::Entry;
 use status::Status;
 
 /// A new solver that holds no room yet, for the other entries to use and `kahlnws_solver_free` to free.
@@ -165,6 +177,9 @@ pub unsafe extern "C" fn kahlnws_solver_reserve(
 /// problem too large for memory answers `KAHLNWS_STATUS_NO_ROOM` before it could be refused as too large. Where the
 /// room already holds the problem, by `kahlnws_solver_reserve` or an earlier solve, the call allocates nothing.
 ///
+/// The solver keeps the basis an optimal or infeasible solve ended on, for a later `kahlnws_solver_resolve`; a call
+/// that answers another status keeps the basis kept before, but an internal error, which may leave none.
+///
 /// # Parameters
 /// - `solver` (in, out): the solver, whose room the solve uses and may grow.
 /// - `problem` (in): the problem to solve.
@@ -222,7 +237,96 @@ pub unsafe extern "C" fn kahlnws_solver_solve(
         // outputs meanwhile.
         let call = unsafe { boundary::call(problem, flows, potentials, total_cost, work, refusal) }?;
 
-        Ok(solver.solve(call))
+        Ok(solver.solve(Entry::Solve, call))
+    })
+}
+
+/// Solves `problem` with `solver` from the basis the solver's last solve ended on, where that basis serves: answers
+/// as `kahlnws_solver_solve` does, the same status and the same cost, with potentials that prove the flow optimal.
+///
+/// The basis serves where a solve of `solver`, by either entry, optimal or infeasible, has ended since the solver was
+/// made and since any call of it that answered `KAHLNWS_STATUS_INTERNAL_ERROR`, which may leave none; where `problem`
+/// has that solve's node and arc counts and every arc the tail and the head it had; and where the flows that basis
+/// puts on its arcs out of the tree keep the supplies net of them within the limit
+/// `KAHLNWS_REFUSAL_KIND_NET_SUPPLY_BEYOND_RANGE` names. Its tree is kept and every number is read anew from
+/// `problem`. Where the basis cannot serve, the call answers and writes exactly what `kahlnws_solver_solve` does, its
+/// work included. So any problem is solved, after any call.
+///
+/// Where the basis serves and only some numbers changed, it often makes far fewer pivots than a solve, and the same
+/// problem again makes none. Of a problem with several optimal flows it may write another than `kahlnws_solver_solve`
+/// writes, and other potentials: its flows, potentials and work are a function of the problem and of the solves before
+/// it, deterministic still. A resolve from the kept basis tries no arcs before block search, so the `first_arc_pivots`
+/// it writes are 0.
+///
+/// On every status but `KAHLNWS_STATUS_OPTIMAL` the flows, the potentials and the cost are as they were; the work is
+/// written on `KAHLNWS_STATUS_OPTIMAL` and `KAHLNWS_STATUS_INFEASIBLE` alone, and the refusal on
+/// `KAHLNWS_STATUS_REFUSED` alone; an internal error leaves the outputs unspecified.
+///
+/// Room. As in `kahlnws_solver_solve`, the solver's room is grown to the problem's counts and kept before the problem
+/// is checked; where the room already holds the problem, by `kahlnws_solver_reserve` or an earlier solve, the call
+/// allocates nothing.
+///
+/// The solver keeps the basis an optimal or infeasible resolve ended on, as a solve does; a call that answers another
+/// status keeps the basis kept before, but an internal error, which may leave none.
+///
+/// # Parameters
+/// - `solver` (in, out): the solver, whose room the solve uses and may grow.
+/// - `problem` (in): the problem to solve.
+/// - `flows` (out): where the flow of each arc is written, arc `a` at `a`: storage for `problem->arc_count`
+///   entries, which may be null where that count is zero.
+/// - `potentials` (out): where each node's potential is written, node `v` at `v`: storage for
+///   `problem->node_count` entries, or null where the potentials are not wanted.
+/// - `total_cost` (out): where the cost of the flow is written, or null where it is not wanted.
+/// - `work` (out): where the work of the solve is written, or null where it is not wanted.
+/// - `refusal` (out): where the breach of a refused problem is written, or null where it is not wanted.
+///
+/// # Returns
+/// - `KAHLNWS_STATUS_OPTIMAL`: the flow of each arc is written to `flows`, arc `a` at `a`; where `potentials` is not
+///   null, each node's potential to it, node `v` at `v`; where `total_cost` is not null, the cost of the flow to it;
+///   where `work` is not null, the work of the solve to it. With the potentials,
+///   `cost + potential[tail] - potential[head]` is at least zero on every arc whose flow is below its capacity and at
+///   most zero on every arc whose flow is above its lower bound, which proves the flow optimal;
+/// - `KAHLNWS_STATUS_INFEASIBLE`: no flow within the bounds meets the supplies; where `work` is not null, the work of
+///   the solve is written to it;
+/// - `KAHLNWS_STATUS_REFUSED`: the problem lies outside what a solve admits; where `refusal` is not null, the breach
+///   is written to it;
+/// - `KAHLNWS_STATUS_NULL_POINTER`: `solver`, `problem` or `flows` is null, or a table of the problem other than its
+///   lower bounds is null while its count is above zero;
+/// - `KAHLNWS_STATUS_INVALID_ARGUMENT`: a pointer the call reads or writes is not aligned for its type, or a count of
+///   entries passes `PTRDIFF_MAX` bytes;
+/// - `KAHLNWS_STATUS_NO_ROOM`: the memory for the room the problem needs was refused;
+/// - `KAHLNWS_STATUS_INTERNAL_ERROR`: an internal error was caught.
+///
+/// # Safety
+/// - `solver` is null, or a pointer `kahlnws_solver_new` answered that has not been freed since and that no other
+///   call uses meanwhile: one thread at a time uses a solver;
+/// - `problem` is null or points to a `kahlnws_problem` whose every pointer points to what its doc states;
+/// - `flows` points to writable storage for `problem->arc_count` entries, and may be null where that count is zero;
+/// - `potentials` is null or points to writable storage for `problem->node_count` entries;
+/// - `total_cost`, `work` and `refusal` are each null or point to writable storage for one value;
+/// - an array lies within one object; what an output held before does not matter;
+/// - no output overlaps another output, the problem or its tables; nothing writes the problem or its tables, and
+///   nothing else reads or writes the outputs, while the call runs.
+#[must_use]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kahlnws_solver_resolve(
+    solver: *mut Solver,
+    problem: *const Problem,
+    flows: *mut u64,
+    potentials: *mut i64,
+    total_cost: *mut Int128,
+    work: *mut Work,
+    refusal: *mut Refusal,
+) -> StatusCode {
+    status_of(|| {
+        // SAFETY: C guarantees `solver` is null or a solver `kahlnws_solver_new` answered, not freed and not in use.
+        let solver = unsafe { boundary::solver_mut(solver) }?;
+        // SAFETY: C guarantees `problem` and the outputs point to what this entry's doc states, null only where it
+        // allows, with no output overlapping another argument, nothing writing the inputs and nothing else using the
+        // outputs meanwhile.
+        let call = unsafe { boundary::call(problem, flows, potentials, total_cost, work, refusal) }?;
+
+        Ok(solver.solve(Entry::Resolve, call))
     })
 }
 

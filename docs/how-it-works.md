@@ -2,8 +2,9 @@
 
 For a reader who knows linear programming and wants to know what a solve does, without reading the code first. The
 method is the primal network simplex with a strongly feasible spanning-tree basis, block search for pricing, and a
-threaded tree. The notation is that of [the problem and the guarantees](problem-and-guarantees.md): $n$ nodes, $m$
-arcs, costs $c$, lower bounds $l$, capacities $u$, supplies $b$, potentials $\pi$.
+threaded tree; a resolve starts the same method from the basis the last solve ended on. The notation is that of [the
+problem and the guarantees](problem-and-guarantees.md): $n$ nodes, $m$ arcs, costs $c$, lower bounds $l$, capacities
+$u$, supplies $b$, potentials $\pi$.
 
 ## The problem the solve works on
 
@@ -25,8 +26,9 @@ root. The basis is a spanning tree of these $n + 1$ nodes, and the root links ma
 
 ## The starting basis
 
-The solve starts from the star: every node hangs from the root by its own root link, and every arc is out of the tree
-at its lower bound, carrying nothing above it.
+A solve starts from the star: every node hangs from the root by its own root link, and every arc is out of the tree
+at its lower bound, carrying nothing above it. A resolve may start from the basis the last solve ended on instead,
+made a basis of the new problem as [starting from the kept basis](#starting-from-the-kept-basis) describes.
 
 - A node of net supply zero or more has a root link that points up, from the node to the root, at cost $0$, carrying
   its net supply.
@@ -118,6 +120,84 @@ An arc whose width is zero is never priced. It carries its lower bound in every 
 ever enter to send nothing, and it meets the optimality conditions whatever its reduced cost. The argument uses no
 property of the rule that chooses the entering arc, so it holds for every pivot of a solve.
 
+## Starting from the kept basis
+
+A solver keeps the basis its last run ended on, optimal or infeasible: the tree, with each node's parent, link and
+direction and the thread, and where each arc out of the tree stood, at its lower bound, at its capacity, or unpriced.
+None of the last problem's numbers is read again. A resolve starts from that basis where it can serve the new problem,
+as [solving again](problem-and-guarantees.md#solving-again) states; among the conditions, every arc has the tail and the
+head it had, so that every tree link joins the same two nodes as before. Then every number is read anew, and three
+passes make the kept tree a strongly feasible basis of the new problem.
+
+**The arcs out of the tree.** Each arc out of the tree keeps its bound: one that stood at its capacity carries its new
+width, $u_{ij} - l_{ij}$, and any other carries nothing above its lower bound; an arc whose new width is zero is
+unpriced. What each node then has left to route along the tree is its excess,
+
+```math
+e_i = b'_i - \sum_{(i,j) \in U} (u_{ij} - l_{ij}) + \sum_{(j,i) \in U} (u_{ji} - l_{ji}) ,
+```
+
+where $b'$ is the net supply and $U$ the set of arcs out of the tree that stand at their capacity. In the star every
+arc stands at its lower bound, so there an excess is a net supply. The excesses must keep the range the net supplies
+keep for the star: where they are positive they add up to at most $2^{64} - 2$.
+
+**The tree's flows, from the leaves up.** The nodes are taken in the reverse of the thread's order, so that each comes
+after its whole subtree, and each sends its excess, with what its children sent it, toward the root along its link. A
+link of width $w$ carries
+
+```math
+g = \min\bigl(\max(\pm e, \, 0), \; w\bigr) ,
+```
+
+with $+e$ where the link points up from the node and $-e$ where it points down to it, and the parent's excess gains $g$
+or $-g$ accordingly; the rest $r = e \mp g$ stays at the node. The link stays in the tree where nothing is left, $r =
+0$, and where it can still carry more toward the root: $g < w$ pointing up, $g > 0$ pointing down. Otherwise the arc
+leaves the tree at the bound its flow stands at, or unpriced where it has no width, and the node hangs from the root by
+its own root link, which carries $\lvert r \rvert$, up where $r \ge 0$ and down where $r < 0$. A node that already hangs
+from the root puts its whole excess on its root link the same way. A node that leaves its arc takes its subtree with it:
+the subtree's run of the thread moves to the thread's end, where only nodes already passed stand, so the order of the
+pass is undisturbed, and the subtree sizes and last successors are rebuilt in the same pass.
+
+**The potentials, from the root down.** The nodes are taken in the thread's order, so that each comes after its
+parent, and each takes the potential that makes its link tight: its parent's less the link's cost where the link
+points up, plus it where it points down. An arc costs its cost, a root link zero up and $M$ down, with $M$ the root
+cost of the new problem; the root's potential is zero.
+
+### Why it is a basis
+
+The result meets every condition the star meets:
+
+- every node conserves its net supply, since it sends $\pm g$ to its parent and keeps $r$ on its root link; every arc
+  carries a flow within its width, and an arc that leaves the tree stands at a bound, since it leaves only where the
+  clamp met one or where its flow left it no room toward the root;
+- the basis is strongly feasible: a link stays only with room toward the root, a root link that points down carries
+  $\lvert r \rvert > 0$, and one that points up carries less than its capacity, by the bound below;
+- every tree link is tight, so the potentials are those the tree implies.
+
+The root links carry at most $P$, the sum of the positive excesses. Take the sum of the positive parts of the excesses
+not yet sent and of the rests already placed: a node with $e \ge 0$ splits it into $r \ge 0$ and a transfer $g \ge 0$
+that raises its parent's positive part by at most $g$, and a node with $e < 0$ only lowers its parent's excess. So the
+sum never rises, and the flow up the root links is at most $P$; since the excesses add up to zero, so is the flow down
+them. With $P \le 2^{64} - 2$ the argument that keeps the star's root links from limiting a pivot in the direction they
+point holds as it does for the star, and every number of the passes fits the integer type it is held in.
+
+From here the run is the run from the star. The pivot, the ratio test, the tree update, the pricing and [why the
+method ends](#why-the-method-ends) rely only on a strongly feasible basis, not on how it was reached, so they are not
+changed, and the outcome and the optimal cost are those of the problem. The star itself is the case of a tree in which
+every node hangs from the root and every arc stands at its lower bound.
+
+### What it costs
+
+The start is a few passes over the arcs, which compare their tails and heads and write their new numbers and the
+excesses, and a few over the nodes, each node at a constant cost whatever a pass moves: $O(m + n)$, as the star's is.
+What follows depends on how far the new problem lies from the old one. Where only some numbers changed, many links
+often still stand, and the run often makes far fewer pivots than a run from the star; where much changed, the kept
+tree may lie no nearer an optimum than the star, and the run may make more. The same problem again, where the kept
+basis serves, sends every link the flow it carried: nothing violates, and no pivot is made. Where only costs changed,
+the start keeps the tree and the flows, and only the potentials move.
+
+Where the kept basis cannot serve, the star is taken, and a resolve is a solve, its answer and its work included.
+
 ## Choosing the entering arc
 
 ### The order of the arcs
@@ -158,8 +238,8 @@ Before block search starts, the solve tries a few arcs chosen from the problem's
 
 Only arcs of positive width that are not loops are chosen. Each chosen arc enters only where it violates when its turn
 comes, so the choice changes the path a solve takes, never whether it ends optimal or infeasible, nor the optimal
-cost. The work counts these pivots as
-`first_arc_pivots`.
+cost. The work counts these pivots as `first_arc_pivots`. The arcs are chosen for the star; a start from a kept basis
+tries none.
 
 ## The threaded tree
 

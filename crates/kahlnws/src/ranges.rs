@@ -62,18 +62,21 @@ pub const fn cost_bound(node_count: usize) -> i64 {
     bound.cast_signed()
 }
 
-/// The most the supplies net of the lower bounds may add up to where they are positive, in units of flow:
-/// `2^64 − 2`. Within it no root link ever carries more than the positive total, and a root link never limits a
-/// pivot in the direction it points.
-// The star starts the flow up the root links and the flow down them at the positive total `T` each. The root
-// conserves, so a pivot raises both totals or neither; a pivot that raises both runs up a supply link at cost zero
-// and down a demand link at cost `M`, a cycle of cost at least `M − (n − 1)·C = 1`, which never enters. So no
-// root-link flow passes `T`.
+/// The most a start's excesses may add up to where they are positive, in units of flow: `2^64 − 2`. A node's excess is
+/// its supply net of the lower bounds and of what the arcs out of the starting tree carry; in the star, where they
+/// carry nothing, it is the node's net supply, so the supplies net of the lower bounds keep it too. Within it no root
+/// link ever carries more than the positive total, and a root link never limits a pivot in the direction it points.
+// A run starts with the flow up the root links equal to the flow down them, since the excesses add up to zero and the
+// root conserves; each total is at most the start's positive excess total `P`, at most this limit: in the star each is
+// `P`, and the re-flow of a kept basis places at most `P` either way (`Reflow::flow_up`). The root conserves, so a
+// pivot raises both totals or neither; a pivot that raises both runs up a root link that points up, at cost zero, and
+// down one that points down, at cost `M`, a cycle of cost at least `M − (n − 1)·C = 1`, which never enters. So no
+// root-link flow passes `P`.
 //
 // A cycle through the root passes two root links. Running along both is the pivot that never enters; running against
 // both blocks only at flows. Otherwise it runs against one, of flow `f₁`, and along the other, of flow `f₂`, which
-// happens exactly when both point up or both point down, so `f₁ + f₂ ≤ T ≤ 2^64 − 2`. The step is at most `f₁`, so
-// the room along the second is `u64::MAX − f₂ ≥ u64::MAX − (T − f₁) ≥ 1 + f₁ > step`. The inequality is strict, and
+// happens exactly when both point up or both point down, so `f₁ + f₂ ≤ P ≤ 2^64 − 2`. The step is at most `f₁`, so
+// the room along the second is `u64::MAX − f₂ ≥ u64::MAX − (P − f₁) ≥ 1 + f₁ > step`. The inequality is strict, and
 // must be: with a tie, the ratio test's non-strict choice on the second side would take out a root link that still
 // carries flow. Hence no root-link flow overflows a `u64`, and a root link out of the tree carries nothing.
 pub(crate) const NET_SUPPLY_LIMIT: u64 = u64::MAX - 1;
@@ -145,10 +148,10 @@ fn root_cost_past_i64_max(node_count: usize, largest_cost: u64) -> ! {
 pub(crate) fn root_cost(node_count: usize, largest_cost: u64) -> i64 {
     // `(n − 1)·C + 1 ≤ n·C < 2^62` where `C ≥ 1`, and it is 1 where `C = 0`.
     //
-    // It is the least value with `M − (n − 1)·C ≥ 1`. So a cycle that runs up a supply link and down a demand link,
-    // costing `M` less a path of at most `n − 1` arcs, never enters; and at the end a root link carries flow exactly
-    // where no flow within the bounds meets the supplies, since a cycle that would route such a supply costs at most
-    // `−M + (n − 1)·C = −1`.
+    // It is the least value with `M − (n − 1)·C ≥ 1`. So a cycle that runs up a root link that points up and down one
+    // that points down, costing `M` less a path of at most `n − 1` arcs, never enters; and at the end a root link
+    // carries flow exactly where no flow within the bounds meets the supplies, since a cycle that would route such a
+    // supply costs at most `−M + (n − 1)·C = −1`.
     let root_cost = u64::try_from(node_count.saturating_sub(1))
         .ok()
         .and_then(|paths| paths.checked_mul(largest_cost))

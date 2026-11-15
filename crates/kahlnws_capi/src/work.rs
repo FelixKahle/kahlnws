@@ -4,7 +4,7 @@
 //! What a solve did, as plain data C reads: its pivots, counted exactly.
 
 /// What one solve did, counted in pivots: exact counts of that solve, not samples or estimates. `kahlnws_solver_solve`
-/// writes it, where asked, on `KAHLNWS_STATUS_OPTIMAL` and on `KAHLNWS_STATUS_INFEASIBLE`.
+/// and `kahlnws_solver_resolve` write it, where asked, on `KAHLNWS_STATUS_OPTIMAL` and on `KAHLNWS_STATUS_INFEASIBLE`.
 ///
 /// A pivot is an arc brought into the basis, a spanning tree, or flipped to its other bound. Either way the arc
 /// violated its bound, and the most flow the cycle it closes with the tree carries is sent around that cycle: where a
@@ -12,8 +12,10 @@
 /// less its lower bound is the least, no link leaves and the arc moves to its other bound, a flip. A flip sends that
 /// whole difference, which is above zero, since an arc whose capacity equals its lower bound never enters.
 ///
-/// Plain data. The counts depend on the problem alone, its arc order included, and on the library's version: the same
-/// problem gives the same work from a fresh solver and from one that solved others before. In every `kahlnws_work` a
+/// Plain data. The counts `kahlnws_solver_solve` writes depend on the problem alone, its arc order included, and on
+/// the library's version: the same problem gives the same work from a fresh solver and from one that solved others
+/// before. Those `kahlnws_solver_resolve` writes depend on the problem and on the solves the solver made before it,
+/// and are those of `kahlnws_solver_solve` where it does not start from the kept basis. In every `kahlnws_work` a
 /// solve writes, `degenerate_pivots <= pivots` and `first_arc_pivots <= pivots`, and the pivots that sent flow are
 /// `pivots - degenerate_pivots`. A solve that answers ran `pivots - first_arc_pivots + 1` block searches.
 #[repr(C)]
@@ -27,7 +29,8 @@ pub struct Work {
     pub degenerate_pivots: u64,
     /// Of the pivots, those made by the arcs the solve tries before block search, chosen from the problem's
     /// structure, each where it violated its bound when its turn came. At most `pivots`. 0 where none was chosen or
-    /// none violated, and `pivots` where those arcs alone reached the outcome, optimal or infeasible.
+    /// none violated, and in a resolve from the kept basis, which tries none; `pivots` where those arcs alone reached
+    /// the outcome, optimal or infeasible.
     pub first_arc_pivots: u64,
 }
 

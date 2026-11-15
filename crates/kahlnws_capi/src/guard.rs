@@ -12,7 +12,8 @@ use crate::status::{PointerFault, Status, StatusCode};
 /// The panic's message is still reported to standard error, as every panic's is.
 pub(crate) fn guarded<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
     // Asserted unwind-safe: a body that panicked has left at most a solver whose room is in some state, and the
-    // library keeps nothing in that room from one solve to the next; every other value the body touched dies with it.
+    // library keeps from one solve to the next only the basis a solve ended on, which a solve that panicked after it
+    // began to write it no longer holds; every other value the body touched dies with it.
     catch_unwind(AssertUnwindSafe(body)).unwrap_or(on_panic)
 }
 

@@ -51,8 +51,8 @@ struct Extent {
     end: i128,
 }
 
-/// The two buffers of one call of `solve_into`, checked to take its answer: the flows always, the potentials where
-/// asked for.
+/// The two buffers of one call of `solve_into` or `resolve_into`, checked to take its answer: the flows always, the
+/// potentials where asked for.
 ///
 /// # Invariant
 /// Only [`Outputs::new`] makes one: each buffer is checked as [`OutputBuffer::new`] checks it, and the two share no

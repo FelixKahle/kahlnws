@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 """Every breach a solve refuses a problem for, raised as `ProblemError` with the library's message and the breach's
-values, through both levels."""
+values, through both levels and both entries of each."""
 
 from array import array
 
@@ -10,7 +10,7 @@ import pytest
 
 import kahlnws
 from kahlnws import Breach, Table
-from networks import Network
+from networks import HIGH_LEVEL, LOW_LEVEL, Network, Solve, SolveInto, named
 
 # The bound of a cost on four nodes: `(2**62 - 1) // 4`.
 BOUND = kahlnws.cost_bound(4)
@@ -85,10 +85,13 @@ REFUSALS = [
 ]
 
 
+@pytest.mark.parametrize("entry", HIGH_LEVEL, ids=named)
 @pytest.mark.parametrize(("network", "breach", "message"), REFUSALS)
-def test_each_breach_is_raised_with_its_message_and_values(network: Network, breach: Breach, message: str) -> None:
+def test_each_breach_is_raised_with_its_message_and_values(
+    network: Network, breach: Breach, message: str, entry: Solve
+) -> None:
     with pytest.raises(kahlnws.ProblemError) as raised:
-        network.solve(kahlnws.NetworkSimplex())
+        network.solve(kahlnws.NetworkSimplex(), entry)
 
     assert str(raised.value) == message
     assert raised.value.args == (message,)
@@ -97,20 +100,15 @@ def test_each_breach_is_raised_with_its_message_and_values(network: Network, bre
     assert isinstance(raised.value, ValueError)
 
 
+@pytest.mark.parametrize("entry", LOW_LEVEL, ids=named)
 @pytest.mark.parametrize(("network", "breach", "message"), REFUSALS)
-def test_each_breach_is_raised_alike_by_the_low_level(network: Network, breach: Breach, message: str) -> None:
+def test_each_breach_is_raised_alike_by_the_low_level(
+    network: Network, breach: Breach, message: str, entry: SolveInto
+) -> None:
     flows = array("Q", [0] * len(network.tails))
 
     with pytest.raises(kahlnws.ProblemError, match=f"^{message}$") as raised:
-        kahlnws.NetworkSimplex().solve_into(
-            tails=network.tails,
-            heads=network.heads,
-            capacities=network.capacities,
-            costs=network.costs,
-            supplies=network.supplies,
-            flows=flows,
-            lower_bounds=network.lower_bounds,
-        )
+        network.answer_into(kahlnws.NetworkSimplex(), flows, entry=entry)
 
     assert raised.value.breach == breach
     assert flows.tolist() == [0] * len(network.tails)

@@ -19,21 +19,28 @@
 //!   brute force enumerates, within the range of numbers it admits.
 //! - The [`CountingAllocator`], read by [`allocations_on_this_thread`], for the tests that claim a call allocates
 //!   nothing.
-//! - Tiny-network strategies for the property tests: [`TinyMincostNetworks`], and [`tiny_networks`], the ones the
-//!   solver's tests draw.
+//! - Tiny-network strategies for the property tests: [`TinyMincostNetworks`], with its
+//!   [`pairs`](TinyMincostNetworks::pairs) of networks on the same arcs, and [`tiny_networks`], the ones the solver's
+//!   tests draw.
 //! - Seeded networks larger than a brute force enumerates, a function of a seed of a few numbers:
-//!   [`supply_shaped`], [`assignment_shaped`] and [`general`], their costs signed as [`Signs`] says.
+//!   [`supply_shaped`], [`assignment_shaped`] and [`general`], their costs signed as [`Signs`] says; and
+//!   [`perturbed`], a network on the same arcs with a few of its numbers moved, which reads at most
+//!   [`perturbation_draws`] numbers of its seed.
 //! - Networks of a size a benchmark names, drawn from seeded generators ([`ShapeDraws`]): [`supply_sized`] and
 //!   [`assignment_sized`], whose optimum ties through twin arcs, the [`costed_grid`], and [`distinct_costs`] that
 //!   make a network's costs distinct.
-//! - The benchmark suite's networks: each [`Family`] at its sizes, drawn from the suite's seeds, and the
-//!   [`suite_tie_breaks`] of its distinct rows.
+//! - The networks the benchmark suites share: each [`Family`] at its sizes, drawn from the suites' seed, also with
+//!   its costs drawn from another stream, and the [`suite_tie_breaks`] of their distinct rows.
+//! - Changes of a network on the same arcs, each drawn by a generator and each changing what it touches:
+//!   [`supplies_moved`] between nodes of one role, [`capacities_moved`] by a few units, and [`costs_taken`] from the
+//!   same network with its costs drawn anew.
 //!
 //! Every model is deliberately simple and shares no reasoning with the code it is checked against, and every one has
 //! hand-worked tests of its own.
 
 mod brute_force;
 mod certificate;
+mod changes;
 mod counting_allocator;
 mod lp_oracle;
 mod mincost_network;
@@ -46,10 +53,11 @@ pub use brute_force::{
     BRUTE_FORCE_FLOWS, BruteForceBreach, OptimalFlow, brute_force_optimum, check_against_brute_force,
 };
 pub use certificate::{CertificateBreach, check_certificate};
+pub use changes::{capacities_moved, costs_taken, supplies_moved};
 pub use counting_allocator::{Allocations, CountingAllocator, allocations_on_this_thread};
 pub use lp_oracle::lp_optimum;
 pub use mincost_network::MincostNetwork;
-pub use seeded_networks::{Signs, assignment_shaped, general, supply_shaped};
+pub use seeded_networks::{Signs, assignment_shaped, general, perturbation_draws, perturbed, supply_shaped};
 pub use seeds::{Family, suite_tie_breaks};
 pub use sized_networks::{ShapeDraws, assignment_sized, costed_grid, distinct_costs, supply_sized};
 pub use tiny_networks::{TinyBounds, TinyCosts, TinyMincostNetworks, TinySupplies, tiny_networks};

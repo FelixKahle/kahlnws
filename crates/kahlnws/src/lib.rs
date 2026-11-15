@@ -25,8 +25,8 @@
 //!
 //! Every number is checked before the solve starts: the ranges are those [`ProblemError`] names, among them a cost
 //! within plus or minus [`cost_bound`] of the node count. Within them every sum the solve forms fits the integer type
-//! it is held in. The answer, the work included, is a function of the problem as given, its arc order included: the
-//! same problem gives the same answer from a fresh solver and from one that solved others before.
+//! it is held in. The answer of a solve, the work included, is a function of the problem as given, its arc order
+//! included: the same problem gives the same answer from a fresh solver and from one that solved others before.
 //!
 //! # Two levels
 //!
@@ -34,6 +34,20 @@
 //! - [`NetworkSimplex::solve_into`] writes the flows into a buffer the caller holds and answers an [`Optimum`] that
 //!   lends the potentials from the solver. After [`NetworkSimplex::try_reserve`], a solve of a problem within the
 //!   reserved counts allocates nothing.
+//!
+//! # Solving again
+//!
+//! A solver keeps the basis its last solve ended on, optimal or infeasible. [`NetworkSimplex::resolve`] and
+//! [`NetworkSimplex::resolve_into`], beside the two levels above, start from it where it serves: where the problem has
+//! the node and arc counts of that solve and every arc its tail and its head, and where the supplies net of the flows
+//! that basis puts on its arcs out of the tree keep the limit [`ProblemError::NetSupplyBeyondRange`] names. The tree
+//! is kept, every number is read anew, and where only some numbers changed a resolve often makes far fewer pivots than
+//! a solve; the same problem again, where the kept basis serves, makes none. Where the basis cannot serve, a resolve
+//! is a solve, its answer and work included. So every entry answers any problem, after any call.
+//!
+//! Every entry guarantees the outcome, the cost, and potentials that prove the flow optimal. Only a solve guarantees
+//! the flows among tied optima, the potentials and the work as a function of the problem alone; a resolve answers a
+//! function of the problem and of the solves before it, deterministic still.
 //!
 //! # Example
 //!
@@ -66,6 +80,32 @@
 //! assert_eq!(cheapest(&mut solver, &[4, 0, -3]), Err(ProblemError::Unbalanced { total: 1 }));
 //! ```
 //!
+//! A resolve of the same arcs starts from where the solve before it ended, here at no pivot at all, since one unit
+//! less still fits the routes as they are:
+//!
+//! ```
+//! use kahlnws::{NetworkSimplex, Problem, ProblemError};
+//!
+//! fn main() -> Result<(), ProblemError> {
+//!     let problem = Problem {
+//!         tails: &[0, 0, 1],
+//!         heads: &[2, 1, 2],
+//!         lower_bounds: None,
+//!         capacities: &[3, 4, 2],
+//!         costs: &[5, 1, 1],
+//!         supplies: &[4, 0, -4],
+//!     };
+//!     let mut solver = NetworkSimplex::new();
+//!     let solved = solver.solve(&problem)?;
+//!
+//!     let resolved = solver.resolve(&Problem { supplies: &[3, 0, -3], ..problem })?;
+//!     let solution = resolved.outcome.optimal().expect("the routes carry three units");
+//!     assert_eq!((solution.total_cost, resolved.work.pivots, solved.work.pivots), (9, 0, 4));
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
 //! The repository's `README.md` and the pages of its `docs/` folder describe the problem, the guarantees and the
 //! algorithm at length, and the C, C++ and Python interfaces built on this crate.
 
@@ -90,6 +130,12 @@ pub use solver::NetworkSimplex;
 #[cfg(doctest)]
 #[doc = include_str!("../../../README.md")]
 struct ReadmeExamples;
+
+/// The Rust example of the crate's own `README.md`, the page of the crate on the registry, run as a doctest so that
+/// it stays true.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct CrateReadmeExamples;
 
 /// The Rust examples of the repository's guide to the Rust interface, run as doctests so that they stay true.
 #[cfg(doctest)]

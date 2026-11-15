@@ -1,13 +1,16 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The threaded spanning tree with each node's potential: the room it is kept in, the loaded tree with its invariant,
-//! its proven indices, the climb of a cycle's two ends to their apex with the tree it climbs, the ends it finds and the
-//! walk of a side, and the view through which the tree's walks read and write its columns.
+//! The threaded spanning tree with each node's potential: the room it is kept in, with whether it holds a whole tree
+//! between runs, the loaded tree with its invariant, its proven indices, the climb of a cycle's two ends to their
+//! apex with the tree it climbs, the ends it finds and the walk of a side, the rules of a root link's cost and of a
+//! tight potential, and the view through which the tree's walks read and write its columns.
 
 use core::iter;
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
+use core::mem;
+use core::ops::Deref;
 
 use std::collections::TryReserveError;
 
@@ -18,7 +21,8 @@ use crate::room::{refill, reserve_total};
 /// is read and written at without a check.
 ///
 /// What the type proves: the index was made by this file for a tree of `n` nodes, and lies below `n + 1`. This file
-/// makes one only as a node of the star [`TreeRoom::star`] writes, the root among them; as an end of a climb, which
+/// makes one only as a node of the star [`TreeRoom::star`] writes, the root among them; as the root of a tree,
+/// [`SpanningTree::root`]; as an end of a climb, which
 /// [`SpanningTree::apex_climb`] checked against the node count or [`SpanningTree::apex_climb_unchecked`] was promised
 /// below it; or as a value read back from the tree's parent, thread, reverse-thread or last-successor column, which
 /// hold nothing else.
@@ -26,9 +30,10 @@ use crate::room::{refill, reserve_total};
 /// What it does not prove, and remains the `tree` folder's own discipline: that a node is used only with the tree it
 /// was made for. Nodes never leave the folder, and inside it they are held only in values that hold that tree's borrow
 /// beside them: the climb of a cycle and its steps, the ends of a cycle and the walk of a side, the walk of a cycle, a
-/// cycle, a kept cycle, an exchange. Outside this file, the only functions that take a node beside a tree are the
-/// reads and writes of [`TreeColumnsMut`] and [`SpanningTree::hanging`]; their one caller, the exchange, hands them its
-/// own tree with the nodes it holds with it, or reads back from it.
+/// cycle, a kept cycle, an exchange, a prune or a tighten and their steps. Outside this file, the only functions that
+/// take a node beside a tree are the reads and writes of [`TreeColumnsMut`] and [`SpanningTree::hanging`]; their
+/// callers, the exchange and the two walks, hand them their own tree with the nodes they hold with it, or read back
+/// from it.
 ///
 /// Stored at 32 bits, as [`SpanningTree`] says why.
 #[derive(Clone, Copy, PartialEq, Eq, derive_more::Debug)]
@@ -51,10 +56,11 @@ pub(super) struct HungNode(TreeNode);
 /// `v`'s root link at `m + v`.
 ///
 /// What its lifetime proves: the link lies below the link count of the tree it was read from, for as long as that
-/// tree is borrowed; so no link outlives that borrow, and none survives a later [`TreeRoom::star`]. What it does not
-/// prove: the lifetime is covariant, so it does not tell one tree's links from another's, and a link of one tree can
-/// be handed to another borrowed as long. Which columns a link may index is its user's invariant. Only this file makes
-/// one: a link the tree holds, read back, or a raw link [`SpanningTree::link`] checked against the link count or
+/// tree is borrowed; so no link outlives that borrow, and none survives a later [`TreeRoom::star`] or
+/// [`TreeRoom::resume`]. What it does not prove: the lifetime is covariant, so it does not tell one tree's links from
+/// another's, and a link of one tree can be handed to another borrowed as long. Which columns a link may index is its
+/// user's invariant. Only this file makes one: a link the tree holds, read back; a hung node's root link
+/// ([`SpanningTree::root_link`]); or a raw link [`SpanningTree::link`] checked against the link count or
 /// [`SpanningTree::link_unchecked`] was promised below it. It converts to a `usize`; nothing converts to it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, derive_more::Debug)]
 #[debug("Link {_0}")]
@@ -78,11 +84,19 @@ pub(crate) enum Side {
     Second,
 }
 
-/// The room a spanning tree is kept in from one solve to the next: its columns, holding whatever the last tree left.
+/// The room a spanning tree is kept in from one solve to the next: its columns, holding whatever the last tree left,
+/// and whether that is a whole tree.
 ///
-/// It only grows, and holds no tree: nothing is read from it but through the [`SpanningTree`] that
-/// [`star`](Self::star) writes into it and lends. Its fields are the tree's columns, each described here once; the
-/// tree and the view that lend them refer to these descriptions.
+/// It only grows. Nothing is read from it but through the [`LentTree`] that [`star`](Self::star) writes into it and
+/// lends, or that [`resume`](Self::resume) lends again from the columns a kept tree left, and through
+/// [`kept`](Self::kept). Its column fields are the tree's columns, each described here once; the tree and the view
+/// that lend them refer to these descriptions.
+///
+/// # Invariant
+/// `kept` guards the columns: where it is [`Kept::Tree`], they are those of a tree whose invariant held when its
+/// lending ended ([`LentTree::keep`]), of the `n` hung nodes the directions hold and the link count it names, and
+/// nothing has written them since. `star` and `resume` take it out before the tree can be written, and only
+/// `LentTree::keep`, of the one tree the room lent, puts it in.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TreeRoom {
     /// Per tree node: its parent; the root's is the root.
@@ -101,6 +115,30 @@ pub(crate) struct TreeRoom {
     subtree_size: Vec<u32>,
     /// Per tree node: its potential, in units of cost; the root's is zero.
     potential: Vec<i64>,
+    /// Whether the columns hold a whole tree, kept when its run ended.
+    kept: Kept,
+}
+
+/// What a tree room holds between runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Kept {
+    /// No whole tree: before the first tree is kept, and from the lending of a tree until it is kept.
+    #[default]
+    Nothing,
+    /// The tree a run ended on, of `link_count` links, `m + n`.
+    Tree {
+        /// The number of links, at most `u32::MAX`.
+        link_count: usize,
+    },
+}
+
+/// The counts of the tree a room keeps, which [`TreeRoom::resume`] lends again. Plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeptCounts {
+    /// The number of hung nodes, `n`.
+    pub(crate) node_count: usize,
+    /// The number of links, `m + n`.
+    pub(crate) link_count: usize,
 }
 
 /// A rooted spanning tree on the tree nodes `0..=n`, the root `n` last, with its preorder threading and each node's
@@ -127,8 +165,14 @@ pub(crate) struct TreeRoom {
 ///   contiguous run that starts at the node; `reverse_thread` is its inverse;
 /// - `last_successor[v]` is the last node of `v`'s run and `subtree_size[v]` its length.
 ///
-/// [`TreeRoom::star`] establishes it; an exchange keeps it. The first two items are what every unchecked access of
-/// the tree's walks rests on; the rest is what keeps those walks on the tree's paths.
+/// [`TreeRoom::star`] establishes it, and [`TreeRoom::resume`] lends a tree its room's marker says it held when it was
+/// kept; an exchange keeps it; a prune keeps it once it is finished, and a tighten, once finished, makes every link
+/// tight under the costs it was told: a walk owns the [`LentTree`] while it writes, and hands it back only finished.
+/// Every
+/// unchecked access rests on it as a whole: the reads and writes at a [`TreeNode`] or a [`HungNode`] on the first two
+/// items; the climb's making of a hung node strictly below the apex on the subtree sizes (a proper ancestor's is
+/// larger, the root's the largest); the stem walk's and the walks' making of a hung node on the parents and the thread,
+/// which lead to the root without a cycle and visit it once.
 #[derive(Debug)]
 pub(crate) struct SpanningTree<'r> {
     /// The room's columns, lent for `'r`.
@@ -137,11 +181,40 @@ pub(crate) struct SpanningTree<'r> {
     link_count: usize,
 }
 
+/// The tree a room lends, with the room's marker: the one value that can end the lending by keeping the tree whole in
+/// its room.
+///
+/// It reads as the [`SpanningTree`] it holds. A climb, a cycle, an exchange and a walk's step hold a [`SpanningTree`],
+/// which has no marker and cannot be kept.
+///
+/// What the type proves: only [`TreeRoom::star`] and [`TreeRoom::resume`] make one, from the columns of the room whose
+/// marker `kept` is, the marker taken out when it was made; no second lending of that room exists while it is out,
+/// since each takes the room by `&mut`. Outside this folder its tree is only read, through `Deref`, which lends no
+/// `&mut`, and only moved by the folder's own walks: a cycle walk borrows the lent tree, and a prune or a tighten owns
+/// it and hands it back only finished, so a walk dropped half way drops the tree with the marker still out.
+///
+/// What remains discipline. Inside this folder: no tree is put in another's place through
+/// [`tree_mut`](Self::tree_mut), by a swap or a replace of two lent trees, and no column is written through it outside
+/// an exchange or a walk before the tree is kept. In the basis's file: the lent trees of two bases are not swapped,
+/// which would pair one room's link columns with another room's tree, and a basis whose pivot unwound inside the crate
+/// is not kept afterwards.
+///
+/// # Invariant
+/// `tree` is lent from the columns of the room whose marker `kept` is, and the marker was taken out when it was made.
+#[derive(Debug)]
+pub(crate) struct LentTree<'r> {
+    /// The tree lent.
+    tree: SpanningTree<'r>,
+    /// The room's marker, which [`keep`](Self::keep) sets.
+    kept: &'r mut Kept,
+}
+
 /// The columns of a room, lent for one tree or one walk that reads or writes them: each field is the room's column of
 /// the same name, as [`TreeRoom`] describes it.
 ///
 /// # Invariant
-/// Only this file makes one: as the columns a star has just written ([`TreeRoom::star`]), or by reborrowing another.
+/// Only this file makes one: as the columns a star has just written ([`TreeRoom::star`]), as the columns of a kept tree
+/// lent again ([`TreeRoom::resume`]), or by reborrowing another.
 /// The per-tree-node slices hold `n + 1` entries and the per-hung-node slices `n`, `n` being the length of
 /// `direction`, and every stored [`TreeNode`] lies below `n + 1`. Every write takes a [`TreeNode`] or a link, so every
 /// value stored is one this file made. That the nodes and links it is handed were made for, or read from, this same
@@ -291,6 +364,7 @@ impl TreeRoom {
             last_successor: Vec::new(),
             subtree_size: Vec::new(),
             potential: Vec::new(),
+            kept: Kept::Nothing,
         }
     }
 
@@ -315,7 +389,8 @@ impl TreeRoom {
     /// The star of `node_count` nodes and `arc_count` arcs, written into this room and lent from it: each node `v` a
     /// leaf under the root, hanging by its root link `arc_count + v` the way `directions` gives it, at potential zero
     /// below a link that points up and `root_cost` below one that points down; the root at potential zero; the thread
-    /// running root, `0`, `1`, …, `n − 1`. Nothing of an earlier tree is kept but the room.
+    /// running root, `0`, `1`, …, `n − 1`. Nothing of an earlier tree is kept but the room: a tree the room kept is
+    /// taken out before the first write.
     ///
     /// # Panics
     /// Panics if `node_count + 1` or `arc_count + node_count` passes `u32::MAX`, or if `directions` yields another
@@ -328,7 +403,7 @@ impl TreeRoom {
         arc_count: usize,
         directions: impl Iterator<Item = Direction>,
         root_cost: i64,
-    ) -> SpanningTree<'_> {
+    ) -> LentTree<'_> {
         let within = |count: Option<usize>| count.is_some_and(|count| count <= INDEX_LIMIT);
         assert!(
             within(node_count.checked_add(1)) && within(arc_count.checked_add(node_count)),
@@ -336,7 +411,9 @@ impl TreeRoom {
              {INDEX_LIMIT}"
         );
 
-        // The directions are counted where they were written, never by what the iterator says of its length.
+        // The room keeps no tree from its first write on; the directions are counted where they were written, never by
+        // what the iterator says of its length.
+        self.kept = Kept::Nothing;
         refill(&mut self.direction, directions);
         let given = self.direction.len();
         assert!(given == node_count, "called `TreeRoom::star` with {given} directions for {node_count} nodes");
@@ -347,7 +424,7 @@ impl TreeRoom {
     /// Writes every column but the directions as the star of the `n` directions the room holds: node `v` hanging by
     /// the link `arc_count + v`, at potential `root_cost` where its link points down and zero where it points up; and
     /// lends the tree. `n + 1` and `arc_count + n` are at most `u32::MAX`.
-    fn hang_star(&mut self, arc_count: usize, root_cost: i64) -> SpanningTree<'_> {
+    fn hang_star(&mut self, arc_count: usize, root_cost: i64) -> LentTree<'_> {
         let node_count = self.direction.len();
         // Every index narrowed below is at most `n + 1` or below `arc_count + n`, both at most `u32::MAX` as `star`
         // asserted: no narrowing can fail.
@@ -362,22 +439,40 @@ impl TreeRoom {
         let root_last = node_count.checked_sub(1).unwrap_or(node_count);
         refill(&mut self.last_successor, (0..node_count).chain(iter::once(root_last)).map(tree_node));
         refill(&mut self.subtree_size, iter::repeat_n(1, node_count).chain(iter::once(narrow(node_count + 1))));
-        refill(&mut self.parent_link, (arc_count..arc_count + node_count).map(narrow));
+        refill(&mut self.parent_link, (0..node_count).map(|node| narrow(root_link_of(arc_count, node))));
 
-        // A root link that points up costs nothing and one that points down `root_cost`: each potential makes its
-        // node's link tight.
-        let potential = |direction: &Direction| match direction {
-            Direction::Up => 0,
-            Direction::Down => root_cost,
-        };
+        // Each potential makes its node's root link tight below the root at zero.
+        let potential = |&direction: &Direction| tight_potential(0, root_link_cost(direction, root_cost), direction);
         refill(&mut self.potential, self.direction.iter().map(potential).chain(iter::once(0)));
 
-        SpanningTree { columns: self.lend(), link_count: arc_count + node_count }
+        self.lend(arc_count + node_count)
     }
 
-    /// The room's columns, lent as they stand.
-    fn lend(&mut self) -> TreeColumnsMut<'_> {
-        TreeColumnsMut {
+    /// The counts of the tree this room keeps, which [`resume`](Self::resume) lends again; `None` where it keeps
+    /// none. It reads, and changes nothing.
+    pub(crate) fn kept(&self) -> Option<KeptCounts> {
+        match self.kept {
+            Kept::Tree { link_count } => Some(KeptCounts { node_count: self.direction.len(), link_count }),
+            Kept::Nothing => None,
+        }
+    }
+
+    /// The tree this room keeps, lent again from the columns as its run left them, with its potentials; the room
+    /// keeps no tree until it is kept again. It costs nothing more.
+    ///
+    /// # Panics
+    /// Panics if the room keeps no tree: where [`kept`](Self::kept) answers `None`.
+    #[track_caller]
+    pub(crate) fn resume(&mut self) -> LentTree<'_> {
+        let Kept::Tree { link_count } = mem::take(&mut self.kept) else { resume_of_nothing_kept() };
+
+        self.lend(link_count)
+    }
+
+    /// The tree of `link_count` links whose columns the room holds, lent as they stand, beside the room's marker, which
+    /// its caller has taken out.
+    fn lend(&mut self, link_count: usize) -> LentTree<'_> {
+        let columns = TreeColumnsMut {
             parent: &mut self.parent,
             parent_link: &mut self.parent_link,
             direction: &mut self.direction,
@@ -386,7 +481,9 @@ impl TreeRoom {
             last_successor: &mut self.last_successor,
             subtree_size: &mut self.subtree_size,
             potential: &mut self.potential,
-        }
+        };
+
+        LentTree { tree: SpanningTree { columns, link_count }, kept: &mut self.kept }
     }
 }
 
@@ -406,10 +503,19 @@ impl<'r> SpanningTree<'r> {
         self.columns.potential
     }
 
-    /// Every tree node's potential, as [`potentials`](Self::potentials), lent for as long as the room is: what a run
-    /// answers when it is over.
-    pub(crate) fn into_potentials(self) -> &'r [i64] {
-        self.columns.potential
+    /// The root, the tree node after the `n` hung nodes.
+    pub(super) fn root(&self) -> TreeNode {
+        // The tree's `n + 1` tree nodes are at most `u32::MAX` (`SpanningTree`), so `n` is stored exactly.
+        TreeNode(stored(self.node_count()))
+    }
+
+    /// The root link of `node`, the link it hangs by where it hangs from the root: link `m + v` for node `v`.
+    pub(super) fn root_link(&self, node: HungNode) -> Link<'r> {
+        // A hung node is below `n`, so its root link is below `m + n`, the link count, at most `u32::MAX`
+        // (`SpanningTree`): it is stored exactly.
+        let raw = root_link_of(self.link_count - self.node_count(), usize::from(node));
+
+        Link(stored(raw), PhantomData)
     }
 
     /// The climb of the cycle an arc from `first` to `second` closes with the tree, from both ends up toward their
@@ -469,7 +575,8 @@ impl<'r> SpanningTree<'r> {
         self.columns.reborrow()
     }
 
-    /// The same tree, borrowed for less long.
+    /// The same tree, borrowed for less long: what a climb holds while it moves the tree. It has no marker: only the
+    /// [`LentTree`] it was borrowed from can be kept.
     fn reborrow(&mut self) -> SpanningTree<'_> {
         SpanningTree { columns: self.columns.reborrow(), link_count: self.link_count }
     }
@@ -477,6 +584,30 @@ impl<'r> SpanningTree<'r> {
     /// The hung node `raw`, where it is below the node count; `None` at the root and past it.
     fn hung_node(&self, raw: usize) -> Option<HungNode> {
         (raw < self.node_count()).then(|| HungNode(TreeNode(stored(raw))))
+    }
+}
+
+impl<'r> LentTree<'r> {
+    /// Ends the lending: the room keeps the tree whole for [`TreeRoom::resume`], and every tree node's potential, as
+    /// [`SpanningTree::potentials`], is lent for as long as the room is: what a run hands over when it is over.
+    pub(crate) fn keep(self) -> &'r [i64] {
+        let Self { tree, kept } = self;
+        *kept = Kept::Tree { link_count: tree.link_count };
+
+        tree.columns.potential
+    }
+
+    /// The tree lent, to be moved by a walk of the folder.
+    pub(super) fn tree_mut(&mut self) -> &mut SpanningTree<'r> {
+        &mut self.tree
+    }
+}
+
+impl<'r> Deref for LentTree<'r> {
+    type Target = SpanningTree<'r>;
+
+    fn deref(&self) -> &SpanningTree<'r> {
+        &self.tree
     }
 }
 
@@ -791,6 +922,22 @@ impl TreeColumnsMut<'_> {
         unsafe { *self.subtree_size.get_unchecked_mut(index) = size };
     }
 
+    /// The potential of `node`, in units of cost.
+    pub(super) fn potential(&self, node: TreeNode) -> i64 {
+        let index = usize::from(node);
+        debug_assert!(index < self.potential.len(), "a tree node should be below the tree's n + 1");
+        // SAFETY: a `TreeNode` is below the `n + 1` entries this slice holds (`TreeNode`, `TreeColumnsMut`).
+        unsafe { *self.potential.get_unchecked(index) }
+    }
+
+    /// Makes `potential` the potential of `node`, in units of cost.
+    pub(super) fn set_potential(&mut self, node: TreeNode, potential: i64) {
+        let index = usize::from(node);
+        debug_assert!(index < self.potential.len(), "a tree node should be below the tree's n + 1");
+        // SAFETY: a `TreeNode` is below the `n + 1` entries this slice holds (`TreeNode`, `TreeColumnsMut`).
+        unsafe { *self.potential.get_unchecked_mut(index) = potential };
+    }
+
     /// Adds `shift` to the potential of `node`, wrapping.
     pub(super) fn shift_potential(&mut self, node: TreeNode, shift: i64) {
         let index = usize::from(node);
@@ -803,7 +950,7 @@ impl TreeColumnsMut<'_> {
     }
 
     /// The link `node` hangs by, and which way it runs seen from `node`.
-    fn hanging(&self, node: HungNode) -> Hanging<'_> {
+    pub(super) fn hanging(&self, node: HungNode) -> Hanging<'_> {
         Hangings { links: self.parent_link, directions: self.direction }.of(node)
     }
 
@@ -820,6 +967,44 @@ impl TreeColumnsMut<'_> {
             *self.direction.get_unchecked_mut(index) = direction;
         }
     }
+}
+
+/// The cost of a root link that runs `direction` seen from its node, in units of cost: zero where it runs up, into the
+/// root, and `root_cost` where it runs down, out of it.
+pub(crate) const fn root_link_cost(direction: Direction, root_cost: i64) -> i64 {
+    match direction {
+        Direction::Up => 0,
+        Direction::Down => root_cost,
+    }
+}
+
+/// The potential, in units of cost, that makes a link of cost `cost`, running `direction` seen from the node below it,
+/// tight below a parent at potential `parent`: the parent's less the cost where the link runs up, plus the cost where
+/// it runs down, wrapping.
+pub(super) fn tight_potential(parent: i64, cost: i64, direction: Direction) -> i64 {
+    // A link is tight where its cost plus its tail's potential less its head's is zero; the node below is the tail of
+    // a link that runs up and the head of one that runs down. The tree cannot know the range its potentials are kept
+    // in; within it the sum is exact, and wrapping is that sum with no panic on the walk.
+    match direction {
+        Direction::Up => parent.wrapping_sub(cost),
+        Direction::Down => parent.wrapping_add(cost),
+    }
+}
+
+/// Panics for a resume of a room that keeps no tree, as [`TreeRoom::resume`] documents.
+///
+/// # Panics
+/// Always: that is its job.
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn resume_of_nothing_kept() -> ! {
+    panic!("called `TreeRoom::resume` on a room that keeps no tree")
+}
+
+/// The link node `node` hangs by from the root, in a tree of `arc_count` arcs: its root link, `arc_count + node`.
+fn root_link_of(arc_count: usize, node: usize) -> usize {
+    arc_count + node
 }
 
 /// `index` at the 32 bits the tree stores an index at, on the pivot's path: exact for every index this file hands it,
@@ -937,13 +1122,10 @@ pub(super) mod tests {
 
     /// The tree whose columns are `columns`, with `link_count` links, written into `room` as they are, in the room it
     /// holds: a test's tree in any state.
-    pub(in crate::tree) fn load<'r>(
-        room: &'r mut TreeRoom,
-        columns: &PlainColumns,
-        link_count: usize,
-    ) -> SpanningTree<'r> {
+    pub(in crate::tree) fn load<'r>(room: &'r mut TreeRoom, columns: &PlainColumns, link_count: usize) -> LentTree<'r> {
         let node = |index: &usize| TreeNode(u32::try_from(*index).expect("a test's node should fit a u32"));
         let raw = |index: usize| u32::try_from(index).expect("a test's index should fit a u32");
+        room.kept = Kept::Nothing;
         refill(&mut room.parent, columns.parents.iter().map(node));
         refill(&mut room.parent_link, columns.hangings.iter().map(|&(link, _)| raw(link)));
         refill(&mut room.direction, columns.hangings.iter().map(|&(_, direction)| direction));
@@ -953,7 +1135,7 @@ pub(super) mod tests {
         refill(&mut room.subtree_size, columns.subtree_sizes.iter().map(|&size| raw(size)));
         refill(&mut room.potential, columns.potentials.iter().copied());
 
-        SpanningTree { columns: room.lend(), link_count }
+        room.lend(link_count)
     }
 
     /// The tree of `model` with `link_count` links, threaded in the model's preorder, every link tight under `costs`.
@@ -962,12 +1144,12 @@ pub(super) mod tests {
         model: &PlainTree,
         link_count: usize,
         costs: &[i64],
-    ) -> SpanningTree<'r> {
+    ) -> LentTree<'r> {
         load(room, &model.columns(costs), link_count)
     }
 
     /// The tree of `model` with twice as many links as nodes, every potential zero.
-    pub(in crate::tree) fn plain_tree_of<'r>(room: &'r mut TreeRoom, model: &PlainTree) -> SpanningTree<'r> {
+    pub(in crate::tree) fn plain_tree_of<'r>(room: &'r mut TreeRoom, model: &PlainTree) -> LentTree<'r> {
         let link_count = 2 * model.root();
 
         tree_of(room, model, link_count, &vec![0; link_count])
@@ -1038,7 +1220,7 @@ pub(super) mod tests {
         };
         assert_eq!(columns_of(&tree), expected);
         assert_eq!((tree.node_count(), tree.link_count(), tree.potentials()), (3, 7, &[0, 9, 9, 0][..]));
-        assert_eq!(tree.into_potentials(), [0, 9, 9, 0]);
+        assert_eq!(tree.keep(), [0, 9, 9, 0]);
     }
 
     #[test]
@@ -1194,9 +1376,12 @@ pub(super) mod tests {
         assert_eq!((tree.hung_node(3), tree.hung_node(usize::MAX)), (None, None), "the root and past it");
         assert_eq!(tree.link(4).map(usize::from), Some(4));
         assert_eq!((tree.link(5), tree.link(usize::MAX)), (None, None));
-        assert!(tree.apex_climb(3, 0).is_none() && tree.apex_climb(0, usize::MAX).is_none(), "an end past the nodes");
+        assert!(
+            tree.tree_mut().apex_climb(3, 0).is_none() && tree.tree_mut().apex_climb(0, usize::MAX).is_none(),
+            "an end past the nodes"
+        );
 
-        let columns = tree.columns_mut();
+        let columns = tree.tree_mut().columns_mut();
         assert_eq!(columns.hung(TreeNode(2)).map(usize::from), Some(2));
         assert_eq!(columns.hung(TreeNode(3)), None, "the root");
     }
@@ -1208,7 +1393,7 @@ pub(super) mod tests {
         let (zero, one, root) = (TreeNode(0), TreeNode(1), TreeNode(2));
         let entering = tree.link(1).expect("link 1 lies below the link count");
 
-        let mut columns = tree.columns_mut();
+        let mut columns = tree.tree_mut().columns_mut();
         let hung_one = columns.hung(one).expect("1 lies below the root");
         let hung_zero = columns.hung(zero).expect("0 lies below the root");
         columns.set_parent(one, zero);
@@ -1230,6 +1415,94 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn test_the_views_read_and_write_a_potential_by_hand() {
+        let mut room = TreeRoom::new();
+        let mut tree = room.star(2, 3, [Direction::Up, Direction::Down].into_iter(), 6);
+
+        let mut columns = tree.tree_mut().columns_mut();
+        assert_eq!([0, 1, 2].map(|node| columns.potential(TreeNode(node))), [0, 6, 0]);
+        columns.set_potential(TreeNode(0), -9);
+        columns.set_potential(TreeNode(2), 4);
+        assert_eq!([0, 1, 2].map(|node| columns.potential(TreeNode(node))), [-9, 6, 4]);
+        assert_eq!(tree.potentials(), [-9, 6, 4]);
+    }
+
+    #[test]
+    fn test_the_root_and_each_hung_nodes_root_link_by_hand() {
+        let mut room = TreeRoom::new();
+        let tree = room.star(3, 4, iter::repeat_n(Direction::Up, 3), 1);
+        assert_eq!(usize::from(tree.root()), 3);
+        assert_eq!([0, 1, 2].map(|node| usize::from(tree.root_link(HungNode(TreeNode(node))))), [4, 5, 6]);
+
+        // Seven nodes and fourteen links: the root links are links 7 to 13, whatever the nodes hang by.
+        let tree = plain_tree_of(&mut room, &seven_nodes());
+        assert_eq!((usize::from(tree.root()), tree.link_count()), (7, 14));
+        assert_eq!([0, 3, 6].map(|node| usize::from(tree.root_link(HungNode(TreeNode(node))))), [7, 10, 13]);
+
+        let alone = room.star(0, 2, iter::empty(), 1);
+        assert_eq!(usize::from(alone.root()), 0);
+    }
+
+    #[test]
+    fn test_a_kept_tree_is_lent_again_as_its_run_left_it_by_hand() {
+        let model = seven_nodes();
+        let costs: Vec<i64> = (0..14).map(|link| 3 * link - 7).collect();
+        let mut room = TreeRoom::new();
+        let tree = tree_of(&mut room, &model, 14, &costs);
+        let before = columns_of(&tree);
+        assert!(before.potentials.iter().any(|&potential| potential != 0), "potentials a reload would lose");
+
+        assert_eq!(tree.keep(), before.potentials.as_slice());
+        assert_eq!(room.kept(), Some(KeptCounts { node_count: 7, link_count: 14 }));
+
+        let resumed = room.resume();
+        assert_eq!((resumed.node_count(), resumed.link_count()), (7, 14));
+        assert_eq!(columns_of(&resumed), before);
+    }
+
+    #[test]
+    fn test_a_kept_star_is_lent_again_as_it_was_left_by_hand() {
+        let mut room = TreeRoom::new();
+        let star = room.star(3, 4, [Direction::Up, Direction::Down, Direction::Down].into_iter(), 9);
+        let before = columns_of(&star);
+        let _ = star.keep();
+        assert_eq!(room.kept(), Some(KeptCounts { node_count: 3, link_count: 7 }));
+
+        assert_eq!(columns_of(&room.resume()), before);
+    }
+
+    #[test]
+    fn test_a_room_keeps_a_tree_only_from_its_keep_to_its_next_lending() {
+        let mut room = TreeRoom::new();
+        assert_eq!(room.kept(), None, "a new room keeps nothing");
+
+        let _ = room.star(3, 4, iter::repeat_n(Direction::Up, 3), 1);
+        assert_eq!(room.kept(), None, "a tree lent and dropped is not kept");
+
+        let _ = room.star(3, 4, iter::repeat_n(Direction::Up, 3), 1).keep();
+        let copy = room.clone();
+        let _ = room.star(2, 1, iter::repeat_n(Direction::Up, 2), 1);
+        assert_eq!(room.kept(), None, "a star after a keep takes it out");
+        assert_eq!(copy.kept(), Some(KeptCounts { node_count: 3, link_count: 7 }), "a copy keeps what was kept");
+
+        let _ = room.star(2, 1, iter::repeat_n(Direction::Up, 2), 1).keep();
+        let _ = room.resume();
+        assert_eq!(room.kept(), None, "a resume takes it out until the next keep");
+        let _ = room.star(2, 1, iter::repeat_n(Direction::Down, 2), 1).keep();
+        assert_eq!(room.kept(), Some(KeptCounts { node_count: 2, link_count: 3 }));
+    }
+
+    #[test]
+    #[should_panic(expected = "called `TreeRoom::resume` on a room that keeps no tree")]
+    fn test_resume_refuses_a_room_that_keeps_no_tree() {
+        let mut room = TreeRoom::new();
+        let _ = room.star(3, 4, iter::repeat_n(Direction::Up, 3), 1).keep();
+        let _ = room.resume();
+
+        let _ = room.resume();
+    }
+
+    #[test]
     fn test_the_climb_moves_the_smaller_subtree_and_ends_at_the_apex_by_hand() {
         let (first, second, up, down) = (Side::First, Side::Second, Direction::Up, Direction::Down);
         let mut room = TreeRoom::new();
@@ -1237,7 +1510,7 @@ pub(super) mod tests {
 
         // 3 and 4 have one node each: of two equal ones the second moves, to 0 of five nodes; then 3, of one node, 2,
         // of two, and 1, of three, each smaller than 0's five, climb to 0, where the two sides meet.
-        let mut climb = tree.apex_climb(3, 4).expect("3 and 4 lie below the node count");
+        let mut climb = tree.tree_mut().apex_climb(3, 4).expect("3 and 4 lie below the node count");
         assert_eq!(climb.step().as_ref().map(plain_step), Some(step(second, 4, 4, up)));
         assert_eq!(climb.step().as_ref().map(plain_step), Some(step(first, 3, 3, up)));
         assert_eq!(climb.step().as_ref().map(plain_step), Some(step(first, 2, 2, down)));
@@ -1256,7 +1529,7 @@ pub(super) mod tests {
         let mut tree = plain_tree_of(&mut room, &seven_nodes());
 
         // 6, of one node, moves first, to 5, of two; then the second end 2, of two as well, would move.
-        let mut climb = tree.apex_climb(6, 2).expect("6 and 2 lie below the node count");
+        let mut climb = tree.tree_mut().apex_climb(6, 2).expect("6 and 2 lie below the node count");
         assert_eq!(climb.step().as_ref().map(plain_step), Some(step(first, 6, 6, up)));
         let ends = climb.into_ends();
         assert_eq!((usize::from(ends.end(first)), usize::from(ends.end(second)), usize::from(ends.apex())), (6, 2, 7));
@@ -1274,13 +1547,13 @@ pub(super) mod tests {
         let nodes = tree.node_count();
 
         // 1 is an ancestor of 3: of the subtree sizes 3 and 1 the second moves, to 2, of two, then to 1 itself.
-        let climb = tree.apex_climb(1, 3).expect("1 and 3 lie below the node count");
+        let climb = tree.tree_mut().apex_climb(1, 3).expect("1 and 3 lie below the node count");
         assert_eq!(climbed(climb, nodes), (vec![step(second, 3, 3, up), step(second, 2, 2, down)], [1, 3, 1]));
 
         // A loop at 2: the apex is 2, and the climb takes no step.
-        let climb = tree.apex_climb(2, 2).expect("2 lies below the node count");
+        let climb = tree.tree_mut().apex_climb(2, 2).expect("2 lies below the node count");
         assert_eq!(climbed(climb, nodes), (vec![], [2, 2, 2]));
-        let ends = tree.apex_climb(2, 2).expect("2 lies below the node count").into_ends();
+        let ends = tree.tree_mut().apex_climb(2, 2).expect("2 lies below the node count").into_ends();
         assert!(ends.side(first).next().is_none() && ends.side(second).next().is_none());
     }
 
@@ -1296,11 +1569,11 @@ pub(super) mod tests {
             let mut tree = tree_of(&mut room, &model, link_count_of(&model), &vec![0; link_count_of(&model)]);
             let nodes = tree.node_count();
 
-            let checked = tree.apex_climb(first, second).map(|climb| climbed(climb, nodes));
+            let checked = tree.tree_mut().apex_climb(first, second).map(|climb| climbed(climb, nodes));
             if first < nodes && second < nodes {
                 debug_assert!(first < nodes && second < nodes, "both ends should be below the node count");
                 // SAFETY: both ends are below the node count, as the branch just tested.
-                let unchecked = climbed(unsafe { tree.apex_climb_unchecked(first, second) }, nodes);
+                let unchecked = climbed(unsafe { tree.tree_mut().apex_climb_unchecked(first, second) }, nodes);
                 prop_assert_eq!(checked, Some(unchecked));
             } else {
                 prop_assert_eq!(checked, None);
@@ -1331,7 +1604,7 @@ pub(super) mod tests {
             let mut room = TreeRoom::new();
             let mut tree = tree_of(&mut room, &model, link_count_of(&model), &vec![0; link_count_of(&model)]);
             let nodes = tree.node_count();
-            let columns = tree.columns_mut();
+            let columns = tree.tree_mut().columns_mut();
 
             // Every tree node, the root last: the checked form refuses exactly the root.
             for index in 0..=nodes {
@@ -1363,6 +1636,34 @@ pub(super) mod tests {
     fn test_a_direction_reversed_is_the_other() {
         assert_eq!(Direction::Up.reversed(), Direction::Down);
         assert_eq!(Direction::Down.reversed(), Direction::Up);
+    }
+
+    #[test]
+    fn test_a_root_link_costs_nothing_up_and_the_root_cost_down_by_hand() {
+        assert_eq!(root_link_cost(Direction::Up, 11), 0);
+        assert_eq!(root_link_cost(Direction::Down, 11), 11);
+        assert_eq!(const { root_link_cost(Direction::Down, i64::MAX) }, i64::MAX);
+    }
+
+    #[test]
+    fn test_a_tight_potential_takes_the_cost_off_up_and_adds_it_down_by_hand() {
+        // Up: the node is the tail, `7 + π − 10 = 0` at `π = 3`. Down: the node is the head, `7 + 10 − π = 0` at 17.
+        assert_eq!(tight_potential(10, 7, Direction::Up), 3);
+        assert_eq!(tight_potential(10, 7, Direction::Down), 17);
+        assert_eq!(tight_potential(-4, -6, Direction::Up), 2);
+        assert_eq!(tight_potential(-4, -6, Direction::Down), -10);
+
+        // Below the root at zero, a root link makes its node's potential zero up and the root cost down.
+        for (direction, potential) in [(Direction::Up, 0), (Direction::Down, 11)] {
+            assert_eq!(tight_potential(0, root_link_cost(direction, 11), direction), potential);
+        }
+
+        assert_eq!(tight_potential(i64::MIN, 1, Direction::Up), i64::MAX, "wrapping");
+    }
+
+    #[test]
+    fn test_a_nodes_root_link_follows_the_arcs_by_hand() {
+        assert_eq!((root_link_of(4, 0), root_link_of(4, 2), root_link_of(0, 3)), (4, 6, 3));
     }
 
     #[test]

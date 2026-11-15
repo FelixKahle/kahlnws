@@ -24,6 +24,16 @@
  * kahlnws_work; on a refusal, it reads the breach from the kahlnws_refusal, or its text from
  * kahlnws_refusal_message. It frees the solver with kahlnws_solver_free.
  *
+ * Solving again. A solver keeps the basis its last solve ended on, optimal or infeasible. A program that solves a
+ * problem again after some of its numbers changed calls kahlnws_solver_resolve, with the same arguments as
+ * kahlnws_solver_solve: it starts from that basis where it serves, where the problem has the node and arc counts of
+ * that solve and every arc its tail and its head and the supplies the basis leaves stay within range. Where only some
+ * numbers changed it then often makes far fewer pivots, and the same problem again, where the kept basis serves, makes
+ * none. Where the basis cannot serve, it answers exactly as kahlnws_solver_solve does. Both entries answer the same
+ * status, the same cost, and potentials that prove the flow optimal; only kahlnws_solver_solve answers the flows
+ * among tied optima, the potentials and the work as a function of the problem alone, while kahlnws_solver_resolve
+ * answers a function of the problem and of the solves before it.
+ *
  * Ownership. The library owns only the solvers it makes, from kahlnws_solver_new to kahlnws_solver_free. Every
  * other pointer belongs to the caller: a call reads or writes through it while it runs, and keeps none.
  *
@@ -102,8 +112,10 @@
  *
  * Opaque: C holds it only by the pointer kahlnws_solver_new answers, passes that pointer to the other entries, and
  * gives it back to kahlnws_solver_free. The room only grows, by kahlnws_solver_reserve or by a solve of a
- * problem larger than the room held; a solve of a problem within the room allocates nothing. Nothing of an earlier
- * problem or of what a solve of it found is kept: what a solve finds depends on its problem alone.
+ * problem larger than the room held; a solve of a problem within the room allocates nothing.
+ *
+ * It also keeps the basis its last solve ended on, by either entry, optimal or infeasible, which only
+ * kahlnws_solver_resolve reads: what kahlnws_solver_solve finds depends on its problem alone.
  *
  * One thread at a time uses a solver: no two calls that take the same solver may run at once. A solver may move
  * from one thread to another between calls, and distinct solvers may be used on distinct threads at once.
@@ -113,7 +125,8 @@ typedef struct kahlnws_solver kahlnws_solver;
 /**
  * @brief How a call went, by a number fixed for good: one of the KAHLNWS_STATUS_ constants.
  *
- * kahlnws_solver_reserve and kahlnws_solver_solve answer one; each says which it can answer.
+ * kahlnws_solver_reserve, kahlnws_solver_solve and kahlnws_solver_resolve answer one; each says which it can
+ * answer.
  *
  * The numbers are part of the binary interface: none is ever changed or given to another status. Plain data: a
  * caller may hold any number, and kahlnws_status_name names every one.
@@ -121,12 +134,12 @@ typedef struct kahlnws_solver kahlnws_solver;
 typedef uint32_t kahlnws_status;
 enum {
   /**
-   * @brief kahlnws_solver_solve found a flow of least cost and wrote it.
+   * @brief A solve found a flow of least cost and wrote it.
    */
   KAHLNWS_STATUS_OPTIMAL = 0,
   /**
-   * @brief kahlnws_solver_solve found that no flow within the bounds meets the supplies, and wrote nothing but the work
-   * of the solve.
+   * @brief A solve found that no flow within the bounds meets the supplies, and wrote nothing but the work of the
+   * solve.
    */
   KAHLNWS_STATUS_INFEASIBLE = 1,
   /**
@@ -134,8 +147,8 @@ enum {
    */
   KAHLNWS_STATUS_RESERVED = 2,
   /**
-   * @brief kahlnws_solver_solve refused the problem, which lies outside what a solve admits, and wrote nothing but the
-   * refusal that names the breach.
+   * @brief A solve refused the problem, which lies outside what a solve admits, and wrote nothing but the refusal that
+   * names the breach.
    */
   KAHLNWS_STATUS_REFUSED = 3,
   /**
@@ -240,7 +253,8 @@ typedef struct kahlnws_int128 {
 
 /**
  * @brief What one solve did, counted in pivots: exact counts of that solve, not samples or estimates.
- * kahlnws_solver_solve writes it, where asked, on KAHLNWS_STATUS_OPTIMAL and on KAHLNWS_STATUS_INFEASIBLE.
+ * kahlnws_solver_solve and kahlnws_solver_resolve write it, where asked, on KAHLNWS_STATUS_OPTIMAL and on
+ * KAHLNWS_STATUS_INFEASIBLE.
  *
  * A pivot is an arc brought into the basis, a spanning tree, or flipped to its other bound. Either way the arc
  * violated its bound, and the most flow the cycle it closes with the tree carries is sent around that cycle: where a
@@ -248,8 +262,10 @@ typedef struct kahlnws_int128 {
  * less its lower bound is the least, no link leaves and the arc moves to its other bound, a flip. A flip sends that
  * whole difference, which is above zero, since an arc whose capacity equals its lower bound never enters.
  *
- * Plain data. The counts depend on the problem alone, its arc order included, and on the library's version: the same
- * problem gives the same work from a fresh solver and from one that solved others before. In every kahlnws_work a
+ * Plain data. The counts kahlnws_solver_solve writes depend on the problem alone, its arc order included, and on
+ * the library's version: the same problem gives the same work from a fresh solver and from one that solved others
+ * before. Those kahlnws_solver_resolve writes depend on the problem and on the solves the solver made before it,
+ * and are those of kahlnws_solver_solve where it does not start from the kept basis. In every kahlnws_work a
  * solve writes, degenerate_pivots <= pivots and first_arc_pivots <= pivots, and the pivots that sent flow are
  * pivots - degenerate_pivots. A solve that answers ran pivots - first_arc_pivots + 1 block searches.
  */
@@ -267,7 +283,8 @@ typedef struct kahlnws_work {
   /**
    * @brief Of the pivots, those made by the arcs the solve tries before block search, chosen from the problem's
    * structure, each where it violated its bound when its turn came. At most pivots. 0 where none was chosen or none
-   * violated, and pivots where those arcs alone reached the outcome, optimal or infeasible.
+   * violated, and in a resolve from the kept basis, which tries none; pivots where those arcs alone reached the
+   * outcome, optimal or infeasible.
    */
   uint64_t first_arc_pivots;
 } kahlnws_work;
@@ -299,12 +316,13 @@ enum {
    */
   KAHLNWS_REFUSAL_KIND_LOWER_ABOVE_CAPACITY = 4,
   /**
-   * @brief An arc's cost lies beyond plus or minus kahlnws_cost_bound(node_count). Sets arc, cost and node_count.
+   * @brief An arc's cost lies beyond plus or minus kahlnws_cost_bound(node_count). Sets arc, cost and
+   * node_count.
    */
   KAHLNWS_REFUSAL_KIND_COST_BEYOND_BOUND = 5,
   /**
-   * @brief The magnitudes of the costs times the capacities, added up in arc order, pass 2^127 - 1. Sets arc, the arc
-   * at which the sum passes.
+   * @brief The magnitudes of the costs times the capacities, added up in arc order, pass 2^127 - 1. Sets arc, the
+   * arc at which the sum passes.
    */
   KAHLNWS_REFUSAL_KIND_COST_TOTAL_BEYOND_RANGE = 6,
   /**
@@ -339,7 +357,7 @@ typedef struct kahlnws_uint128 {
 } kahlnws_uint128;
 
 /**
- * @brief Why kahlnws_solver_solve refused a problem: the breach, by its kind, and the values that make it one.
+ * @brief Why a solve refused a problem: the breach, by its kind, and the values that make it one.
  *
  * A problem with several breaches is refused with the first in the order of the kinds' numbers, where the kinds
  * about one arc, from KAHLNWS_REFUSAL_KIND_TAIL_OUTSIDE_NODES to KAHLNWS_REFUSAL_KIND_COST_TOTAL_BEYOND_RANGE,
@@ -457,6 +475,9 @@ kahlnws_status kahlnws_solver_reserve(struct kahlnws_solver *solver,
  * problem too large for memory answers KAHLNWS_STATUS_NO_ROOM before it could be refused as too large. Where the
  * room already holds the problem, by kahlnws_solver_reserve or an earlier solve, the call allocates nothing.
  *
+ * The solver keeps the basis an optimal or infeasible solve ended on, for a later kahlnws_solver_resolve; a call
+ * that answers another status keeps the basis kept before, but an internal error, which may leave none.
+ *
  * @param[in,out] solver the solver, whose room the solve uses and may grow.
  * @param[in] problem the problem to solve.
  * @param[out] flows where the flow of each arc is written, arc a at a: storage for problem->arc_count entries,
@@ -502,6 +523,82 @@ kahlnws_status kahlnws_solver_solve(struct kahlnws_solver *solver,
                                     struct kahlnws_int128 *total_cost,
                                     struct kahlnws_work *work,
                                     struct kahlnws_refusal *refusal);
+
+/**
+ * @brief Solves problem with solver from the basis the solver's last solve ended on, where that basis serves:
+ * answers as kahlnws_solver_solve does, the same status and the same cost, with potentials that prove the flow
+ * optimal.
+ *
+ * The basis serves where a solve of solver, by either entry, optimal or infeasible, has ended since the solver was
+ * made and since any call of it that answered KAHLNWS_STATUS_INTERNAL_ERROR, which may leave none; where problem
+ * has that solve's node and arc counts and every arc the tail and the head it had; and where the flows that basis
+ * puts on its arcs out of the tree keep the supplies net of them within the limit
+ * KAHLNWS_REFUSAL_KIND_NET_SUPPLY_BEYOND_RANGE names. Its tree is kept and every number is read anew from
+ * problem. Where the basis cannot serve, the call answers and writes exactly what kahlnws_solver_solve does, its
+ * work included. So any problem is solved, after any call.
+ *
+ * Where the basis serves and only some numbers changed, it often makes far fewer pivots than a solve, and the same
+ * problem again makes none. Of a problem with several optimal flows it may write another than kahlnws_solver_solve
+ * writes, and other potentials: its flows, potentials and work are a function of the problem and of the solves before
+ * it, deterministic still. A resolve from the kept basis tries no arcs before block search, so the first_arc_pivots
+ * it writes are 0.
+ *
+ * On every status but KAHLNWS_STATUS_OPTIMAL the flows, the potentials and the cost are as they were; the work is
+ * written on KAHLNWS_STATUS_OPTIMAL and KAHLNWS_STATUS_INFEASIBLE alone, and the refusal on
+ * KAHLNWS_STATUS_REFUSED alone; an internal error leaves the outputs unspecified.
+ *
+ * Room. As in kahlnws_solver_solve, the solver's room is grown to the problem's counts and kept before the problem
+ * is checked; where the room already holds the problem, by kahlnws_solver_reserve or an earlier solve, the call
+ * allocates nothing.
+ *
+ * The solver keeps the basis an optimal or infeasible resolve ended on, as a solve does; a call that answers another
+ * status keeps the basis kept before, but an internal error, which may leave none.
+ *
+ * @param[in,out] solver the solver, whose room the solve uses and may grow.
+ * @param[in] problem the problem to solve.
+ * @param[out] flows where the flow of each arc is written, arc a at a: storage for problem->arc_count entries,
+ * which may be null where that count is zero.
+ * @param[out] potentials where each node's potential is written, node v at v: storage for problem->node_count
+ * entries, or null where the potentials are not wanted.
+ * @param[out] total_cost where the cost of the flow is written, or null where it is not wanted.
+ * @param[out] work where the work of the solve is written, or null where it is not wanted.
+ * @param[out] refusal where the breach of a refused problem is written, or null where it is not wanted.
+ *
+ * @retval KAHLNWS_STATUS_OPTIMAL the flow of each arc is written to flows, arc a at a; where potentials is not
+ * null, each node's potential to it, node v at v; where total_cost is not null, the cost of the flow to it; where
+ * work is not null, the work of the solve to it. With the potentials, cost + potential[tail] - potential[head] is
+ * at least zero on every arc whose flow is below its capacity and at most zero on every arc whose flow is above its
+ * lower bound, which proves the flow optimal;
+ * @retval KAHLNWS_STATUS_INFEASIBLE no flow within the bounds meets the supplies; where work is not null, the work of
+ * the solve is written to it;
+ * @retval KAHLNWS_STATUS_REFUSED the problem lies outside what a solve admits; where refusal is not null, the breach
+ * is written to it;
+ * @retval KAHLNWS_STATUS_NULL_POINTER solver, problem or flows is null, or a table of the problem other than its
+ * lower bounds is null while its count is above zero;
+ * @retval KAHLNWS_STATUS_INVALID_ARGUMENT a pointer the call reads or writes is not aligned for its type, or a count of
+ * entries passes PTRDIFF_MAX bytes;
+ * @retval KAHLNWS_STATUS_NO_ROOM the memory for the room the problem needs was refused;
+ * @retval KAHLNWS_STATUS_INTERNAL_ERROR an internal error was caught.
+ *
+ * @pre solver is null, or a pointer kahlnws_solver_new answered that has not been freed since and that no other
+ * call uses meanwhile: one thread at a time uses a solver;
+ * @pre problem is null or points to a kahlnws_problem whose every pointer points to what its doc states;
+ * @pre flows points to writable storage for problem->arc_count entries, and may be null where that count is zero;
+ * @pre potentials is null or points to writable storage for problem->node_count entries;
+ * @pre total_cost, work and refusal are each null or point to writable storage for one value;
+ * @pre an array lies within one object; what an output held before does not matter;
+ * @pre no output overlaps another output, the problem or its tables; nothing writes the problem or its tables, and
+ * nothing else reads or writes the outputs, while the call runs.
+ */
+KAHLNWS_API
+KAHLNWS_NODISCARD
+kahlnws_status kahlnws_solver_resolve(struct kahlnws_solver *solver,
+                                      const struct kahlnws_problem *problem,
+                                      uint64_t *flows,
+                                      int64_t *potentials,
+                                      struct kahlnws_int128 *total_cost,
+                                      struct kahlnws_work *work,
+                                      struct kahlnws_refusal *refusal);
 
 /**
  * @brief Writes the message of the breach refusal names to buffer, as UTF-8 ending in a NUL.

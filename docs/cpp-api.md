@@ -99,11 +99,37 @@ storage with a table or with the other buffer, is an error of the kind `invalid_
 Where the problem is infeasible, or refused, or an argument is not admitted, the buffers hold what they held before;
 an internal error leaves them unspecified.
 
+## Solving again
+
+A solver keeps the basis its last solve ended on, optimal or infeasible. `try_resolve` and `try_resolve_into` take the
+same arguments as `try_solve` and `try_solve_into` and answer the same types, and start from that basis where it serves:
+where the problem has the node and arc counts of that solve and every arc the tail and the head it had, and the supplies
+the basis leaves stay within the range a solve admits. The tree is kept and every number is read anew; where only some
+numbers changed, a resolve often makes far fewer pivots, and the same problem again, where the kept basis serves, makes
+none. Where the basis cannot serve, as on a new solver or for a problem of other counts, a resolve answers exactly what
+a solve answers, its work included.
+
+```cpp
+const kahlnws::result<kahlnws::answer<kahlnws::solution>> solved = solver.try_solve(problem);
+// ... the program changes some supplies or costs of the same arcs ...
+const kahlnws::result<kahlnws::answer<kahlnws::solution>> resolved = solver.try_resolve(problem);
+// resolved->work.pivots is often far below what a fresh solve makes
+```
+
+Every form answers the same outcome, the same cost, and potentials that prove the flow optimal. Only a solve answers
+the flows among tied optima, the potentials and the work as a function of the problem alone; a resolve answers a
+function of the problem and of the solves before it, and its `work.first_arc_pivots` is 0 where it starts from the kept
+basis. Each form keeps the basis an answer ended on, and a call that fails keeps the basis kept before, but an internal
+error, which may leave none. A move carries the basis with the solver.
+
+`try_resolve_into` allocates nothing where the solver's room holds the problem, made by `try_reserve` or by an earlier
+solve of either kind, just as `try_solve_into`: every form makes the room before it solves.
+
 ## Errors as values
 
 Every call that can fail has a form whose name begins with `try_` and that never throws and is present in every build:
-`try_reserve`, `try_solve`, `try_solve_into` and `try_cost_bound`. Each answers a `result`, which converts to `true`
-where it holds its value. `error()` says why it does not:
+`try_reserve`, `try_solve`, `try_solve_into`, `try_resolve`, `try_resolve_into` and `try_cost_bound`. Each answers a
+`result`, which converts to `true` where it holds its value. `error()` says why it does not:
 
 | `error_kind` | When |
 |---|---|
@@ -131,8 +157,8 @@ error's message is held inside the error, so building one allocates nothing.
 
 ## Errors as exceptions
 
-Where exceptions are enabled, the plain names are the throwing forms: `reserve`, `solve`, `solve_into` and
-`cost_bound`. Each calls its `try_` twin and throws what that answered:
+Where exceptions are enabled, the plain names are the throwing forms: `reserve`, `solve`, `solve_into`, `resolve`,
+`resolve_into` and `cost_bound`. Each calls its `try_` twin and throws what that answered:
 
 | Error | Exception |
 |---|---|
@@ -168,9 +194,9 @@ const std::string cost = kahlnws::to_string(solution->total_cost);
 
 ## Moving a solver
 
-A `network_simplex` is movable and not copyable. A solver that was moved from is a solver with no room, the same as
-a new one, and may be used again. A new solver holds no memory; its room is made by a reservation or by its first
-solve.
+A `network_simplex` is movable and not copyable. A solver moved into takes the room and the kept basis of the one it
+was moved from; a solver that was moved from is a solver with no room and no basis, the same as a new one, and may be
+used again. A new solver holds no memory; its room is made by a reservation or by its first solve.
 
 ## Threads
 
@@ -222,7 +248,7 @@ It prints `cost 14, 4 pivots`, with exceptions enabled or not.
 
 ## Examples
 
-`crates/kahlnws_capi/examples/` holds four programs, the same four the other guides show in their languages, each
+`crates/kahlnws_capi/examples/` holds five programs, the same five the other guides show in their languages, each
 beside its C twin. Each solves a small transport network, two warehouses that serve three shops, with the `try_` forms,
 so that it builds with exceptions enabled or not:
 
@@ -230,6 +256,7 @@ so that it builds with exceptions enabled or not:
 |---|---|
 | `transport.cpp` | the smallest useful call: one owned answer, its cost and the flow on each lane |
 | `reuse.cpp` | one solver for three days of demands, its room reserved once, each day solved into the same buffer |
+| `resolve.cpp` | the days of `reuse.cpp`, each after the first resolved from the day before, beside fresh pivots |
 | `outcomes.cpp` | an infeasible outcome, a refused problem as an error value and, with exceptions, as thrown |
 | `potentials.cpp` | the potentials, each lane's reduced cost, the optimality conditions checked, the solve's work |
 

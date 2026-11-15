@@ -78,9 +78,9 @@ pub(crate) unsafe fn solver_mut<'a>(solver: *mut Solver) -> Result<&'a mut Solve
     Ok(unsafe { &mut *solver })
 }
 
-/// The call of `kahlnws_solver_solve` with these pointers: the problem `problem` points to, its tables lent, and the
-/// outputs, each lent as storage to be written for the length the problem's counts state; the outputs C passes as
-/// null are not wanted.
+/// The call of `kahlnws_solver_solve` or `kahlnws_solver_resolve` with these pointers: the problem `problem` points
+/// to, its tables lent, and the outputs, each lent as storage to be written for the length the problem's counts
+/// state; the outputs C passes as null are not wanted.
 ///
 /// # Errors
 /// Returns [`PointerFault::Null`] where `problem` is null, or `flows` or a table of the problem other than its lower

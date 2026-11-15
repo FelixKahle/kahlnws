@@ -1,30 +1,34 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The solver: the room it keeps, the reservation, the two entry points, and the run of one problem in that room.
+//! The solver: the room it keeps, the reservation, the four entry points, and the run of one problem in that room.
 
 use std::collections::TryReserveError;
 
-use crate::basis::{Basis, BasisRoom};
+use crate::basis::{Basis, BasisRoom, Resumed};
 use crate::first_pivots::FirstPivots;
 use crate::outcome::{Answer, Optimum, Outcome, Solution, Work};
 use crate::pricing::BlockSearch;
 use crate::problem::{CheckedProblem, Problem, ProblemError};
 use crate::slot_order::Slot;
-use crate::starting_basis::NetSupplies;
+use crate::starting_basis::{Excesses, NetSupplies, Start};
 
 /// A primal network simplex with the room it works in.
 ///
 /// It solves a [`Problem`] in exact integer arithmetic: it finds a flow of least cost, or that no flow within the
 /// bounds meets the supplies. [`solve`](Self::solve) answers the flows, the potentials and the cost owned;
 /// [`solve_into`](Self::solve_into) writes the flows to a buffer the caller holds and lends the potentials. Either
-/// answers its outcome as an [`Answer`], beside the [`Work`] the solve did.
+/// answers its outcome as an [`Answer`], beside the [`Work`] the solve did. [`resolve`](Self::resolve) and
+/// [`resolve_into`](Self::resolve_into) answer the same, starting from the basis the solver's last solve ended on.
 ///
 /// The room is kept from one solve to the next and only grows: a solve of a problem with no more nodes and no more
 /// arcs than the room was made for, by [`try_reserve`](Self::try_reserve) or by an earlier solve that answered,
-/// optimal or infeasible, allocates nothing in `solve_into`. A solve that was refused makes no such room. Nothing of
-/// an earlier problem or its [`Answer`] is kept: an `Answer` is a function of the problem alone, its arc order
-/// included, and a solve that panicked leaves room behind and nothing else.
+/// optimal or infeasible, allocates nothing in `solve_into`. A solve that was refused makes no such room.
+///
+/// The room also keeps the basis the last solve ended on, optimal or infeasible alike, which only a resolve reads. A
+/// solve never reads it: its `Answer` is a function of the problem alone, its arc order included. A call that is
+/// refused, or that panics on its buffer, writes no basis and keeps the basis kept; a solve that panics after it began
+/// to write the basis leaves room behind and no basis.
 ///
 /// ```
 /// use kahlnws::{NetworkSimplex, Outcome, Problem, ProblemError};
@@ -40,8 +44,14 @@ use crate::starting_basis::NetSupplies;
 ///         supplies: &[2, -2],
 ///     };
 ///
-///     let solution = NetworkSimplex::new().solve(&problem)?.outcome.optimal().expect("two units fit the two arcs");
+///     let mut solver = NetworkSimplex::new();
+///     let solution = solver.solve(&problem)?.outcome.optimal().expect("two units fit the two arcs");
 ///     assert_eq!((solution.flows, solution.total_cost), (vec![1, 1], 4));
+///
+///     // The cheaper arc is narrowed to nothing: the resolve starts from the basis the solve ended on.
+///     let narrowed = Problem { capacities: &[2, 0], ..problem };
+///     let solution = solver.resolve(&narrowed)?.outcome.optimal().expect("the wide arc carries both units");
+///     assert_eq!((solution.flows, solution.total_cost), (vec![2, 0], 6));
 ///
 ///     Ok(())
 /// }
@@ -50,18 +60,21 @@ use crate::starting_basis::NetSupplies;
 pub struct NetworkSimplex {
     /// The room of each node's supply net of the lower bounds.
     net_supplies: NetSupplies,
-    /// The room of the basis a run pivots on.
+    /// The room of each node's excess over the kept basis.
+    excesses: Excesses,
+    /// The room of the basis a run pivots on, and the basis the last run ended on.
     basis: BasisRoom,
     /// The room of the arcs tried before block search.
     first_pivots: FirstPivots,
 }
 
-/// One run of the network simplex on one problem, in the room of a solver: the basis loaded as the star of the
-/// problem's start, the arcs the first pivots chose for it, and the work done on it so far.
+/// One run of the network simplex on one problem, in the room of a solver: the basis loaded from the problem's start,
+/// the arcs tried before block search, and the work done on it so far.
 ///
 /// # Invariant
-/// Only [`Run::new`] makes one: `first_arcs` are slots the first pivots chose for the problem `basis` was loaded from,
-/// so each lies below its arc count. `work` counts every pivot made on `basis` since the load, and nothing else; every
+/// Only [`Run::of_star`] and [`Run::resumed`] make one: `first_arcs` are slots below the arc count of the problem
+/// `basis` was loaded from: those the first pivots chose for the problem where the basis is its star, and none where
+/// it is the kept basis re-flowed. `work` counts every pivot made on `basis` since the load, and nothing else; every
 /// pivot made before block search is a first arc's, so `first_arc_pivots` is `pivots` as the first arcs leave it.
 #[derive(Debug)]
 struct Run<'s, 'p> {
@@ -76,11 +89,17 @@ struct Run<'s, 'p> {
 impl NetworkSimplex {
     /// A solver that holds no room yet; it allocates nothing.
     pub const fn new() -> Self {
-        Self { net_supplies: NetSupplies::new(), basis: BasisRoom::new(), first_pivots: FirstPivots::new() }
+        Self {
+            net_supplies: NetSupplies::new(),
+            excesses: Excesses::new(),
+            basis: BasisRoom::new(),
+            first_pivots: FirstPivots::new(),
+        }
     }
 
     /// Makes room for problems of up to `node_count` nodes and `arc_count` arcs: a [`solve_into`](Self::solve_into)
-    /// of such a problem allocates nothing afterwards. Room already held is kept, and nothing else changes.
+    /// or a [`resolve_into`](Self::resolve_into) of such a problem allocates nothing afterwards. Room already held is
+    /// kept, and nothing else changes: a kept basis stays kept.
     ///
     /// # Errors
     /// Returns the `TryReserveError` of the first refused reservation.
@@ -93,6 +112,7 @@ impl NetworkSimplex {
     /// ```
     pub fn try_reserve(&mut self, node_count: usize, arc_count: usize) -> Result<(), TryReserveError> {
         self.net_supplies.try_reserve(node_count)?;
+        self.excesses.try_reserve(node_count)?;
         self.basis.try_reserve(node_count, arc_count)?;
         self.first_pivots.try_reserve(node_count, arc_count)
     }
@@ -101,7 +121,8 @@ impl NetworkSimplex {
     /// potentials that prove it optimal, lent by the solver, or that no flow within the bounds meets the supplies,
     /// with the [`Work`] the solve did either way. On [`Outcome::Infeasible`] and on an error `flows` is as it was.
     ///
-    /// Where the solver's room holds the problem, it allocates nothing.
+    /// Where the solver's room holds the problem, it allocates nothing. The solver keeps the basis the solve ended on
+    /// for a later [`resolve`](Self::resolve).
     ///
     /// # Errors
     /// Given a buffer of the right length, returns the first breach of `problem`, as [`ProblemError`] orders them.
@@ -150,18 +171,15 @@ impl NetworkSimplex {
             "called `NetworkSimplex::solve_into` with {length} flows, which should be the arc count {arc_count}"
         );
 
-        let mut run = Run::new(self, problem.checked()?)?;
-        run.enter_first_arcs();
-        run.enter_by_block_search();
-
-        Ok(run.answer(flows))
+        Ok(Run::from_star(self, problem.checked()?)?.run_to_end(flows))
     }
 
     /// Solves `problem` and answers its flows, its potentials and the cost, owned, or that no flow within the bounds
     /// meets the supplies, with the [`Work`] the solve did either way: the work [`solve_into`](Self::solve_into)
     /// answers for the same problem.
     ///
-    /// It allocates the flows and the potentials it answers, and room for a problem larger than the solver held.
+    /// It allocates the flows and the potentials it answers, and room for a problem larger than the solver held. The
+    /// solver keeps the basis the solve ended on for a later [`resolve`](Self::resolve).
     ///
     /// # Errors
     /// Returns the first breach of `problem`, as [`ProblemError`] orders them.
@@ -191,34 +209,186 @@ impl NetworkSimplex {
     /// ```
     pub fn solve(&mut self, problem: &Problem<'_>) -> Result<Answer<Solution>, ProblemError> {
         let mut flows = vec![0; problem.tails.len()];
-        let Answer { outcome, work } = self.solve_into(problem, &mut flows)?;
+        let answer = self.solve_into(problem, &mut flows)?;
 
-        let outcome = match outcome {
-            // The potentials are the solver's own column, lent until the next solve; the solution owns a copy.
-            Outcome::Optimal(Optimum { total_cost, potentials }) => {
-                Outcome::Optimal(Solution { flows, potentials: potentials.to_vec(), total_cost })
-            }
-            Outcome::Infeasible => Outcome::Infeasible,
-        };
+        Ok(owned(answer, flows))
+    }
 
-        Ok(Answer { outcome, work })
+    /// Solves `problem` from the basis the solver's last solve ended on, and writes each arc's flow to `flows`, arc
+    /// `a` at `a`: answers as [`solve_into`](Self::solve_into) does, the same outcome and the same cost, with a
+    /// certificate that proves it, and the [`Work`] this resolve did.
+    ///
+    /// The last solve's basis serves where a solve of this solver, by any of the four entries, optimal or infeasible,
+    /// has ended since the solver was made and since any solve that panicked after it began; where `problem` has that
+    /// solve's node and arc counts and every arc the tail and the head it had; and where the flows that basis puts on
+    /// its arcs out of the tree keep the supplies net of them within the limit [`ProblemError::NetSupplyBeyondRange`]
+    /// names. Where it serves, the resolve starts from that basis's tree and from where each arc out of it stood, with
+    /// every number read from `problem`, and answers from there. Where it cannot serve, the resolve answers exactly
+    /// what `solve_into` answers, its work included. So the resolve has no precondition: any problem, after any call,
+    /// is solved.
+    ///
+    /// Where only some numbers changed, it often makes far fewer pivots than a solve; the same problem again, where
+    /// the kept basis serves, makes none. Of a problem with several optimal flows it may answer another than a solve
+    /// does, and other potentials: its flows, potentials and work are a function of the problem and of the solves
+    /// before it. A resolve from the kept basis tries no arcs before block search, so its
+    /// [`Work::first_arc_pivots`] is zero. The solver keeps the
+    /// basis the resolve ended on, as a solve does.
+    ///
+    /// Where the solver's room holds the problem, made by [`try_reserve`](Self::try_reserve) or by an earlier
+    /// resolve of a problem no larger that started from a kept basis, it allocates nothing. A solve, and a resolve
+    /// that did not start from a kept basis, make no room for what only a start from a kept basis reads.
+    ///
+    /// # Errors
+    /// Given a buffer of the right length, returns the first breach of `problem`, as [`ProblemError`] orders them,
+    /// the refusals of `solve_into`. A refused resolve writes no basis and keeps the basis kept.
+    ///
+    /// # Panics
+    /// Panics if `flows` holds another number of entries than `problem` has tails, one per arc: the buffer is compared
+    /// first, so a wrong buffer panics whether or not the problem would be refused, and keeps the basis kept. On a
+    /// target whose `usize` has 32 bits it can also panic while it grows its room, where a column's room passes
+    /// `isize::MAX` bytes.
+    ///
+    /// ```
+    /// use kahlnws::{NetworkSimplex, Outcome, Problem};
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     // Node 0 sends 4 units to node 2, directly at 5 a unit for up to 3 units, or through node 1 at 2 a unit.
+    ///     let problem = Problem {
+    ///         tails: &[0, 0, 1],
+    ///         heads: &[2, 1, 2],
+    ///         lower_bounds: None,
+    ///         capacities: &[3, 4, 2],
+    ///         costs: &[5, 1, 1],
+    ///         supplies: &[4, 0, -4],
+    ///     };
+    ///     let mut solver = NetworkSimplex::new();
+    ///     solver.try_reserve(3, 3)?;
+    ///     let mut flows = [0; 3];
+    ///     solver.solve_into(&problem, &mut flows)?;
+    ///
+    ///     // One unit less to send: the resolve starts from the optimum of the solve, which still serves.
+    ///     let fewer = Problem { supplies: &[3, 0, -3], ..problem };
+    ///     let answer = solver.resolve_into(&fewer, &mut flows)?;
+    ///     let Outcome::Optimal(optimum) = answer.outcome else { unreachable!("the routes carry the supply") };
+    ///     assert_eq!((optimum.total_cost, flows), (9, [1, 2, 2]));
+    ///     assert_eq!(answer.work.pivots, 0);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[track_caller]
+    pub fn resolve_into<'s>(
+        &'s mut self,
+        problem: &Problem<'_>,
+        flows: &mut [u64],
+    ) -> Result<Answer<Optimum<'s>>, ProblemError> {
+        let (length, arc_count) = (flows.len(), problem.tails.len());
+        assert!(
+            length == arc_count,
+            "called `NetworkSimplex::resolve_into` with {length} flows, which should be the arc count {arc_count}"
+        );
+
+        Ok(Run::resumed(self, problem.checked()?)?.run_to_end(flows))
+    }
+
+    /// Solves `problem` from the basis the solver's last solve ended on, and answers its flows, its potentials and the
+    /// cost, owned, or that no flow within the bounds meets the supplies, with the [`Work`] the resolve did: what
+    /// [`resolve_into`](Self::resolve_into) answers, from the same basis, where it serves, and otherwise exactly what
+    /// [`solve`](Self::solve) answers.
+    ///
+    /// It allocates the flows and the potentials it answers, and room for a problem larger than the solver held.
+    ///
+    /// # Errors
+    /// Returns the first breach of `problem`, as [`ProblemError`] orders them. A refused resolve keeps the basis kept.
+    ///
+    /// # Panics
+    /// On a target whose `usize` has 32 bits it can panic while it allocates the flows or grows its room, where their
+    /// room passes `isize::MAX` bytes.
+    ///
+    /// ```
+    /// use kahlnws::{NetworkSimplex, Problem, ProblemError};
+    ///
+    /// fn main() -> Result<(), ProblemError> {
+    ///     // Node 0 sends 4 units to node 2, directly at 5 a unit for up to 3 units, or through node 1 at 2 a unit.
+    ///     let problem = Problem {
+    ///         tails: &[0, 0, 1],
+    ///         heads: &[2, 1, 2],
+    ///         lower_bounds: None,
+    ///         capacities: &[3, 4, 2],
+    ///         costs: &[5, 1, 1],
+    ///         supplies: &[4, 0, -4],
+    ///     };
+    ///     let mut solver = NetworkSimplex::new();
+    ///     let solved = solver.solve(&problem)?;
+    ///
+    ///     // The route through node 1 now costs 6 a unit, more than the direct arc: one unit moves over.
+    ///     let dearer = Problem { costs: &[5, 5, 1], ..problem };
+    ///     let resolved = solver.resolve(&dearer)?;
+    ///     let solution = resolved.outcome.optimal().expect("the routes still carry the supply");
+    ///     assert_eq!((solution.flows, solution.total_cost), (vec![3, 1, 1], 21));
+    ///     assert!(resolved.work.pivots < solved.work.pivots);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn resolve(&mut self, problem: &Problem<'_>) -> Result<Answer<Solution>, ProblemError> {
+        let mut flows = vec![0; problem.tails.len()];
+        let answer = self.resolve_into(problem, &mut flows)?;
+
+        Ok(owned(answer, flows))
     }
 }
 
 impl<'s, 'p> Run<'s, 'p> {
-    /// The run of `problem` in the room of `solver`: its net supplies gathered, the basis loaded as the star of its
-    /// start, the first arcs chosen, and no work done yet. Nothing of an earlier run is read.
+    /// The run of `problem` in the room of `solver` from its star: its net supplies gathered, the basis loaded as the
+    /// star of its start, the first arcs chosen, and no work done yet. Nothing of an earlier run is read.
     ///
     /// # Errors
     /// Returns [`ProblemError::NetSupplyBeyondRange`] where the positive net supplies pass their limit.
-    fn new(solver: &'s mut NetworkSimplex, problem: CheckedProblem<'p>) -> Result<Self, ProblemError> {
-        let NetworkSimplex { net_supplies, basis, first_pivots } = solver;
+    fn from_star(solver: &'s mut NetworkSimplex, problem: CheckedProblem<'p>) -> Result<Self, ProblemError> {
+        let NetworkSimplex { net_supplies, basis, first_pivots, .. } = solver;
         let start = net_supplies.gather(problem)?;
 
-        let basis = basis.load(&start);
-        first_pivots.choose(&start);
+        Ok(Self::of_star(basis.load(&start), first_pivots, &start))
+    }
 
-        Ok(Self { basis, first_arcs: first_pivots.chosen(), work: Work::default() })
+    /// The run of `problem` in the room of `solver` from the basis the last run ended on, re-flowed, where it serves
+    /// the problem, with no first arcs; otherwise from the star, as [`from_star`](Self::from_star) makes it. No work is
+    /// done yet.
+    ///
+    /// # Errors
+    /// Returns [`ProblemError::NetSupplyBeyondRange`] where the positive net supplies pass their limit; the kept basis
+    /// is then kept.
+    fn resumed(solver: &'s mut NetworkSimplex, problem: CheckedProblem<'p>) -> Result<Self, ProblemError> {
+        let NetworkSimplex { net_supplies, excesses, basis, first_pivots } = solver;
+        let start = net_supplies.gather(problem)?;
+
+        // The arcs tried before block search are chosen for the star, from the problem alone; the kept basis starts
+        // where the last run ended, and tries none.
+        Ok(match basis.resume(&start, excesses) {
+            Resumed::Kept(basis) => Self { basis, first_arcs: &[], work: Work::default() },
+            Resumed::Star(basis) => Self::of_star(basis, first_pivots, &start),
+        })
+    }
+
+    /// The run on `basis`, the star of `start`, with the arcs the first pivots choose for it, and no work done yet.
+    fn of_star(basis: Basis<'s, 'p>, first_pivots: &'s mut FirstPivots, start: &Start<'p, '_>) -> Self {
+        first_pivots.choose(start);
+
+        Self { basis, first_arcs: first_pivots.chosen(), work: Work::default() }
+    }
+
+    /// The run carried to its end: its first arcs entered, then the arcs block search chooses until none violates; the
+    /// answer with the work, each arc's flow written to `flows` where it is optimal, the basis kept in the room.
+    ///
+    /// # Panics
+    /// Panics if `flows` holds another number of entries than the problem has arcs.
+    #[track_caller]
+    fn run_to_end(mut self, flows: &mut [u64]) -> Answer<Optimum<'s>> {
+        self.enter_first_arcs();
+        self.enter_by_block_search();
+
+        self.answer(flows)
     }
 
     /// Enters each first arc in turn where it violates its bound when its turn comes, and counts the pivots made as
@@ -264,7 +434,7 @@ impl<'s, 'p> Run<'s, 'p> {
 
     /// The answer of a run no arc violates in, with the work done on it: [`Outcome::Infeasible`] where a root link
     /// carries flow, `flows` left as it was; otherwise each arc's flow written to `flows`, with its cost and the
-    /// potentials, lent for as long as the solver is.
+    /// potentials, lent for as long as the solver is. The room keeps the basis either way.
     ///
     /// # Panics
     /// Panics if `flows` holds another number of entries than the problem has arcs.
@@ -274,13 +444,29 @@ impl<'s, 'p> Run<'s, 'p> {
 
         let outcome = if basis.routes_every_supply() {
             let total_cost = basis.write_flows(flows);
-            Outcome::Optimal(Optimum { total_cost, potentials: basis.into_potentials() })
+            Outcome::Optimal(Optimum { total_cost, potentials: basis.keep() })
         } else {
+            basis.keep();
             Outcome::Infeasible
         };
 
         Answer { outcome, work }
     }
+}
+
+/// The answer of an entry that writes into `flows`, `answer`, with the flows and a copy of the lent potentials owned:
+/// what the owning entries answer.
+fn owned(answer: Answer<Optimum<'_>>, flows: Vec<u64>) -> Answer<Solution> {
+    let Answer { outcome, work } = answer;
+    let outcome = match outcome {
+        // The potentials are the solver's own column, lent until the next solve; the solution owns a copy.
+        Outcome::Optimal(Optimum { total_cost, potentials }) => {
+            Outcome::Optimal(Solution { flows, potentials: potentials.to_vec(), total_cost })
+        }
+        Outcome::Infeasible => Outcome::Infeasible,
+    };
+
+    Answer { outcome, work }
 }
 
 #[cfg(test)]
@@ -340,7 +526,7 @@ mod tests {
         let problem = problem_of(&network);
         let mut solver = NetworkSimplex::new();
         let checked = problem.checked().expect("the depot should be admitted");
-        let mut run = Run::new(&mut solver, checked).expect("the depot's net supplies should be in range");
+        let mut run = Run::from_star(&mut solver, checked).expect("the depot's net supplies should be in range");
 
         // The star: nodes 0 and 1 up at potential 0, node 2 down at 11. One supplier and one demander: the search
         // back from node 2 over arcs wide enough for 4 takes arc 2 from node 1, then arc 1 from node 0, the supply.
@@ -382,7 +568,7 @@ mod tests {
         let problem = problem_of(&network);
         let mut solver = NetworkSimplex::new();
         let checked = problem.checked().expect("the depot should be admitted");
-        let mut run = Run::new(&mut solver, checked).expect("the depot's net supplies should be in range");
+        let mut run = Run::from_star(&mut solver, checked).expect("the depot's net supplies should be in range");
         assert_eq!(run.first_arcs, []);
 
         run.enter_first_arcs();
@@ -409,7 +595,7 @@ mod tests {
         let problem = problem_of(&network);
         let mut solver = NetworkSimplex::new();
         let checked = problem.checked().expect("the network should be admitted");
-        let mut run = Run::new(&mut solver, checked).expect("the net supplies should be in range");
+        let mut run = Run::from_star(&mut solver, checked).expect("the net supplies should be in range");
         run.enter_first_arcs();
         run.enter_by_block_search();
 
@@ -427,7 +613,7 @@ mod tests {
         let problem = problem_of(&network);
         let mut solver = NetworkSimplex::new();
         let checked = problem.checked().expect("the depot should be admitted");
-        let mut run = Run::new(&mut solver, checked).expect("the depot's net supplies should be in range");
+        let mut run = Run::from_star(&mut solver, checked).expect("the depot's net supplies should be in range");
 
         run.pivot(Slot::from(0_usize));
         assert_eq!(run.work, Work { pivots: 1, degenerate_pivots: 0, first_arc_pivots: 0 });
@@ -445,7 +631,7 @@ mod tests {
         let mut solver = NetworkSimplex::new();
         let checked = problem.checked().expect("the network should pass the checks before the net supplies");
 
-        let refused = Run::new(&mut solver, checked).map(|_| ());
+        let refused = Run::from_star(&mut solver, checked).map(|_| ());
         assert_eq!(refused, Err(ProblemError::NetSupplyBeyondRange { total: u128::from(u64::MAX) }));
     }
 
@@ -467,7 +653,7 @@ mod tests {
 
         let unwound = catch_unwind(AssertUnwindSafe(|| {
             let checked = problem_of(&network).checked().expect("the depot should be admitted");
-            let mut run = Run::new(&mut solver, checked).expect("the depot's net supplies should be in range");
+            let mut run = Run::from_star(&mut solver, checked).expect("the depot's net supplies should be in range");
             run.enter_first_arcs();
             run.basis.pivot(Slot::from(1_usize));
         }));
@@ -476,6 +662,115 @@ mod tests {
         for answered in [&depot, &network] {
             assert_eq!(solver.solve(&problem_of(answered)), NetworkSimplex::new().solve(&problem_of(answered)));
         }
+
+        // Unwound once more, then resolved: the unwound run left no basis, and the resolve answers as a fresh solve,
+        // its work included.
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let checked = problem_of(&network).checked().expect("the depot should be admitted");
+            let mut run = Run::resumed(&mut solver, checked).expect("the depot's net supplies should be in range");
+            run.enter_first_arcs();
+            run.basis.pivot(Slot::from(1_usize));
+        }));
+        assert!(unwound.is_err(), "a pivot of an arc in the tree should panic");
+        let fresh = NetworkSimplex::new().solve(&problem_of(&depot));
+        assert_eq!(solver.resolve(&problem_of(&depot)), fresh);
+        assert_eq!(NetworkSimplex::new().resolve(&problem_of(&depot)), fresh);
+    }
+
+    /// The depot of the basis's hand-worked run: arc 2 of capacity 2, so that no first arc is chosen.
+    fn depot() -> MincostNetwork {
+        MincostNetwork::from_arcs(&[4, 0, -4], &[(0, 2, 0, 3, 5), (0, 1, 0, 4, 1), (1, 2, 0, 2, 1)])
+    }
+
+    #[test]
+    fn test_the_run_resumed_from_the_wide_depot_tries_no_first_arc_by_hand() {
+        // The wide depot ends with arcs 1 and 2 in the tree carrying 4 each. Its supplies cut to 3: the kept tree
+        // carries 3 down both, arc 0 at its lower bound of reduced cost `5 + 0 − 2 = 3`: the optimum, and no first arc,
+        // where the star of the same problem has two.
+        let network = wide_depot();
+        let mut solver = NetworkSimplex::new();
+        let _ = solver.solve(&problem_of(&network)).expect("the wide depot should be admitted");
+
+        let fewer = MincostNetwork { supplies: vec![3, 0, -3], ..network };
+        let problem = problem_of(&fewer);
+        let checked = problem.checked().expect("the depot should be admitted");
+        let run = Run::resumed(&mut solver, checked).expect("the depot's net supplies should be in range");
+        assert_invariant(&run, &fewer);
+        assert!(run.first_arcs.is_empty());
+        assert_eq!(violations(&run), [3, 0, 0]);
+        assert_eq!(written(&run, 3), Written { flows: vec![0, 3, 3], cost: 6 });
+
+        let checked = problem.checked().expect("the depot should be admitted");
+        let star = Run::from_star(&mut NetworkSimplex::new(), checked).map(|run| run.first_arcs.len());
+        assert_eq!(star, Ok(2));
+    }
+
+    #[test]
+    fn test_a_resolve_of_a_fresh_solver_runs_from_the_star_by_hand() {
+        let network = wide_depot();
+        let problem = problem_of(&network);
+        let checked = problem.checked().expect("the depot should be admitted");
+        let mut solver = NetworkSimplex::new();
+        let run = Run::resumed(&mut solver, checked).expect("the depot's net supplies should be in range");
+
+        assert_eq!(run.first_arcs, [Slot::from(2_usize), Slot::from(1_usize)]);
+        assert_eq!(violations(&run), [5 - 11, 1, 1 - 11]);
+    }
+
+    #[test]
+    fn test_a_refused_problem_between_a_solve_and_a_resolve_keeps_the_basis() {
+        // Refused at its check, with supplies that do not balance, and at its net supplies, past their limit, each
+        // with the depot's counts: the resolve of the depot then starts from its optimum and makes no pivot.
+        let network = depot();
+        let unbalanced = MincostNetwork { supplies: vec![4, 0, -3], ..network.clone() };
+        let past_limit = MincostNetwork::from_arcs(
+            &[i64::MAX, i64::MIN + 1, 0],
+            &[(1, 0, 1 << 63, 1 << 63, 0), (0, 1, 0, 4, 1), (1, 2, 0, 2, 1)],
+        );
+
+        for refused in [&unbalanced, &past_limit] {
+            let mut solver = NetworkSimplex::new();
+            let solved = solver.solve(&problem_of(&network)).expect("the depot should be admitted");
+            assert!(solved.work.pivots > 0);
+            assert!(solver.resolve(&problem_of(refused)).is_err());
+            assert!(solver.resolve_into(&problem_of(refused), &mut [0; 3]).is_err());
+
+            let resolved = solver.resolve(&problem_of(&network)).expect("the depot should be admitted");
+            assert_eq!((resolved.outcome, resolved.work.pivots), (solved.outcome, 0));
+        }
+    }
+
+    #[test]
+    fn test_a_buffer_refused_between_a_solve_and_a_resolve_keeps_the_basis() {
+        let network = depot();
+        let mut solver = NetworkSimplex::new();
+        let _ = solver.solve(&problem_of(&network)).expect("the depot should be admitted");
+
+        let refused =
+            catch_unwind(AssertUnwindSafe(|| solver.resolve_into(&problem_of(&network), &mut [0; 2]).map(|_| ())));
+        assert!(refused.is_err(), "a buffer of two flows for three arcs should be refused");
+        let resolved = solver.resolve(&problem_of(&network)).expect("the depot should be admitted");
+        assert_eq!(resolved.work.pivots, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `NetworkSimplex::resolve_into` with 4 flows, which should be the arc count 3")]
+    fn test_resolve_into_refuses_a_buffer_of_another_length() {
+        let network = wide_depot();
+
+        let _ = NetworkSimplex::new().resolve_into(&problem_of(&network), &mut [0; 4]);
+    }
+
+    #[test]
+    fn test_owned_copies_the_lent_answer_by_hand() {
+        let potentials = [0, 1, 5];
+        let work = Work { pivots: 4, degenerate_pivots: 1, first_arc_pivots: 0 };
+        let lent = Answer { outcome: Outcome::Optimal(Optimum { total_cost: 14, potentials: &potentials }), work };
+        let solution = Solution { flows: vec![2, 2, 2], potentials: vec![0, 1, 5], total_cost: 14 };
+        assert_eq!(owned(lent, vec![2, 2, 2]), Answer { outcome: Outcome::Optimal(solution), work });
+
+        let infeasible = Answer { outcome: Outcome::Infeasible, work };
+        assert_eq!(owned(infeasible, vec![9]), Answer { outcome: Outcome::Infeasible, work });
     }
 
     #[test]

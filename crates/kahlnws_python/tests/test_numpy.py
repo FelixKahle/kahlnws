@@ -1,8 +1,8 @@
 # Copyright 2026 Felix Kahle
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""NumPy arrays in and out, through both levels: the item types read as they are, the ones converted, the ones refused.
-Skipped where NumPy is not installed."""
+"""NumPy arrays in and out, through both levels and both entries of each: the item types read as they are, the ones
+converted, the ones refused. Skipped where NumPy is not installed."""
 
 from typing import TypeAlias
 
@@ -14,7 +14,7 @@ import numpy
 import numpy.typing
 
 import kahlnws
-from networks import CUT, DEPOT, DEPOT_COST, DEPOT_FLOWS, DEPOT_POTENTIALS
+from networks import CUT, DEPOT, DEPOT_COST, DEPOT_FLOWS, DEPOT_POTENTIALS, ENTRY_PAIRS, Solve, SolveInto, named
 
 # An array of any item type, as the tests hand them in.
 Array: TypeAlias = numpy.typing.NDArray[numpy.generic]
@@ -44,13 +44,16 @@ def depot_arrays(index_type: numpy.typing.DTypeLike, number_type: numpy.typing.D
         (numpy.uint32, numpy.int64),
     ],
 )
+@pytest.mark.parametrize(("entry", "entry_into"), ENTRY_PAIRS, ids=named)
 def test_the_depot_from_arrays_of_every_integer_type_through_both_levels(
-    index_type: numpy.typing.DTypeLike, number_type: numpy.typing.DTypeLike
+    index_type: numpy.typing.DTypeLike, number_type: numpy.typing.DTypeLike, entry: Solve, entry_into: SolveInto
 ) -> None:
+    # One solver at both levels: by the second entry, the low level resolves the depot from the basis of its optimum.
     tails, heads, capacities, costs, supplies = depot_arrays(index_type, number_type)
     solver = kahlnws.NetworkSimplex()
 
-    solution = solver.solve(
+    solution = entry(
+        solver,
         tails=tails,
         heads=heads,
         capacities=capacities,
@@ -62,7 +65,8 @@ def test_the_depot_from_arrays_of_every_integer_type_through_both_levels(
     assert (solution.flows, solution.potentials, solution.total_cost) == (DEPOT_FLOWS, DEPOT_POTENTIALS, DEPOT_COST)
 
     flows, potentials = numpy.zeros(3, dtype=numpy.uint64), numpy.zeros(3, dtype=numpy.int64)
-    total_cost = solver.solve_into(
+    total_cost = entry_into(
+        solver,
         tails=tails,
         heads=heads,
         capacities=capacities,
