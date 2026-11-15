@@ -218,6 +218,52 @@ from the three and are not stored:
 The counts are exact counts of that solve, not samples or estimates. A refused problem has no work, since no pivot is
 made.
 
+## Solving again
+
+A solver keeps the basis its last solve ended on, after an optimal and after an infeasible answer alike: the spanning
+tree of [how it works](how-it-works.md#the-basis) and where each arc out of it stood. A solve never reads it. A
+resolve takes the arguments of a solve, answers the same kinds of answer and refuses the same problems, and starts
+from the kept basis where it serves:
+
+- a solve of this solver, by any entry, has ended since the solver was made, and since any solve that stopped after
+  it began to write the basis;
+- the problem has the node count and the arc count of that solve, and every arc the tail and the head it had;
+- the supplies net of the lower bounds and of the flows the kept basis puts on its arcs out of the tree add up to at
+  most $2^{64} - 2$ where they are positive, the limit of the last range.
+
+Where it serves, the resolve keeps the tree and where each arc out of it stood, and reads every number of the problem
+anew: supplies, lower bounds, capacities and costs may all differ from the last problem's. Where it does not, the
+resolve is a solve, its answer and its work included. So a resolve has no precondition: any problem, after any call, is
+solved.
+
+What each entry guarantees:
+
+| | Solve | Resolve |
+|---|---|---|
+| refusal | the first breach | the same |
+| outcome, optimal or infeasible | the problem's | the same |
+| `total_cost` | the least cost of a flow | the same |
+| `potentials` | prove the flows optimal | prove the flows optimal |
+| flows among tied optima, potentials, work | of the problem alone | of the problem and the solves before it |
+| `first_arc_pivots` | the pivots of the arcs tried first | zero where it starts from the kept basis |
+
+A resolve is deterministic: the same calls on a new solver answer the same, work included. Where only some numbers
+changed, a resolve often makes far fewer pivots than a solve; the same problem again, where the kept basis serves,
+makes none. [How it works](how-it-works.md#starting-from-the-kept-basis) says how a kept basis is made a basis of the
+new problem.
+
+A solve or a resolve that answers, optimal or infeasible, keeps the basis it ended on. A refused call, and a call turned
+away before its solve begins, such as a Rust call whose flow buffer has the wrong length, keeps the basis kept before
+it. A solve that stops after it began to write the basis, by a panic in Rust, leaves none, and the next resolve is a
+solve; in C, a call that answers `KAHLNWS_STATUS_INTERNAL_ERROR` may leave none.
+
+| Language | Solve | Resolve |
+|---|---|---|
+| Rust | `solve`, `solve_into` | `resolve`, `resolve_into` |
+| C | `kahlnws_solver_solve` | `kahlnws_solver_resolve` |
+| C++ | `solve`, `solve_into` and their `try_` forms | `resolve`, `resolve_into` and their `try_` forms |
+| Python | `solve`, `solve_into` | `resolve`, `resolve_into` |
+
 ## Room and allocation
 
 A solver owns the room it works in: the columns a solve reads and writes. The room is kept from
@@ -229,12 +275,17 @@ in the library. What each interface allocates beside that:
 
 | Interface | Reservation | Memory refused | Solve that allocates nothing within the room |
 |---|---|---|---|
-| Rust | `try_reserve(nodes, arcs)` | answers a `TryReserveError` | `solve_into` |
-| C | `kahlnws_solver_reserve` | answers `KAHLNWS_STATUS_NO_ROOM` | `kahlnws_solver_solve` |
-| Python | `reserve(nodes, arcs)` | raises `MemoryError` | `solve_into`, but for its answer and each buffer's view |
+| Rust | `try_reserve(nodes, arcs)` | answers a `TryReserveError` | `solve_into`, `resolve_into` |
+| C | `kahlnws_solver_reserve` | answers `KAHLNWS_STATUS_NO_ROOM` | `kahlnws_solver_solve`, `kahlnws_solver_resolve` |
+| Python | `reserve(nodes, arcs)` | raises `MemoryError` | `solve_into`, `resolve_into`, but for the answer and views |
 
-In Rust, `solve` allocates the flows and the potentials it answers. In Python, each call makes its answer and a
-`memoryview` with an export record for each buffer it is handed; `solve` makes lists besides.
+A resolve that starts from a kept basis reads one more column, a number per node, whose room a solve does not make. A
+reservation makes it, and so does a resolve that started from a kept basis. So in Rust `resolve_into` allocates nothing
+within the room made by `try_reserve`, or by an earlier resolve of a problem no larger that started from a kept basis.
+In C and Python every solve and resolve makes its room by a reservation before it starts.
+
+In Rust, `solve` and `resolve` allocate the flows and the potentials they answer. In Python, each call makes its answer
+and a `memoryview` with an export record for each buffer it is handed; `solve` and `resolve` make lists besides.
 
 In Rust, a refused solve leaves the room short of the problem, though it may have grown one column. In C and Python the
 room is grown to the problem's counts before the problem is checked, so a refused problem may still have grown it.
@@ -243,8 +294,12 @@ room is grown to the problem's counts before the problem is checked, so a refuse
 
 The answer of a solve, its work included, is a function of the problem as given, its arc order included, and of the
 version of kahlnws. The same problem gives the same answer from a new solver and from one that solved other problems
-before: nothing of an earlier problem is kept but the room. Where several flows are optimal, which one is answered is
-not specified beyond that; reordering the arcs may change it, and its cost stays the same.
+before: a solve reads nothing an earlier call left but the room. Where several flows are optimal, which one is
+answered is not specified beyond that; reordering the arcs may change it, and its cost stays the same.
+
+A resolve reads the basis an earlier solve left as well. Its answer, its work included, is a function of the problem
+and of the calls the solver answered before it, and of the version of kahlnws; its outcome and its cost are the
+problem's alone.
 
 ## Threads
 

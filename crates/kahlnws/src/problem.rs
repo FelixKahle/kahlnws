@@ -10,7 +10,7 @@ use core::slice;
 use derive_more::{From, Into};
 use itertools::izip;
 
-use crate::ranges::{INDEX_LIMIT, NET_SUPPLY_LIMIT, cost_bound, cost_total_with};
+use crate::ranges::{INDEX_LIMIT, NET_SUPPLY_LIMIT, cost_bound, cost_total_with, root_cost};
 
 /// One min-cost flow problem, borrowed: arcs `0..tails.len()` between nodes `0..supplies.len()`.
 ///
@@ -355,6 +355,13 @@ impl<'a> CheckedProblem<'a> {
     /// The largest magnitude of a cost, `C`, in units of cost; zero without arcs.
     pub(crate) fn largest_cost(&self) -> u64 {
         self.largest_cost
+    }
+
+    /// The cost of a root link that points down, in units of cost: `(n − 1)·C + 1` for the `n` nodes and the largest
+    /// cost magnitude `C`, at most `2^62`.
+    pub(crate) fn root_cost(&self) -> i64 {
+        // The costs lie within the cost bound, so the root cost is at most `2^62` and `root_cost` does not panic.
+        root_cost(self.node_count(), self.largest_cost())
     }
 
     /// The supply of each node, in units of flow, one per node; they add up to zero.
@@ -846,6 +853,17 @@ pub(crate) mod tests {
 
         let one_node = nodes_only(&[0]).checked().expect("one node of no supply should be admitted");
         assert_eq!((one_node.node_count(), one_node.largest_cost()), (1, 0));
+    }
+
+    #[test]
+    fn test_the_root_cost_of_a_checked_problem_by_hand() {
+        // Three nodes and a largest cost of 5: `(3 − 1) · 5 + 1`.
+        let network = three_nodes();
+        assert_eq!(problem_of(&network).checked().map(|checked| checked.root_cost()), Ok(11));
+
+        // Without a path of an arc, or without a node, a root link that points down costs 1.
+        assert_eq!(nodes_only(&[0]).checked().map(|checked| checked.root_cost()), Ok(1));
+        assert_eq!(nodes_only(&[]).checked().map(|checked| checked.root_cost()), Ok(1));
     }
 
     #[test]

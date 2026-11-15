@@ -9,6 +9,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 publish = false
 
 [lints]
@@ -21,9 +22,9 @@ culmen = { workspace = true }
 # The tiny-network strategies the property tests of the workspace draw from, and this crate's own property tests; an
 # ordinary dependency, since this crate is only ever a dev-dependency, so no test tool reaches a published manifest.
 proptest = { workspace = true }
-# `izip!` in the brute force's step to the next flow; `zip_eq` in the LP oracle's rows, a network's excesses and the
-# sized assignment shape's demand arcs; `tuple_windows` along the chains of the seeded and the sized supply shape;
-# `iproduct!` over the grid's nodes.
+# `izip!` in the brute force's step to the next flow; `zip_eq` in the LP oracle's rows, a network's excesses, the
+# sized assignment shape's demand arcs and the arcs of a tiny pair; `collect_vec` of a tiny network's arcs;
+# `tuple_windows` along the chains of the seeded and the sized supply shape; `iproduct!` over the grid's nodes.
 itertools = { workspace = true }
 # `CertificateBreach`, the breach `check_certificate` names, and `ShapeBreach`, the broken shape a model refuses.
 thiserror = { workspace = true }

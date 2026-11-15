@@ -21,6 +21,9 @@ exists. The same solver is offered to C, C++ and Python.
 - **No allocation within reserved room.** A solver keeps its room from one solve to the next. Once room is reserved,
   a solve into the caller's buffers allocates nothing in Rust, C and C++; in Python it makes only its answer and a
   view of each buffer.
+- **Solving again from the last basis.** A solver keeps the basis its last solve ended on. A resolve of the same arcs
+  with some numbers changed starts from it and often makes far fewer pivots; it answers the same outcome and cost as
+  a solve, with potentials that prove it, and where the basis cannot serve it is a solve.
 - **One small interface in four languages.** Rust, C, C++ and Python share the same problem, answer, work and
   refusals.
 
@@ -159,13 +162,14 @@ Installing, buffers, NumPy and the exceptions are in [the Python guide](docs/pyt
 
 ## Examples
 
-Four programs in each language show the interface at work on one small transport network, and print the same lines
+Five programs in each language show the interface at work on one small transport network, and print the same lines
 in every language:
 
 | Example | Shows |
 |---|---|
 | `transport` | the smallest call: a problem in, the optimal cost and the flow of each lane out |
 | `reuse` | one solver kept, its room reserved once, solving day after day into the caller's buffers |
+| `resolve` | the days of `reuse`, each after the first resolved from the basis the day before ended on |
 | `outcomes` | the answers that are no optimal flow: a problem without a flow, and a problem that is refused |
 | `potentials` | the potentials, the reduced costs they give, the optimality conditions, and the work counted |
 
@@ -177,13 +181,16 @@ the tests run every one.
 ## Documentation
 
 - [The problem and the guarantees](docs/problem-and-guarantees.md): the linear program, feasibility, the certificate,
-  the ranges and the refusals, the answer and the work.
-- [How it works](docs/how-it-works.md): the algorithm and the layout of its data.
+  the ranges and the refusals, the answer and the work, and what a resolve guarantees.
+- [How it works](docs/how-it-works.md): the algorithm, its start from the star or from a kept basis, and the layout
+  of its data.
 - The guides for [Rust](docs/rust-api.md), [C](docs/c-api.md), [C++](docs/cpp-api.md) and
   [Python](docs/python-api.md).
-- [Benchmarks](docs/benchmarks.md): the suite and how to run it, and a comparison with two LP solvers.
+- [Benchmarks](docs/benchmarks.md): the two suites, of cold solves and of solves from a kept basis, how to run
+  them, and a comparison with two LP solvers.
 - [Building, testing and safety](docs/building-and-testing.md): the gates, the tests, the `unsafe` code and Miri.
 - [The rules of the code](docs/style.md): what every change to the code holds to.
+- [Releasing](docs/releasing.md): what a release publishes and how one is made.
 
 [The index of the documents](docs/README.md) says who each page is for.
 

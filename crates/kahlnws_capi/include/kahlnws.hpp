@@ -26,6 +26,16 @@
 ///   buffers the caller owns, and answers a kahlnws::optimum, the cost, or that the problem is infeasible, beside the
 ///   work.
 ///
+/// @par Solving again
+/// A solver keeps the basis its last solve ended on, optimal or infeasible. @c try_resolve and @c resolve, and
+/// @c try_resolve_into and @c resolve_into, beside the two levels above and with the same arguments and answers, start
+/// from it where it serves: where the problem has the node and arc counts of that solve and every arc its tail and its
+/// head, and the supplies the basis leaves stay within range. Then, where only some numbers changed, they often make
+/// far fewer pivots, and the same problem again, where the kept basis serves, makes none. Where the basis cannot serve,
+/// a resolve answers exactly as a solve does. Every form answers the same outcome, the same cost, and potentials that
+/// prove the flow optimal; only a solve answers the flows among tied optima, the potentials and the work as a function
+/// of the problem alone, while a resolve answers a function of the problem and of the solves before it.
+///
 /// @par Errors as values, and as exceptions
 /// An infeasible problem is an answer, not an error. Every operation that can fail has a form named @c try_..., in
 /// every build, that never throws and answers a kahlnws::result: the value, or a kahlnws::error, which says whether
@@ -47,12 +57,12 @@
 /// standards only in attributes that make warnings and in the constructor of a kahlnws::span from a @c std::span.
 ///
 /// @par Allocation
-/// The @c try_ forms of the low level allocate nothing where the solver's room holds the problem, made by
-/// @c try_reserve or by an earlier solve, and nothing on any error. The high level allocates the vectors of the
-/// solution. Where exceptions are disabled and memory for those vectors is refused, the standard library acts as it
-/// does without exceptions, which is to end the program on the common implementations; the low level, with the
-/// caller's buffers, is the path that needs no allocation. A kahlnws::error holds its message, and making one
-/// allocates nothing; a throwing form allocates the message of the exception it throws.
+/// The @c try_ forms of the low level, @c try_solve_into and @c try_resolve_into, allocate nothing where the solver's
+/// room holds the problem, made by @c try_reserve or by an earlier solve, and nothing on any error. The high level
+/// allocates the vectors of the solution. Where exceptions are disabled and memory for those vectors is refused, the
+/// standard library acts as it does without exceptions, which is to end the program on the common implementations;
+/// the low level, with the caller's buffers, is the path that needs no allocation. A kahlnws::error holds its
+/// message, and making one allocates nothing; a throwing form allocates the message of the exception it throws.
 ///
 /// @par Preconditions
 /// A precondition this header states is checked in every build, and a call that breaks it ends the program with
@@ -676,7 +686,7 @@ std::basic_ostream<Char, Traits>& operator<<(std::basic_ostream<Char, Traits>& s
 }
 
 /// @brief A view of @c size() elements of type @p T stored contiguously elsewhere: a table of a kahlnws::problem, or a
-/// buffer kahlnws::network_simplex::try_solve_into writes to.
+/// buffer kahlnws::network_simplex::try_solve_into or try_resolve_into writes to.
 ///
 /// Its invariant: the pointer is null only where the size is zero, and the size counts elements within PTRDIFF_MAX
 /// bytes of one object. Every constructor keeps it; copying a span copies the view, never the elements.
@@ -854,16 +864,19 @@ struct problem {
 /// link of the tree has the least room, that link leaves and the arc takes its place; where the arc's own capacity
 /// less its lower bound is the least, no link leaves and the arc moves to its other bound, a flip.
 ///
-/// Plain data, an aggregate: `kahlnws::work counted = {};` is all zero. The counts depend on the problem alone, its arc
-/// order included, and on the library's version. In every work a solve answers, `degenerate_pivots <= pivots` and
-/// `first_arc_pivots <= pivots`, and the pivots that sent flow are `pivots - degenerate_pivots`.
+/// Plain data, an aggregate: `kahlnws::work counted = {};` is all zero. The counts of a solve depend on the problem
+/// alone, its arc order included, and on the library's version; those of a resolve on the problem and on the solves the
+/// solver made before it, and are those of a solve where it does not start from the kept basis. In every work a solve
+/// or a resolve answers, `degenerate_pivots <= pivots` and `first_arc_pivots <= pivots`, and the pivots that sent flow
+/// are `pivots - degenerate_pivots`.
 struct work {
     /// @brief The pivots the solve made, flips included; 0 where no arc ever violated its bound.
     std::uint64_t pivots;
     /// @brief Of the pivots, those that sent no flow, so that only the tree and the potentials changed; never a flip.
     std::uint64_t degenerate_pivots;
     /// @brief Of the pivots, those made by the arcs the solve tries before block search, chosen from the problem's
-    /// structure; @c pivots where those arcs alone reached the outcome.
+    /// structure; 0 in a resolve from the kept basis, which tries none; @c pivots where those arcs alone reached the
+    /// outcome.
     std::uint64_t first_arc_pivots;
 };
 
@@ -880,8 +893,8 @@ constexpr bool operator==(const work& left, const work& right) noexcept {
 /// @param right Another work.
 constexpr bool operator!=(const work& left, const work& right) noexcept { return !(left == right); }
 
-/// @brief What an optimal kahlnws::network_simplex::try_solve_into answers beside the flows, and the potentials where
-/// asked, that it wrote to the caller's buffers. Plain data.
+/// @brief What an optimal kahlnws::network_simplex::try_solve_into or try_resolve_into answers beside the flows, and
+/// the potentials where asked, that it wrote to the caller's buffers. Plain data.
 struct optimum {
     /// @brief The cost of the flow, in units of cost times units of flow.
     int128 total_cost;
@@ -899,7 +912,8 @@ constexpr bool operator==(const optimum& left, const optimum& right) noexcept {
 /// @param right Another optimum.
 constexpr bool operator!=(const optimum& left, const optimum& right) noexcept { return !(left == right); }
 
-/// @brief What an optimal kahlnws::network_simplex::try_solve answers, owned: the flows, the potentials and the cost.
+/// @brief What an optimal kahlnws::network_simplex::try_solve or try_resolve answers, owned: the flows, the potentials
+/// and the cost.
 ///
 /// Plain data. With the potentials, `costs[a] + potentials[tails[a]] - potentials[heads[a]]` is at least zero on every
 /// arc a whose flow is below its capacity and at most zero on every arc whose flow is above its lower bound, which
@@ -1764,15 +1778,20 @@ private:
 ///
 /// It finds a flow of least cost, or that no flow within the bounds meets the supplies, in exact integer arithmetic.
 /// The room is kept from one solve to the next and only grows: a solve of a problem with no more nodes and no more
-/// arcs than the room holds, made by try_reserve() or by an earlier solve, allocates nothing in the library. Nothing
-/// of an earlier problem or its answer is kept: what a solve answers depends on its problem alone.
+/// arcs than the room holds, made by try_reserve() or by an earlier solve, allocates nothing in the library.
+///
+/// The solver also keeps the basis its last solve ended on, by any form, optimal or infeasible, which only
+/// try_resolve() and try_resolve_into() and their throwing forms read: what try_solve() and try_solve_into() answer
+/// depends on the problem alone. A resolve starts from that basis where the problem has the node and arc counts of
+/// that solve and every arc its tail and its head, and otherwise answers exactly as a solve does.
 ///
 /// An owning handle, movable and never copied. A new solver holds no room and no handle of the library: the first call
 /// that needs one makes it, and a handle refused is the error error_kind::refused_memory. A moved-from solver is in
 /// the same state as a new one. The handle and the room are freed with the solver.
 ///
-/// Where a call fails, the solver is as usable as before, and what a later call answers is as it would have been;
-/// only its room may have grown. The buffers of try_solve_into are as they were, except after an internal error.
+/// Where a call fails, the solver is as usable as before, and what a later call answers is as it would have been: only
+/// its room may have grown, and the basis kept stays kept, but after an internal error, which may leave none. The
+/// buffers of try_solve_into and try_resolve_into are as they were, except after an internal error.
 class network_simplex {
 public:
     /// @brief A solver that holds no room yet; it allocates nothing.
@@ -1806,12 +1825,13 @@ public:
     /// @param[in,out] second Another solver.
     friend void swap(network_simplex& first, network_simplex& second) noexcept { first.swap(second); }
 
-    /// @brief Makes room for problems of up to @p node_count nodes and @p arc_count arcs: a solve of such a problem
-    /// allocates nothing in the library afterwards, and try_solve_into nothing at all. Room already held is kept.
+    /// @brief Makes room for problems of up to @p node_count nodes and @p arc_count arcs: a solve or a resolve of such
+    /// a problem allocates nothing in the library afterwards, and try_solve_into and try_resolve_into nothing at all.
+    /// Room already held is kept, and so is the basis kept.
     /// @param node_count The most nodes.
     /// @param arc_count The most arcs.
     /// @return A success, or an error of kind refused_memory, or internal_error.
-    /// @post On an error, the room held before is kept.
+    /// @post On an error, the room held before is kept; the basis kept is kept either way.
     /// @see reserve
     KAHLNWS_HPP_NODISCARD result<void> try_reserve(std::size_t node_count, std::size_t arc_count) noexcept {
         kahlnws_solver* const solver = handle();
@@ -1829,25 +1849,13 @@ public:
     /// no flow exists; either way beside the work of the solve.
     /// @param problem The problem.
     /// @return The answer, or an error of kind refused_problem, refused_memory or internal_error.
+    /// @post On an error other than an internal error, the basis kept is kept.
     /// @note Allocates the flows and the potentials, one entry per arc and per node, and the room the problem needs
     /// beyond the room held. Where exceptions are disabled and the memory for the vectors is refused, the standard
     /// library ends the program as it does without exceptions.
     /// @see solve
     KAHLNWS_HPP_NODISCARD result<answer<solution>> try_solve(const problem& problem) noexcept {
-        result<solution> owned = allocated(problem.tails.size(), problem.supplies.size());
-        if (!owned) {
-            return owned.error();
-        }
-        const result<answer<optimum>> written = try_solve_into(problem, owned->flows, owned->potentials);
-        if (!written) {
-            return written.error();
-        }
-        const optimum* const found = written->outcome.optimal();
-        if (found == nullptr) {
-            return answer<solution>(outcome<solution>(), written->work);
-        }
-        owned->total_cost = found->total_cost;
-        return answer<solution>(outcome<solution>::make_optimal(std::move(*owned)), written->work);
+        return owned(entry::solve, problem);
     }
 
     /// @brief Solves @p problem, writes the flow of each arc to @p flows, arc a at position a, and answers the cost of
@@ -1858,16 +1866,12 @@ public:
     /// @pre @p flows holds one entry per arc, and shares no storage with a table of @p problem; answered as an error
     /// of kind invalid_argument, before anything runs.
     /// @post Where the outcome is infeasible, or the call fails other than with an internal error, @p flows is as it
-    /// was.
+    /// was, and on such a failure the basis kept is kept.
     /// @note Allocates nothing where the room holds the problem, and nothing on an error.
     /// @see solve_into
     KAHLNWS_HPP_NODISCARD result<answer<optimum>> try_solve_into(const problem& problem,
                                                                 span<std::uint64_t> flows) noexcept {
-        const result<void> admitted = admitted_flows(problem, flows);
-        if (!admitted) {
-            return admitted.error();
-        }
-        return run(problem, flows.data(), nullptr);
+        return into(entry::solve, problem, flows);
     }
 
     /// @brief Solves @p problem as try_solve_into(problem, flows) does, and of an optimal flow writes each node's
@@ -1885,21 +1889,82 @@ public:
     /// @pre @p potentials holds one entry per node, and shares no storage with a table of @p problem or with
     /// @p flows; answered as an error of kind invalid_argument, before anything runs.
     /// @post Where the outcome is infeasible, or the call fails other than with an internal error, @p flows and
-    /// @p potentials are as they were.
+    /// @p potentials are as they were, and on such a failure the basis kept is kept.
     /// @note Allocates nothing where the room holds the problem, and nothing on an error.
     /// @see solve_into
     KAHLNWS_HPP_NODISCARD result<answer<optimum>> try_solve_into(const problem& problem,
                                                                 span<std::uint64_t> flows,
                                                                 span<std::int64_t> potentials) noexcept {
-        const result<void> admitted_first = admitted_flows(problem, flows);
-        if (!admitted_first) {
-            return admitted_first.error();
-        }
-        const result<void> admitted_second = admitted_potentials(problem, flows, potentials);
-        if (!admitted_second) {
-            return admitted_second.error();
-        }
-        return run(problem, flows.data(), potentials.data());
+        return into(entry::solve, problem, flows, potentials);
+    }
+
+    /// @brief Solves @p problem from the basis the solver's last solve ended on, where it serves, and answers as
+    /// try_solve() does: the flows, the potentials and the cost of an optimal flow, owned, or that no flow exists;
+    /// either way beside the work of the resolve.
+    ///
+    /// The basis serves where the solver holds one: the basis its last solve ended on, by any form, optimal or
+    /// infeasible, which a move carries with the solver, a new or moved-from solver holds none, and an internal error
+    /// may leave none; where @p problem has that solve's node and arc counts and every arc the tail and the head it
+    /// had; and where the flows that basis puts on its arcs out of the tree keep the supplies net of them within the
+    /// limit breach::net_supply_beyond_range names. Its tree is kept and every number is read anew. Where the basis
+    /// cannot serve, the resolve answers exactly what try_solve() answers, its work included.
+    ///
+    /// Where the basis serves and only some numbers changed, it often makes far fewer pivots than a solve, and the
+    /// same problem again makes none. The outcome and the cost are those of try_solve(), and the potentials prove the
+    /// flows optimal; of a problem with several optimal flows it may answer another, and other potentials, a function
+    /// of the problem and of the solves before it. A resolve from the kept basis tries no arcs before block search,
+    /// so its work.first_arc_pivots is 0. The solver keeps the basis the resolve ended on.
+    /// @param problem The problem.
+    /// @return The answer, or an error of kind refused_problem, refused_memory or internal_error.
+    /// @post On an error other than an internal error, the basis kept is kept.
+    /// @note Allocates the flows and the potentials, one entry per arc and per node, and the room the problem needs
+    /// beyond the room held. Where exceptions are disabled and the memory for the vectors is refused, the standard
+    /// library ends the program as it does without exceptions.
+    /// @see resolve
+    KAHLNWS_HPP_NODISCARD result<answer<solution>> try_resolve(const problem& problem) noexcept {
+        return owned(entry::resolve, problem);
+    }
+
+    /// @brief Solves @p problem from the basis the solver's last solve ended on, where it serves, writes the flow of
+    /// each arc to @p flows, arc a at position a, and answers as try_solve_into(problem, flows) does.
+    ///
+    /// The basis serves, and what is answered, as try_resolve() states.
+    /// @param problem The problem.
+    /// @param[out] flows One entry per arc; what it held before does not matter.
+    /// @return The answer, or an error of kind invalid_argument, refused_problem, refused_memory or internal_error.
+    /// @pre @p flows holds one entry per arc, and shares no storage with a table of @p problem; answered as an error
+    /// of kind invalid_argument, before anything runs.
+    /// @post Where the outcome is infeasible, or the call fails other than with an internal error, @p flows is as it
+    /// was, and on such a failure the basis kept is kept.
+    /// @note Allocates nothing where the room holds the problem, and nothing on an error.
+    /// @see resolve_into
+    KAHLNWS_HPP_NODISCARD result<answer<optimum>> try_resolve_into(const problem& problem,
+                                                                  span<std::uint64_t> flows) noexcept {
+        return into(entry::resolve, problem, flows);
+    }
+
+    /// @brief Solves @p problem as try_resolve_into(problem, flows) does, and of an optimal flow writes each node's
+    /// potential to @p potentials too, node v at position v.
+    ///
+    /// With the potentials, `costs[a] + potentials[tails[a]] - potentials[heads[a]]` is at least zero on every arc a
+    /// whose flow is below its capacity and at most zero on every arc whose flow is above its lower bound, which
+    /// proves the flow optimal.
+    /// @param problem The problem.
+    /// @param[out] flows One entry per arc; what it held before does not matter.
+    /// @param[out] potentials One entry per node; what it held before does not matter.
+    /// @return The answer, or an error of kind invalid_argument, refused_problem, refused_memory or internal_error.
+    /// @pre @p flows holds one entry per arc, and shares no storage with a table of @p problem; answered as an error
+    /// of kind invalid_argument, before anything runs.
+    /// @pre @p potentials holds one entry per node, and shares no storage with a table of @p problem or with
+    /// @p flows; answered as an error of kind invalid_argument, before anything runs.
+    /// @post Where the outcome is infeasible, or the call fails other than with an internal error, @p flows and
+    /// @p potentials are as they were, and on such a failure the basis kept is kept.
+    /// @note Allocates nothing where the room holds the problem, and nothing on an error.
+    /// @see resolve_into
+    KAHLNWS_HPP_NODISCARD result<answer<optimum>> try_resolve_into(const problem& problem,
+                                                                  span<std::uint64_t> flows,
+                                                                  span<std::int64_t> potentials) noexcept {
+        return into(entry::resolve, problem, flows, potentials);
     }
 
 #if KAHLNWS_EXCEPTIONS
@@ -1951,9 +2016,129 @@ public:
                                                     span<std::int64_t> potentials) {
         return try_solve_into(problem, flows, potentials).value();
     }
+
+    /// @brief Solves @p problem from the kept basis as try_resolve() does, and throws where it fails; only where
+    /// @c KAHLNWS_EXCEPTIONS is 1.
+    /// @param problem The problem.
+    /// @return The answer.
+    /// @throws kahlnws::problem_error Where the problem lies outside what a solve admits.
+    /// @throws std::bad_alloc Where memory is refused.
+    /// @throws kahlnws::internal_error Where the library fails.
+    /// @see try_resolve
+    KAHLNWS_HPP_NODISCARD answer<solution> resolve(const problem& problem) { return try_resolve(problem).value(); }
+
+    /// @brief Solves @p problem into @p flows from the kept basis as try_resolve_into() does, and throws where it
+    /// fails; only where @c KAHLNWS_EXCEPTIONS is 1.
+    /// @param problem The problem.
+    /// @param[out] flows One entry per arc.
+    /// @return The answer.
+    /// @throws std::invalid_argument Where @p flows does not hold one entry per arc or shares storage with a table.
+    /// @throws kahlnws::problem_error Where the problem lies outside what a solve admits.
+    /// @throws std::bad_alloc Where memory is refused.
+    /// @throws kahlnws::internal_error Where the library fails.
+    /// @see try_resolve_into
+    KAHLNWS_HPP_NODISCARD answer<optimum> resolve_into(const problem& problem, span<std::uint64_t> flows) {
+        return try_resolve_into(problem, flows).value();
+    }
+
+    /// @brief Solves @p problem into @p flows and @p potentials from the kept basis as try_resolve_into() does, and
+    /// throws where it fails; only where @c KAHLNWS_EXCEPTIONS is 1.
+    /// @param problem The problem.
+    /// @param[out] flows One entry per arc.
+    /// @param[out] potentials One entry per node.
+    /// @return The answer.
+    /// @throws std::invalid_argument Where a buffer does not hold one entry per arc or node, or shares storage with a
+    /// table or the other buffer.
+    /// @throws kahlnws::problem_error Where the problem lies outside what a solve admits.
+    /// @throws std::bad_alloc Where memory is refused.
+    /// @throws kahlnws::internal_error Where the library fails.
+    /// @see try_resolve_into
+    KAHLNWS_HPP_NODISCARD answer<optimum> resolve_into(const problem& problem,
+                                                      span<std::uint64_t> flows,
+                                                      span<std::int64_t> potentials) {
+        return try_resolve_into(problem, flows, potentials).value();
+    }
 #endif
 
 private:
+    /// The entry of the library a solve calls: kahlnws_solver_solve, from the problem alone, or
+    /// kahlnws_solver_resolve, from the basis the last solve ended on where it serves.
+    enum class entry { solve, resolve };
+
+    /// A function of the C interface that solves, as kahlnws_solver_solve and kahlnws_solver_resolve are declared.
+    typedef kahlnws_status (*c_solve)(kahlnws_solver*, const kahlnws_problem*, std::uint64_t*, std::int64_t*,
+                                      kahlnws_int128*, kahlnws_work*, kahlnws_refusal*);
+
+    /// The function of the C interface `which` calls.
+    static c_solve c_function(entry which) noexcept {
+        switch (which) {
+        case entry::solve:
+            return kahlnws_solver_solve;
+        case entry::resolve:
+            return kahlnws_solver_resolve;
+        }
+        // Every entry is named above; a value no enumerator has is never made, and is called as a solve.
+        return kahlnws_solver_solve;
+    }
+
+    /// The name an error's message gives the low-level form of `which`.
+    static const char* into_name(entry which) noexcept {
+        switch (which) {
+        case entry::solve:
+            return "network_simplex::try_solve_into";
+        case entry::resolve:
+            return "network_simplex::try_resolve_into";
+        }
+        // Every entry is named above; a value no enumerator has is never made, and is named as a solve.
+        return "network_simplex::try_solve_into";
+    }
+
+    /// Solves `problem` by `which` into vectors of its own, and answers them owned: the body of try_solve() and
+    /// try_resolve().
+    result<answer<solution>> owned(entry which, const problem& problem) noexcept {
+        result<solution> columns = allocated(problem.tails.size(), problem.supplies.size());
+        if (!columns) {
+            return columns.error();
+        }
+        const result<answer<optimum>> found_into = into(which, problem, columns->flows, columns->potentials);
+        if (!found_into) {
+            return found_into.error();
+        }
+        const optimum* const found = found_into->outcome.optimal();
+        if (found == nullptr) {
+            return answer<solution>(outcome<solution>(), found_into->work);
+        }
+        columns->total_cost = found->total_cost;
+        return answer<solution>(outcome<solution>::make_optimal(std::move(*columns)), found_into->work);
+    }
+
+    /// Solves `problem` by `which` into `flows` where it is admitted: the body of try_solve_into() and
+    /// try_resolve_into() without potentials.
+    result<answer<optimum>> into(entry which, const problem& problem, span<std::uint64_t> flows) noexcept {
+        const result<void> admitted = admitted_flows(which, problem, flows);
+        if (!admitted) {
+            return admitted.error();
+        }
+        return run(which, problem, flows.data(), nullptr);
+    }
+
+    /// Solves `problem` by `which` into `flows` and `potentials` where both are admitted: the body of
+    /// try_solve_into() and try_resolve_into() with potentials.
+    result<answer<optimum>> into(entry which,
+                                 const problem& problem,
+                                 span<std::uint64_t> flows,
+                                 span<std::int64_t> potentials) noexcept {
+        const result<void> admitted_first = admitted_flows(which, problem, flows);
+        if (!admitted_first) {
+            return admitted_first.error();
+        }
+        const result<void> admitted_second = admitted_potentials(which, problem, flows, potentials);
+        if (!admitted_second) {
+            return admitted_second.error();
+        }
+        return run(which, problem, flows.data(), potentials.data());
+    }
+
     /// The handle, made on first need; null where the library could not make one, which it answers only where the
     /// memory for it is refused.
     kahlnws_solver* handle() noexcept {
@@ -1995,37 +2180,37 @@ private:
                detail::overlap(data, bytes, problem.supplies.data(), problem.supplies.size() * sizeof(std::int64_t));
     }
 
-    /// A success where `flows` holds one entry per arc of `problem` and shares no storage with a table of it.
-    static result<void> admitted_flows(const problem& problem, span<std::uint64_t> flows) noexcept {
+    /// A success where `flows` holds one entry per arc of `problem` and shares no storage with a table of it; the
+    /// error names the low-level form of `which`.
+    static result<void> admitted_flows(entry which, const problem& problem, span<std::uint64_t> flows) noexcept {
         if (flows.size() != problem.tails.size()) {
-            return error(error_kind::invalid_argument, "called `network_simplex::try_solve_into` with ",
+            return error(error_kind::invalid_argument, "called `", into_name(which), "` with ",
                          std::uint64_t(flows.size()), " flows for a problem of ", std::uint64_t(problem.tails.size()),
                          " arcs");
         }
         if (overlaps_tables(problem, flows.data(), flows.size() * sizeof(std::uint64_t))) {
-            return error(error_kind::invalid_argument,
-                         "called `network_simplex::try_solve_into` with flows that share storage with a table of the "
-                         "problem");
+            return error(error_kind::invalid_argument, "called `", into_name(which),
+                         "` with flows that share storage with a table of the problem");
         }
         return result<void>();
     }
 
     /// A success where `potentials` holds one entry per node of `problem` and shares no storage with a table of it or
-    /// with `flows`.
-    static result<void> admitted_potentials(const problem& problem,
+    /// with `flows`; the error names the low-level form of `which`.
+    static result<void> admitted_potentials(entry which,
+                                            const problem& problem,
                                             span<std::uint64_t> flows,
                                             span<std::int64_t> potentials) noexcept {
         if (potentials.size() != problem.supplies.size()) {
-            return error(error_kind::invalid_argument, "called `network_simplex::try_solve_into` with ",
+            return error(error_kind::invalid_argument, "called `", into_name(which), "` with ",
                          std::uint64_t(potentials.size()), " potentials for a problem of ",
                          std::uint64_t(problem.supplies.size()), " nodes");
         }
         const std::size_t bytes = potentials.size() * sizeof(std::int64_t);
         if (overlaps_tables(problem, potentials.data(), bytes) ||
             detail::overlap(potentials.data(), bytes, flows.data(), flows.size() * sizeof(std::uint64_t))) {
-            return error(error_kind::invalid_argument,
-                         "called `network_simplex::try_solve_into` with potentials that share storage with a table of "
-                         "the problem or with the flows");
+            return error(error_kind::invalid_argument, "called `", into_name(which),
+                         "` with potentials that share storage with a table of the problem or with the flows");
         }
         return result<void>();
     }
@@ -2055,9 +2240,12 @@ private:
         return tables_laid_out;
     }
 
-    /// Solves `problem` into `flows`, one entry per arc, and `potentials`, one per node or null, which overlap
-    /// nothing else of the call: the one call of the library's solve, and the answer it maps to.
-    result<answer<optimum>> run(const problem& problem, std::uint64_t* flows, std::int64_t* potentials) noexcept {
+    /// Solves `problem` by `which` into `flows`, one entry per arc, and `potentials`, one per node or null, which
+    /// overlap nothing else of the call: the one call of the library's solve, and the answer it maps to.
+    result<answer<optimum>> run(entry which,
+                                const problem& problem,
+                                std::uint64_t* flows,
+                                std::int64_t* potentials) noexcept {
         const result<kahlnws_problem> tables = laid_out(problem);
         if (!tables) {
             return tables.error();
@@ -2070,7 +2258,7 @@ private:
         kahlnws_work counts = {0, 0, 0};
         kahlnws_refusal written = kahlnws_refusal();
         const kahlnws_status status =
-            kahlnws_solver_solve(solver, &*tables, flows, potentials, &total_cost, &counts, &written);
+            c_function(which)(solver, &*tables, flows, potentials, &total_cost, &counts, &written);
 
         const work done = {counts.pivots, counts.degenerate_pivots, counts.first_arc_pivots};
         switch (status) {

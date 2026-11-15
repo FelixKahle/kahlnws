@@ -3,8 +3,9 @@
 
 // The C++ interface's solver, through the static library, in the mode the build chose: the depot through both levels;
 // an infeasible problem, whose buffers stay as they were; every breach a test can reach, with its values and the
-// library's message; buffers of the wrong length or sharing storage; moves and a moved-from solver; and, where
-// exceptions are enabled, the throwing forms. What the header refuses at compile time is shown by static assertions.
+// library's message; buffers of the wrong length or sharing storage; moves and a moved-from solver; the resolve forms,
+// from the kept basis and from none, with a failed call between that keeps the basis; and, where exceptions are
+// enabled, the throwing forms. What the header refuses at compile time is shown by static assertions.
 
 #include "kahlnws.hpp"
 
@@ -30,6 +31,14 @@ template <class Solver>
 struct has_solve<Solver, decltype(static_cast<void>(std::declval<Solver&>().solve(kahlnws::problem())))>
     : std::true_type {};
 
+/// Whether `Solver` has a member `resolve` taking a problem: the throwing form, present only with exceptions.
+template <class Solver, class = void>
+struct has_resolve : std::false_type {};
+
+template <class Solver>
+struct has_resolve<Solver, decltype(static_cast<void>(std::declval<Solver&>().resolve(kahlnws::problem())))>
+    : std::true_type {};
+
 /// Whether a `View` can be made from a braced list of three integers.
 template <class View, class = void>
 struct takes_braced_list : std::false_type {};
@@ -39,6 +48,8 @@ struct takes_braced_list<View, decltype(static_cast<void>(View({1, 2, 3})))> : s
 
 static_assert(has_solve<kahlnws::network_simplex>::value == (KAHLNWS_EXCEPTIONS == 1),
               "the throwing forms exist exactly where exceptions are enabled");
+static_assert(has_resolve<kahlnws::network_simplex>::value == (KAHLNWS_EXCEPTIONS == 1),
+              "the throwing resolve exists exactly where exceptions are enabled");
 static_assert(std::is_nothrow_default_constructible<kahlnws::network_simplex>::value, "a new solver allocates nothing");
 static_assert(!std::is_copy_constructible<kahlnws::network_simplex>::value, "a solver is not copied");
 static_assert(std::is_nothrow_move_constructible<kahlnws::network_simplex>::value, "a solver moves without throwing");
@@ -278,6 +289,109 @@ void test_moves_and_a_moved_from_solver(checks& checks) {
     }
 }
 
+void test_a_resolve_starts_from_the_kept_basis_through_both_levels(checks& checks) {
+    const tables depot;
+    kahlnws::network_simplex solver;
+    const kahlnws::result<kahlnws::answer<kahlnws::solution> > solved = solver.try_solve(depot.problem());
+    const kahlnws::work none = {0, 0, 0};
+    checks.check(solved && solved->work != none, "the depot should be solved with pivots");
+
+    // The basis the solve ended on is the optimum of the same numbers: nothing violates, and nothing moves.
+    const kahlnws::result<kahlnws::answer<kahlnws::solution> > again = solver.try_resolve(depot.problem());
+    checks.check(again && solved && again->outcome == solved->outcome, "a resolve should answer the same optimum");
+    checks.check(again && again->work == none, "a resolve of the problem solved last should make no pivot");
+
+    // Arcs 0 and 1 hang nodes 2 and 1 from node 0, and arc 2 stays full: 1, 2 and 2 units, at 5 + 2 + 2 = 9.
+    tables fewer;
+    fewer.supplies = {3, 0, -3};
+    std::vector<std::uint64_t> flows(3, 99);
+    std::vector<std::int64_t> potentials(3, 7);
+    const kahlnws::result<kahlnws::answer<kahlnws::optimum> > written =
+        solver.try_resolve_into(fewer.problem(), flows, potentials);
+    checks.check(written && written->outcome.optimal() != nullptr &&
+                     written->outcome.optimal()->total_cost == kahlnws::int128(9),
+                 "one unit less should cost 9");
+    checks.check(flows == std::vector<std::uint64_t>({1, 2, 2}), "the kept tree should carry 1, 2, 2");
+    checks.check(potentials == std::vector<std::int64_t>({0, 1, 5}), "the kept tree should keep its potentials");
+    checks.check(written && written->work == none, "the kept tree should carry one unit less without a pivot");
+
+    std::vector<std::uint64_t> only_flows(3, 99);
+    const kahlnws::result<kahlnws::answer<kahlnws::optimum> > flows_only =
+        solver.try_resolve_into(fewer.problem(), only_flows);
+    checks.check(flows_only && flows_only->work == none && only_flows == flows, "the flows alone, again no pivot");
+}
+
+void test_a_resolve_of_no_kept_basis_answers_as_a_solve(checks& checks) {
+    tables narrow;
+    narrow.capacities = {1, 1, 1};
+    tables unbalanced;
+    unbalanced.supplies = {4, 0, -3};
+    tables chain;
+    chain.tails = {0, 1, 2};
+    chain.heads = {1, 2, 3};
+    chain.capacities = {5, 5, 5};
+    chain.costs = {1, 1, 1};
+    chain.supplies = {2, 0, 0, -2};
+
+    const tables problems[] = {tables(), narrow, chain};
+    for (const tables& problem : problems) {
+        kahlnws::network_simplex fresh;
+        kahlnws::network_simplex never_solved;
+        const kahlnws::result<kahlnws::answer<kahlnws::solution> > solved = fresh.try_solve(problem.problem());
+        const kahlnws::result<kahlnws::answer<kahlnws::solution> > resolved =
+            never_solved.try_resolve(problem.problem());
+        checks.check(solved && resolved && *solved == *resolved,
+                     "a solver that never solved should resolve as it solves");
+    }
+
+    kahlnws::network_simplex never_solved;
+    const kahlnws::result<kahlnws::answer<kahlnws::solution> > refused = never_solved.try_resolve(unbalanced.problem());
+    checks.check(!refused && refused.error().refusal() != nullptr && refused.error().refusal()->unbalanced() != nullptr,
+                 "a resolve should refuse what a solve refuses");
+
+    // The depot's basis cannot serve the chain, of four nodes: the resolve answers as a solve, its work included.
+    kahlnws::network_simplex solver;
+    checks.check(solver.try_solve(tables().problem()).has_value(), "the depot should be solved");
+    kahlnws::network_simplex fresh;
+    const kahlnws::result<kahlnws::answer<kahlnws::solution> > solved = fresh.try_solve(chain.problem());
+    const kahlnws::result<kahlnws::answer<kahlnws::solution> > resolved = solver.try_resolve(chain.problem());
+    checks.check(solved && resolved && *solved == *resolved, "other counts should resolve as they solve");
+}
+
+void test_a_failed_call_keeps_the_basis_and_a_move_carries_it(checks& checks) {
+    tables depot;
+    tables unbalanced;
+    unbalanced.supplies = {4, 0, -3};
+    const kahlnws::work none = {0, 0, 0};
+    kahlnws::network_simplex solver;
+    checks.check(solver.try_solve(depot.problem()).has_value(), "the depot should be solved");
+
+    checks.check(!solver.try_resolve(unbalanced.problem()), "the unbalanced depot should be refused");
+    std::vector<std::uint64_t> short_flows = {5, 5};
+    const kahlnws::result<kahlnws::answer<kahlnws::optimum> > written =
+        solver.try_resolve_into(depot.problem(), short_flows);
+    checks.check(written ? false
+                         : std::strcmp(written.error().message(), "called `network_simplex::try_resolve_into` with 2 "
+                                                                  "flows for a problem of 3 arcs") == 0,
+                 "flows of the wrong length should be refused with their message");
+    std::vector<std::uint64_t> flows(3);
+    std::vector<std::int64_t> short_potentials = {6, 6};
+    checks.check(!solver.try_resolve_into(depot.problem(), flows, short_potentials),
+                 "potentials of the wrong length should be refused");
+    checks.check(!solver.try_resolve_into(depot.problem(), flows, depot.supplies),
+                 "potentials in the supplies' storage should be refused");
+    checks.check(!solver.try_reserve((std::numeric_limits<std::size_t>::max)(), 1), "the room should be refused");
+
+    kahlnws::network_simplex moved(std::move(solver));
+    const kahlnws::result<kahlnws::answer<kahlnws::solution> > resolved = moved.try_resolve(depot.problem());
+    checks.check(resolved && resolved->work == none, "the basis should be kept through failed calls and a move");
+
+    kahlnws::network_simplex fresh;
+    const kahlnws::result<kahlnws::answer<kahlnws::solution> > from_star = solver.try_resolve(depot.problem());
+    checks.check(from_star && *from_star == *fresh.try_solve(depot.problem()),
+                 "a moved-from solver should hold no basis and resolve as it solves");
+}
+
 void test_the_throwing_forms(checks& checks) {
 #if KAHLNWS_EXCEPTIONS
     tables problem;
@@ -286,6 +400,11 @@ void test_the_throwing_forms(checks& checks) {
     checks.check(solver.solve(problem.problem()).outcome.is_optimal(), "solve should answer the depot");
     std::vector<std::uint64_t> flows(3);
     checks.check(solver.solve_into(problem.problem(), flows).outcome.is_optimal(), "solve_into should answer it");
+    const kahlnws::work none = {0, 0, 0};
+    checks.check(solver.resolve(problem.problem()).work == none, "resolve should answer it from the kept basis");
+    std::vector<std::int64_t> potentials(3);
+    checks.check(solver.resolve_into(problem.problem(), flows).work == none, "resolve_into should answer it too");
+    checks.check(solver.resolve_into(problem.problem(), flows, potentials).work == none, "and with the potentials");
 
     problem.supplies = {4, 0, -3};
     bool thrown = false;
@@ -299,12 +418,31 @@ void test_the_throwing_forms(checks& checks) {
 
     thrown = false;
     try {
+        static_cast<void>(solver.resolve(problem.problem()));
+    } catch (const kahlnws::problem_error& error) {
+        thrown = error.refusal().unbalanced() != nullptr;
+    }
+    checks.check(thrown, "a refused resolve should throw kahlnws::problem_error");
+
+    thrown = false;
+    try {
         std::vector<std::uint64_t> short_flows(2);
         static_cast<void>(solver.solve_into(tables().problem(), short_flows));
     } catch (const std::invalid_argument& error) {
         thrown = dynamic_cast<const kahlnws::problem_error*>(&error) == nullptr;
     }
     checks.check(thrown, "flows of the wrong length should throw std::invalid_argument");
+
+    thrown = false;
+    try {
+        std::vector<std::uint64_t> short_flows(2);
+        static_cast<void>(solver.resolve_into(tables().problem(), short_flows));
+    } catch (const std::invalid_argument& error) {
+        thrown = dynamic_cast<const kahlnws::problem_error*>(&error) == nullptr &&
+                 std::string(error.what()) ==
+                     "called `network_simplex::try_resolve_into` with 2 flows for a problem of 3 arcs";
+    }
+    checks.check(thrown, "flows of the wrong length should throw std::invalid_argument from resolve_into");
 
     thrown = false;
     try {
@@ -339,6 +477,9 @@ int main() {
     test_every_reachable_breach_is_answered_with_its_values(checks);
     test_buffers_of_the_wrong_length_or_storage_are_refused(checks);
     test_moves_and_a_moved_from_solver(checks);
+    test_a_resolve_starts_from_the_kept_basis_through_both_levels(checks);
+    test_a_resolve_of_no_kept_basis_answers_as_a_solve(checks);
+    test_a_failed_call_keeps_the_basis_and_a_move_carries_it(checks);
     test_the_throwing_forms(checks);
     test_refused_memory_is_answered(checks);
 

@@ -1,8 +1,8 @@
 # Copyright 2026 Felix Kahle
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""The answer of both levels: what a solve found beside the work it did, optimal and infeasible alike, and the two
-values `Answer` and `Work` as Python handles them."""
+"""The answer of both levels and both entries of each: what a solve found beside the work it did, optimal and
+infeasible alike, and the two values `Answer` and `Work` as Python handles them."""
 
 from array import array
 
@@ -10,49 +10,55 @@ import pytest
 
 import kahlnws
 from kahlnws import Answer, Work
-from networks import CUT, DEPOT, Network
+from networks import CUT, DEPOT, ENTRY_PAIRS, Network, Solve, SolveInto, named
+
+# The entries of the two levels in pairs, each pair called on fresh solvers: a resolve on a solver that never solved
+# answers what a solve answers, its work included.
+PAIRS = pytest.mark.parametrize(("entry", "entry_into"), ENTRY_PAIRS, ids=named)
 
 # Node 0 must send 2 units to node 1 over an arc of capacity 1; an arc back of capacity 5 does not help. One pivot
 # fills the forward arc, and then no arc violates its bound while a root link still carries flow.
 CUT_WITH_A_WAY_BACK = Network(tails=[0, 1], heads=[1, 0], capacities=[1, 5], costs=[1, 1], supplies=[2, -2])
 
 
-def both_levels(network: Network) -> tuple[Answer[kahlnws.Solution], Answer[int]]:
-    """What a fresh solver answers for `network` at the high level and at the low level."""
-    high = network.answer(kahlnws.NetworkSimplex())
-    flows = array("Q", [0] * len(network.tails))
-    low = kahlnws.NetworkSimplex().solve_into(
-        tails=network.tails,
-        heads=network.heads,
-        capacities=network.capacities,
-        costs=network.costs,
-        supplies=network.supplies,
-        flows=flows,
-        lower_bounds=network.lower_bounds,
-    )
+def both_levels(
+    network: Network,
+    entry: Solve = kahlnws.NetworkSimplex.solve,
+    entry_into: SolveInto = kahlnws.NetworkSimplex.solve_into,
+) -> tuple[Answer[kahlnws.Solution], Answer[int]]:
+    """What a fresh solver answers for `network` at the high level by `entry` and at the low level by `entry_into`."""
+    high = network.answer(kahlnws.NetworkSimplex(), entry)
+    low = network.answer_into(kahlnws.NetworkSimplex(), array("Q", [0] * len(network.tails)), entry=entry_into)
     return high, low
 
 
-def test_the_depot_answers_its_solution_and_its_work_by_hand() -> None:
-    high, low = both_levels(DEPOT)
+@PAIRS
+def test_the_depot_answers_its_solution_and_its_work_by_hand(entry: Solve, entry_into: SolveInto) -> None:
+    high, low = both_levels(DEPOT, entry, entry_into)
 
     assert high.outcome is not None
     assert high.outcome.total_cost == low.outcome == 14
     assert high.work == low.work == Work(pivots=4, degenerate_pivots=1, first_arc_pivots=0)
 
 
+@PAIRS
 @pytest.mark.parametrize("network", [CUT_WITH_A_WAY_BACK, CUT])
-def test_an_infeasible_problem_answers_none_and_its_work_by_hand(network: Network) -> None:
-    high, low = both_levels(network)
+def test_an_infeasible_problem_answers_none_and_its_work_by_hand(
+    network: Network, entry: Solve, entry_into: SolveInto
+) -> None:
+    high, low = both_levels(network, entry, entry_into)
 
     assert high.outcome is None
     assert low.outcome is None
     assert high.work == low.work == Work(1, 0, 0)
 
 
-def test_a_problem_of_no_arc_does_no_work() -> None:
+@PAIRS
+def test_a_problem_of_no_arc_does_no_work(entry: Solve, entry_into: SolveInto) -> None:
     for supplies in [[], [0, 0]]:
-        high, low = both_levels(Network(tails=[], heads=[], capacities=[], costs=[], supplies=supplies))
+        high, low = both_levels(
+            Network(tails=[], heads=[], capacities=[], costs=[], supplies=supplies), entry, entry_into
+        )
 
         assert high.outcome is not None
         assert low.outcome == 0

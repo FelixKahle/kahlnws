@@ -9,7 +9,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+repository.workspace = true
+# The crate's own page on the registry: what it is, the smallest call, and where the documents are.
+readme = "README.md"
+keywords = ["min-cost-flow", "network-simplex", "optimization", "graph", "flow"]
+categories = ["algorithms", "mathematics", "science"]
+# `benches/rows.rs` is a module the benchmark suites share, not a target of its own: the bench targets are those
+# listed below.
+autobenches = false
 
 [lints]
 workspace = true
@@ -35,14 +42,15 @@ kahlnws_testing = { workspace = true }
 proptest = { workspace = true }
 # The range proofs and the extreme problems checked in big integers, apart from the arithmetic under test.
 num-bigint = { workspace = true }
-# The seeded generator of the test runs that enter a violating arc drawn at random.
+# The seeded generator of the test runs that enter a violating arc drawn at random, and the generators the warm
+# benchmark suite draws its changes from.
 rand_xoshiro = { workspace = true }
-# The unbiased draw of that arc among the violating ones.
+# The unbiased draw of that arc among the violating ones, and the traits that seed and read the suite's generators.
 rand = { workspace = true }
-# The timing of the benchmark suite.
+# The timing of the benchmark suites.
 criterion = { workspace = true }
 
-# The library has no benchmarks of its own: `cargo bench` runs only the suite.
+# The library has no benchmarks of its own: `cargo bench` runs only the suites.
 [lib]
 bench = false
 
@@ -68,7 +76,17 @@ name = "potentials"
 test = true
 harness = false
 
-# The benchmark suite, `benches/cold.rs`: cold solves of the seeded networks, with its own criterion `main`.
+[[example]]
+name = "resolve"
+test = true
+harness = false
+
+# The benchmark suites, each with its own criterion `main`: `benches/cold.rs`, cold solves of the seeded networks, and
+# `benches/warm.rs`, a resolve from a kept basis beside a solve of the same networks with some numbers changed.
 [[bench]]
 name = "cold"
+harness = false
+
+[[bench]]
+name = "warm"
 harness = false

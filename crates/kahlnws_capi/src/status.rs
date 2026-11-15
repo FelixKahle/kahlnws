@@ -7,7 +7,8 @@ use core::ffi::CStr;
 
 /// How a call went, by a number fixed for good: one of the `KAHLNWS_STATUS_` constants.
 ///
-/// `kahlnws_solver_reserve` and `kahlnws_solver_solve` answer one; each says which it can answer.
+/// `kahlnws_solver_reserve`, `kahlnws_solver_solve` and `kahlnws_solver_resolve` answer one; each says which it can
+/// answer.
 ///
 /// The numbers are part of the binary interface: none is ever changed or given to another status. Plain data: a
 /// caller may hold any number, and `kahlnws_status_name` names every one.
@@ -16,15 +17,14 @@ use core::ffi::CStr;
 pub struct StatusCode(pub u32);
 
 impl StatusCode {
-    /// `kahlnws_solver_solve` found a flow of least cost and wrote it.
+    /// A solve found a flow of least cost and wrote it.
     pub const OPTIMAL: Self = Self(0);
-    /// `kahlnws_solver_solve` found that no flow within the bounds meets the supplies, and wrote nothing but the work
-    /// of the solve.
+    /// A solve found that no flow within the bounds meets the supplies, and wrote nothing but the work of the solve.
     pub const INFEASIBLE: Self = Self(1);
     /// `kahlnws_solver_reserve` made the room it was asked for.
     pub const RESERVED: Self = Self(2);
-    /// `kahlnws_solver_solve` refused the problem, which lies outside what a solve admits, and wrote nothing but the
-    /// refusal that names the breach.
+    /// A solve refused the problem, which lies outside what a solve admits, and wrote nothing but the refusal that
+    /// names the breach.
     pub const REFUSED: Self = Self(3);
     /// A pointer the call needs is null, and nothing was written.
     pub const NULL_POINTER: Self = Self(4);

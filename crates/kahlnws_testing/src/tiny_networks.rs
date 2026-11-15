@@ -7,6 +7,7 @@
 
 use core::ops::RangeInclusive;
 
+use itertools::Itertools;
 use proptest::collection::vec;
 use proptest::prelude::*;
 
@@ -66,10 +67,34 @@ impl TinyMincostNetworks {
 
         (1_usize..=4)
             .prop_flat_map(move |nodes| {
-                let drawn = vec(DrawnArc::strategy(nodes, costs.strategy(), bounds.strategy()), fewest..=most);
+                let drawn = vec(ArcDraw::strategy(nodes, costs.strategy(), bounds.strategy()), fewest..=most);
                 (Just(nodes), drawn, supplies.strategy(nodes))
             })
-            .prop_map(|(nodes, arcs, random)| network_of(nodes, &arcs, random))
+            .prop_map(|(nodes, draws, random)| {
+                network_of(nodes, &draws.into_iter().map(ArcDraw::arc).collect_vec(), random)
+            })
+    }
+
+    /// The strategy that draws pairs of networks on the same arcs, each as `self` describes it: the second has the
+    /// first's nodes and its arcs' tails and heads, and its supplies, its lower bounds, its widths and its costs are
+    /// each the first's or drawn anew, by a coin of their own; an arc's capacity is its lower bound and its width as
+    /// they came out, so every arc keeps the ranges of [`strategy`](Self::strategy). So the same network comes up
+    /// about once in sixteen pairs, and so does the same network at other costs.
+    pub fn pairs(self) -> impl Strategy<Value = (MincostNetwork, MincostNetwork)> {
+        let Self { arcs, costs, supplies, bounds } = self;
+        let (fewest, most) = arcs.into_inner();
+        let redrawn_costs = costs.clone();
+
+        (1_usize..=4)
+            .prop_flat_map(move |nodes| {
+                let drawn = vec(ArcDraw::strategy(nodes, costs.strategy(), bounds.strategy()), fewest..=most);
+                (Just(nodes), drawn, supplies.strategy(nodes))
+            })
+            .prop_flat_map(move |(nodes, first, random)| {
+                let redrawn = vec(ArcNumbers::strategy(redrawn_costs.strategy(), bounds.strategy()), first.len());
+                (Just(FirstDraw { nodes, arcs: first, random }), redrawn, supplies.strategy(nodes), Redraws::strategy())
+            })
+            .prop_map(|(first, redrawn, random, redraws)| first.paired(&redrawn, random, redraws))
     }
 }
 
@@ -127,21 +152,168 @@ struct DrawnArc {
     flow: u64,
 }
 
-impl DrawnArc {
+/// One arc as drawn, before its bounds and its flow are worked out: its ends and its numbers. Plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArcDraw {
+    /// The node it leaves.
+    tail: usize,
+    /// The node it enters.
+    head: usize,
+    /// The numbers its bounds, its cost and its flow are worked out from.
+    numbers: ArcNumbers,
+}
+
+/// The numbers one arc is drawn with, its ends apart. Plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArcNumbers {
+    /// Its lower bound where its bounds are ordered, one less than it where they are inverted: 0 or 1.
+    lower: u64,
+    /// Its width where its bounds are ordered: 0 to 2.
+    width: u64,
+    /// Its cost of a unit of flow.
+    cost: i64,
+    /// What picks its flow among the flows within its ordered bounds: 0 to 3.
+    pick: u64,
+    /// Whether its lower bound passes its capacity.
+    inverted: bool,
+}
+
+/// The first network of a pair as drawn: its nodes, its arcs, and the supplies drawn for it. Plain data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FirstDraw {
+    /// The number of nodes.
+    nodes: usize,
+    /// The arcs as drawn.
+    arcs: Vec<ArcDraw>,
+    /// The supplies of nodes `1..nodes`, or `None` where they are the arcs' flows'.
+    random: Option<Vec<i64>>,
+}
+
+/// Which columns of the second network of a pair are drawn anew, each by a coin of its own. Plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Redraws {
+    /// The supplies.
+    supplies: Coin,
+    /// The lower bounds.
+    lower_bounds: Coin,
+    /// The widths, with whether the bounds are inverted.
+    widths: Coin,
+    /// The costs.
+    costs: Coin,
+}
+
+/// Whether a column of the second network of a pair is the first's or drawn anew.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coin {
+    /// The first network's.
+    Keep,
+    /// Drawn anew.
+    Redraw,
+}
+
+impl ArcDraw {
     /// The strategy of one arc between nodes of `0..nodes`, its cost drawn by `cost` and whether its bounds are
     /// inverted by `inverted`.
     fn strategy(nodes: usize, cost: BoxedStrategy<i64>, inverted: BoxedStrategy<bool>) -> impl Strategy<Value = Self> {
-        (0..nodes, 0..nodes, 0_u64..=1, 0_u64..=2, cost, 0_u64..=3, inverted).prop_map(
-            |(tail, head, lower_bound, width, cost, pick, inverted)| {
-                if inverted {
-                    let lower_bound = lower_bound + 1;
-                    Self { tail, head, lower_bound, capacity: lower_bound - 1, cost, flow: lower_bound }
-                } else {
-                    let capacity = lower_bound + width;
-                    Self { tail, head, lower_bound, capacity, cost, flow: lower_bound + pick % (width + 1) }
-                }
-            },
-        )
+        (0..nodes, 0..nodes, ArcNumbers::strategy(cost, inverted)).prop_map(|(tail, head, numbers)| Self {
+            tail,
+            head,
+            numbers,
+        })
+    }
+
+    /// The arc of this draw: where its bounds are ordered, its lower bound and its capacity that plus its width, and a
+    /// flow of `lower + pick % (width + 1)`; where they are inverted, a lower bound of one more than drawn, a capacity
+    /// one below it, and its lower bound as its flow.
+    fn arc(self) -> DrawnArc {
+        let Self { tail, head, numbers: ArcNumbers { lower, width, cost, pick, inverted } } = self;
+
+        if inverted {
+            let lower_bound = lower + 1;
+            DrawnArc { tail, head, lower_bound, capacity: lower_bound - 1, cost, flow: lower_bound }
+        } else {
+            DrawnArc { tail, head, lower_bound: lower, capacity: lower + width, cost, flow: lower + pick % (width + 1) }
+        }
+    }
+}
+
+impl ArcNumbers {
+    /// The strategy of the numbers of one arc, its cost drawn by `cost` and whether its bounds are inverted by
+    /// `inverted`.
+    fn strategy(cost: BoxedStrategy<i64>, inverted: BoxedStrategy<bool>) -> impl Strategy<Value = Self> {
+        (0_u64..=1, 0_u64..=2, cost, 0_u64..=3, inverted).prop_map(|(lower, width, cost, pick, inverted)| Self {
+            lower,
+            width,
+            cost,
+            pick,
+            inverted,
+        })
+    }
+
+    /// These numbers with the columns `redraws` draws anew taken from `redrawn`: the lower bound, the width with
+    /// whether the bounds are inverted, and the cost. The pick of the flow is `redrawn`'s, read only where the supplies
+    /// are drawn anew as a flow's.
+    fn mixed(self, redrawn: Self, redraws: Redraws) -> Self {
+        let (width, inverted) = redraws.widths.pick((self.width, self.inverted), (redrawn.width, redrawn.inverted));
+
+        Self {
+            lower: redraws.lower_bounds.pick(self.lower, redrawn.lower),
+            width,
+            cost: redraws.costs.pick(self.cost, redrawn.cost),
+            pick: redrawn.pick,
+            inverted,
+        }
+    }
+}
+
+impl FirstDraw {
+    /// The pair of this draw: its own network, and the network on the same arcs whose columns `redraws` names are
+    /// drawn anew, from `redrawn`, one per arc, and from `random`, the supplies drawn for it.
+    ///
+    /// # Panics
+    /// Panics if `redrawn` holds another number of entries than the draw has arcs.
+    fn paired(
+        self,
+        redrawn: &[ArcNumbers],
+        random: Option<Vec<i64>>,
+        redraws: Redraws,
+    ) -> (MincostNetwork, MincostNetwork) {
+        let Self { nodes, arcs, random: first_random } = self;
+        let second_arcs = arcs
+            .iter()
+            .zip_eq(redrawn)
+            .map(|(&draw, &numbers)| ArcDraw { numbers: draw.numbers.mixed(numbers, redraws), ..draw }.arc())
+            .collect_vec();
+        let first = network_of(nodes, &arcs.into_iter().map(ArcDraw::arc).collect_vec(), first_random);
+
+        let mut second = network_of(nodes, &second_arcs, random);
+        second.supplies = redraws.supplies.pick(first.supplies.clone(), second.supplies);
+
+        (first, second)
+    }
+}
+
+impl Redraws {
+    /// The strategy of four fair coins.
+    fn strategy() -> impl Strategy<Value = Self> {
+        let coin = || prop_oneof![Just(Coin::Keep), Just(Coin::Redraw)];
+
+        (coin(), coin(), coin(), coin()).prop_map(|(supplies, lower_bounds, widths, costs)| Self {
+            supplies,
+            lower_bounds,
+            widths,
+            costs,
+        })
+    }
+}
+
+impl Coin {
+    /// `kept` where this coin keeps the first's column, `redrawn` where it draws it anew.
+    fn pick<T>(self, kept: T, redrawn: T) -> T {
+        match self {
+            Self::Keep => kept,
+            Self::Redraw => redrawn,
+        }
     }
 }
 
@@ -276,6 +448,120 @@ mod tests {
 
             prop_assert!(brute_force_optimum(&network).is_some());
         }
+
+        #[test]
+        fn test_a_pair_shares_its_arcs_and_keeps_to_the_ranges((first, second) in wide().pairs()) {
+            prop_assert_eq!(second.node_count(), first.node_count());
+            prop_assert_eq!((&second.tails, &second.heads), (&first.tails, &first.heads));
+            prop_assert!(first.arc_count() <= 6 && second.shaped().is_ok());
+
+            for arc in 0..second.arc_count() {
+                let (lower_bound, capacity) = (second.lower_bounds[arc], second.capacities[arc]);
+                let ordered = lower_bound <= 1 && capacity >= lower_bound && capacity - lower_bound <= 2;
+                let inverted = (1..=2).contains(&lower_bound) && capacity + 1 == lower_bound;
+                prop_assert!(ordered || inverted, "bounds {}..={}", lower_bound, capacity);
+                prop_assert!((-4..=4).contains(&second.costs[arc]));
+            }
+            prop_assert_eq!(second.supplies.iter().sum::<i64>(), 0);
+
+            // Within what the brute force enumerates, which it refuses with a panic.
+            let _ = brute_force_optimum(&second);
+        }
+    }
+
+    #[test]
+    fn test_pairs_reach_the_same_network_and_each_column_changed_alone() {
+        let mut runner = TestRunner::deterministic();
+        let pairs = TinyMincostNetworks { bounds: TinyBounds::Ordered, ..wide() }.pairs();
+        let (mut same, mut costs, mut supplies, mut bounds, mut everything) = (0, 0, 0, 0, 0);
+
+        for _ in 0..400 {
+            let (first, second) = pairs.new_tree(&mut runner).expect("a pair should be drawn").current();
+            let changed = [
+                first.supplies != second.supplies,
+                first.lower_bounds != second.lower_bounds || first.capacities != second.capacities,
+                first.costs != second.costs,
+            ];
+            match changed {
+                [false, false, false] => same += 1,
+                [false, false, true] => costs += 1,
+                [true, false, false] => supplies += 1,
+                [false, true, false] => bounds += 1,
+                [true, true, true] => everything += 1,
+                _ => {}
+            }
+        }
+
+        assert!(same > 0 && costs > 0 && supplies > 0, "{same} same, {costs} costs, {supplies} supplies");
+        assert!(bounds > 0 && everything > 0, "{bounds} bounds, {everything} everything");
+    }
+
+    /// The numbers of an arc, for a test to write out.
+    fn numbers(lower: u64, width: u64, cost: i64, pick: u64, inverted: bool) -> ArcNumbers {
+        ArcNumbers { lower, width, cost, pick, inverted }
+    }
+
+    #[test]
+    fn test_an_arc_draw_works_out_its_bounds_and_its_flow_by_hand() {
+        // Ordered: a lower bound of 1 and a width of 2 make a capacity of 3; the pick 3 a flow of 1 + 3 % 3 = 1.
+        let draw = ArcDraw { tail: 0, head: 1, numbers: numbers(1, 2, 5, 3, false) };
+        assert_eq!(draw.arc(), DrawnArc { tail: 0, head: 1, lower_bound: 1, capacity: 3, cost: 5, flow: 1 });
+
+        // Inverted: a lower bound of one more than drawn, a capacity one below it, and the lower bound as the flow.
+        let inverted = ArcDraw { numbers: numbers(1, 2, 5, 3, true), ..draw };
+        assert_eq!(inverted.arc(), DrawnArc { tail: 0, head: 1, lower_bound: 2, capacity: 1, cost: 5, flow: 2 });
+    }
+
+    #[test]
+    fn test_mixed_numbers_take_each_column_by_its_coin_by_hand() {
+        let (kept, redrawn) = (numbers(1, 2, 5, 3, false), numbers(0, 0, -4, 1, true));
+        let (keep, redraw) = (Coin::Keep, Coin::Redraw);
+        let redraws = |lower_bounds, widths, costs| Redraws { supplies: keep, lower_bounds, widths, costs };
+
+        // The pick of the flow is always the redrawn one's.
+        assert_eq!(kept.mixed(redrawn, redraws(keep, keep, keep)), numbers(1, 2, 5, 1, false));
+        assert_eq!(kept.mixed(redrawn, redraws(redraw, keep, keep)), numbers(0, 2, 5, 1, false));
+        assert_eq!(kept.mixed(redrawn, redraws(keep, redraw, keep)), numbers(1, 0, 5, 1, true), "with the inversion");
+        assert_eq!(kept.mixed(redrawn, redraws(keep, keep, redraw)), numbers(1, 2, -4, 1, false));
+        assert_eq!(kept.mixed(redrawn, redraws(redraw, redraw, redraw)), redrawn);
+    }
+
+    #[test]
+    fn test_a_pair_keeps_or_redraws_each_column_by_hand() {
+        // Two nodes and an arc 0 -> 1 of lower bound 1, width 2 and cost 5, carrying 1 + 3 % 3 = 1 in the flow its
+        // supplies are of.
+        let arcs = vec![ArcDraw { tail: 0, head: 1, numbers: numbers(1, 2, 5, 3, false) }];
+        let first = FirstDraw { nodes: 2, arcs, random: None };
+        let redrawn = [numbers(0, 1, -4, 0, false)];
+        let all = |coin| Redraws { supplies: coin, lower_bounds: coin, widths: coin, costs: coin };
+
+        let (network, same) = first.clone().paired(&redrawn, Some(vec![2]), all(Coin::Keep));
+        assert_eq!(network, MincostNetwork::from_arcs(&[1, -1], &[(0, 1, 1, 3, 5)]));
+        assert_eq!(same, network, "every column kept");
+
+        // Every column drawn anew: a lower bound of 0, a width of 1 and a cost of -4; node 1 supplies 2, node 0
+        // balances it.
+        let (_, other) = first.clone().paired(&redrawn, Some(vec![2]), all(Coin::Redraw));
+        assert_eq!(other, MincostNetwork::from_arcs(&[-2, 2], &[(0, 1, 0, 1, -4)]));
+
+        // The supplies drawn anew as a flow's: the new arc carries 0 + 0 % 2 = 0.
+        let (_, of_a_flow) = first.clone().paired(&redrawn, None, all(Coin::Redraw));
+        assert_eq!(of_a_flow.supplies, [0, 0]);
+
+        // Only the costs drawn anew.
+        let costs = Redraws { costs: Coin::Redraw, ..all(Coin::Keep) };
+        let (_, recosted) = first.paired(&redrawn, None, costs);
+        assert_eq!(recosted, MincostNetwork::from_arcs(&[1, -1], &[(0, 1, 1, 3, -4)]));
+    }
+
+    #[test]
+    #[should_panic(expected = "zip_eq")]
+    fn test_a_pair_refuses_redrawn_numbers_of_another_count() {
+        let first = FirstDraw { nodes: 1, arcs: vec![], random: None };
+        let keep = Coin::Keep;
+        let redraws = Redraws { supplies: keep, lower_bounds: keep, widths: keep, costs: keep };
+
+        let _ = first.paired(&[numbers(0, 0, 0, 0, false)], None, redraws);
     }
 
     #[test]

@@ -3,12 +3,15 @@
 
 //! Writes the C header of the crate from its sources and `cbindgen.toml` to the build's output folder, where a test
 //! compares it with the committed `include/kahlnws.h`; and, where the environment variable `KAHLNWS_WRITE_HEADER` is
-//! `1`, to `include/kahlnws.h` itself. Every build of the same sources writes the same bytes.
+//! `1`, to `include/kahlnws.h` itself. Every build of the same sources writes the same bytes. It hands the target tuple
+//! and the profile family of the build on to the crate's targets, as `KAHLNWS_CAPI_TARGET` (cargo's `TARGET`) and
+//! `KAHLNWS_CAPI_PROFILE` (cargo's `PROFILE`, `debug` or `release`), for the header tests that build the static
+//! library as this build made it.
 //!
 //! After the includes stand the overview, the crate doc up to its first heading; the preamble of macros; and the
-//! version macros, from the crate's version encoded as the library encodes it. The docs of the generated declarations
-//! are then made Doxygen comments, and their numbered constants gathered into enums; each of those steps fails the
-//! build where it meets a form it does not know.
+//! version macros, from the crate's version encoded as the library encodes it. The numbered constants of the generated
+//! declarations are then gathered into enums, and every doc made a Doxygen comment wrapped where it stands; each of
+//! those steps fails the build where it meets a form it does not know.
 
 #[path = "header_text.rs"]
 mod header_text;
@@ -28,6 +31,10 @@ const WRITE_HEADER: &str = "KAHLNWS_WRITE_HEADER";
 /// The value of [`WRITE_HEADER`] that rewrites the committed header.
 const WRITE_HEADER_ON: &str = "1";
 
+/// The variables cargo sets for the build script that it hands on to the crate's targets, each with the name the
+/// targets read it by.
+const HANDED_ON: [(&str, &str); 2] = [("TARGET", "KAHLNWS_CAPI_TARGET"), ("PROFILE", "KAHLNWS_CAPI_PROFILE")];
+
 fn main() {
     let crate_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo should set CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("cargo should set OUT_DIR"));
@@ -36,6 +43,10 @@ fn main() {
         println!("cargo::rerun-if-changed={input}");
     }
     println!("cargo::rerun-if-env-changed={WRITE_HEADER}");
+    for (variable, handed_on) in HANDED_ON {
+        let value = env::var(variable).unwrap_or_else(|_| panic!("cargo should set {variable}"));
+        println!("cargo::rustc-env={handed_on}={value}");
+    }
 
     let header = header_of(&crate_dir);
     write_if_changed(&out_dir.join(HEADER), &header);
@@ -70,7 +81,7 @@ fn header_of(crate_dir: &Path) -> String {
     bindings.write(&mut written);
     let header = String::from_utf8(written).expect("the header should be written as UTF-8");
 
-    header_text::enumerate_constants(&header_text::doxygen_comments(&header))
+    header_text::for_c_reader(&header)
 }
 
 /// Writes `contents` to the file at `path`, creating its folder, unless the file already holds exactly them.

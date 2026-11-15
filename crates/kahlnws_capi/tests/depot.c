@@ -1,12 +1,13 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// The depot solved from C through the static library: a depot (node 0) sends 4 units to a customer (node 2),
-// directly or through a hub (node 1), with the work of the solve. Then the same network with arcs too narrow, which is
-// infeasible and has its work, and with a customer who asks for one unit more, which is refused; the version of the
-// library against the header's; and the names of statuses. Every output is left without values before the call that
-// writes it. The test `header.rs` builds and runs it; it exits with 0 where every result is the one worked by hand,
-// and otherwise names each that is not.
+// The depot solved from C through the static library: a depot (node 0) sends 4 units to a customer (node 2), directly
+// or through a hub (node 1), with the work of the solve. The depot resolved from the basis the solve ended on, which
+// makes no pivot, and with one unit less, which the kept tree carries without a pivot. Then the same network with arcs
+// too narrow, which is infeasible and has its work, and with a customer who asks for one unit more, which is refused;
+// the version of the library against the header's; and the names of statuses. Every output is left without values
+// before the call that writes it. The test `header.rs` builds and runs it; it exits with 0 where every result is the
+// one worked by hand, and otherwise names each that is not.
 
 #include <stdio.h>
 #include <string.h>
@@ -40,6 +41,7 @@ int main(void) {
     const int64_t costs[] = {5, 1, 1};
     const int64_t supplies[] = {4, 0, -4};
     const int64_t unbalanced[] = {4, 0, -3};
+    const int64_t fewer[] = {3, 0, -3};
     const kahlnws_problem problem = {3, 3, tails, heads, NULL, capacities, costs, supplies};
 
     uint64_t flows[3];
@@ -64,11 +66,27 @@ int main(void) {
     failures += failed(total_cost.low == 14 && total_cost.high == 0, "the cost should be 14");
     failures += failed(counted(work, 4, 1, 0), "the depot should take four pivots, one of them degenerate");
 
+    // The basis the solve ended on is the optimum of the same numbers: the resolve moves nothing.
+    status = kahlnws_solver_resolve(solver, &problem, flows, potentials, &total_cost, &work, &refusal);
+    failures += failed(status == KAHLNWS_STATUS_OPTIMAL, "the depot should be resolved optimally");
+    failures += failed(flows[0] == 2 && flows[1] == 2 && flows[2] == 2, "the resolved flows should be 2, 2, 2");
+    failures += failed(total_cost.low == 14 && total_cost.high == 0, "the resolved cost should be 14");
+    failures += failed(counted(work, 0, 0, 0), "a resolve of the problem solved last should take no pivot");
+
+    // Arcs 0 and 1 hang node 2 and node 1 from node 0, and arc 2 stays full: 1, 2 and 2 units, at 5 + 2 + 2 = 9.
+    kahlnws_problem one_less = problem;
+    one_less.supplies = fewer;
+    status = kahlnws_solver_resolve(solver, &one_less, flows, potentials, &total_cost, &work, &refusal);
+    failures += failed(status == KAHLNWS_STATUS_OPTIMAL, "one unit less should be resolved optimally");
+    failures += failed(flows[0] == 1 && flows[1] == 2 && flows[2] == 2, "the flows should be 1, 2, 2");
+    failures += failed(total_cost.low == 9 && total_cost.high == 0, "the cost of one unit less should be 9");
+    failures += failed(counted(work, 0, 0, 0), "the kept tree should carry one unit less without a pivot");
+
     kahlnws_problem infeasible = problem;
     infeasible.capacities = narrow;
     status = kahlnws_solver_solve(solver, &infeasible, flows, potentials, &total_cost, &work, &refusal);
     failures += failed(status == KAHLNWS_STATUS_INFEASIBLE, "the narrow depot should be infeasible");
-    failures += failed(flows[0] == 2 && total_cost.low == 14, "an infeasible solve should leave the outputs");
+    failures += failed(flows[0] == 1 && total_cost.low == 9, "an infeasible solve should leave the outputs");
     failures += failed(counted(work, 3, 1, 0), "the narrow depot should take three pivots, one degenerate");
 
     kahlnws_problem refused = problem;

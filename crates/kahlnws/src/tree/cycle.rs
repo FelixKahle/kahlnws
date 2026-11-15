@@ -6,7 +6,8 @@
 //! node whose link leaves, which is what an exchange is made of.
 
 use super::spanning_tree::{
-    ApexClimb, ClimbStep, CycleEnds, Direction, HungNode, Link, Side, SideHangingsIter, SpanningTree, TreeNode,
+    ApexClimb, ClimbStep, CycleEnds, Direction, HungNode, LentTree, Link, Side, SideHangingsIter, SpanningTree,
+    TreeNode,
 };
 
 /// The walk of the cycle an arc closes with the tree, from both ends up toward their apex, before the apex is known: a
@@ -85,7 +86,7 @@ impl<'t> CycleWalk<'t> {
     /// # Safety
     /// `first` and `second` are below the node count of `tree`: the ends for which
     /// [`SpanningTree::apex_climb`] answers a climb, as its doc states.
-    pub(crate) unsafe fn new_unchecked(tree: &'t mut SpanningTree<'_>, first: usize, second: usize) -> Self {
+    pub(crate) unsafe fn new_unchecked(tree: &'t mut LentTree<'_>, first: usize, second: usize) -> Self {
         debug_assert!(
             first < tree.node_count() && second < tree.node_count(),
             "called `CycleWalk::new_unchecked` with ends {first} and {second}, which should both be below the node \
@@ -93,7 +94,7 @@ impl<'t> CycleWalk<'t> {
             tree.node_count()
         );
         // SAFETY: both ends are below the node count of `tree`, as the caller promises (`CycleWalk::new_unchecked`).
-        let climb = unsafe { tree.apex_climb_unchecked(first, second) };
+        let climb = unsafe { tree.tree_mut().apex_climb_unchecked(first, second) };
 
         Self { climb, first_kept: None, second_kept: None }
     }
@@ -231,7 +232,7 @@ pub(super) mod tests {
     ///
     /// # Panics
     /// Panics if `first` or `second` is not below the node count of `tree`.
-    pub(crate) fn cycle_walk<'t>(tree: &'t mut SpanningTree<'_>, first: usize, second: usize) -> CycleWalk<'t> {
+    pub(crate) fn cycle_walk<'t>(tree: &'t mut LentTree<'_>, first: usize, second: usize) -> CycleWalk<'t> {
         let node_count = tree.node_count();
         assert!(first < node_count && second < node_count, "a test's ends should be below the node count");
 
@@ -279,7 +280,7 @@ pub(super) mod tests {
 
     /// The steps of the walk of the cycle of `first` and `second` in `tree`, and the apex the cycle it becomes holds,
     /// as plain numbers.
-    fn walk_of(tree: &mut SpanningTree<'_>, first: usize, second: usize) -> (Vec<PlainStep>, usize) {
+    fn walk_of(tree: &mut LentTree<'_>, first: usize, second: usize) -> (Vec<PlainStep>, usize) {
         let hung_nodes = tree.node_count();
         let mut walk = cycle_walk(tree, first, second);
         let steps = walked(&mut walk, hung_nodes);
@@ -289,12 +290,7 @@ pub(super) mod tests {
 
     /// The cycle of `first` and `second` in `tree` with `side` named, its walk having kept every node of `side` that
     /// `keeps` names.
-    fn kept_of<'t>(
-        tree: &'t mut SpanningTree<'_>,
-        [first, second]: [usize; 2],
-        side: Side,
-        keeps: &[usize],
-    ) -> Cycle<'t> {
+    fn kept_of<'t>(tree: &'t mut LentTree<'_>, [first, second]: [usize; 2], side: Side, keeps: &[usize]) -> Cycle<'t> {
         let mut walk = cycle_walk(tree, first, second);
         while let Some(step) = walk.step() {
             if step.side() == side && keeps.contains(&usize::from(step.step.node)) {

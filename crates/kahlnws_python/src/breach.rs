@@ -12,12 +12,13 @@ create_exception!(
     kahlnws,
     ProblemError,
     PyValueError,
-    "A problem no solve admits, raised by `NetworkSimplex.solve` and `NetworkSimplex.solve_into`.
+    "A problem no solve admits, raised by `NetworkSimplex.solve`, `solve_into`, `resolve` and `resolve_into`.
 
 The problem has a table of the wrong length, too many nodes or arcs, an arc whose numbers lie outside the range
 a solve admits, or supplies that do not balance. A problem with several breaches is refused with the first, in the
 order of the classes of `Breach`, where those about one arc are taken arc by arc: the lowest arc with any of them,
-and its first. A refused solve answers no work, and may still have grown the solver's room.
+and its first. A refused solve answers no work, keeps the basis the solver kept, and may still have grown the
+solver's room.
 
 Attributes:
     breach: The breach as a `Breach`, whose class names the kind and whose attributes hold the values; `None` on a

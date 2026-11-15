@@ -102,6 +102,48 @@ assert answer.outcome == 14
 assert flows.tolist() == [2, 2, 2] and potentials.tolist() == [0, 1, 5]
 ```
 
+## Solving again
+
+A solver keeps the basis its last solve ended on, optimal or infeasible. `NetworkSimplex.resolve` and
+`NetworkSimplex.resolve_into` take the same arguments as `solve` and `solve_into`, answer the same types and raise the
+same exceptions, and start from that basis where it serves: where the problem has the node and arc counts of that solve
+and every arc the tail and the head it had, and the supplies the basis leaves stay within the range a solve admits. The
+tree is kept and every number is read anew, so supplies, bounds, capacities and costs may all have changed. Where only
+some of them did, a resolve often makes far fewer pivots than a solve, and the same problem again, where the kept basis
+serves, makes none. Where the basis cannot serve, as on a new solver or for a problem of other counts, a resolve answers
+exactly what `solve` answers, its work included; so it is never wrong to call it.
+
+```python
+import kahlnws
+
+solver = kahlnws.NetworkSimplex()
+depot = {"tails": [0, 0, 1], "heads": [2, 1, 2], "capacities": [3, 4, 2], "supplies": [4, 0, -4]}
+solved = solver.solve(**depot, costs=[5, 1, 1])
+assert solved.work.pivots == 4
+
+# The route through the hub now costs 6 a unit, more than the direct arc: one unit moves over.
+resolved = solver.resolve(**depot, costs=[5, 5, 1])
+assert resolved.outcome is not None
+assert resolved.outcome.flows == [3, 1, 1] and resolved.outcome.total_cost == 21
+assert resolved.work.pivots < solved.work.pivots
+
+# The same problem again: the kept basis serves and is its optimum, so nothing moves.
+assert solver.resolve(**depot, costs=[5, 5, 1]).work.pivots == 0
+```
+
+What each entry guarantees:
+
+| | `solve`, `solve_into` | `resolve`, `resolve_into` |
+|---|---|---|
+| outcome and cost | those of the problem | the same |
+| potentials | prove the flows optimal | prove the flows optimal |
+| flows among tied optima, potentials, work | a function of the problem | of the problem and the solves before it |
+| `work.first_arc_pivots` | as the problem's structure gives | 0 where it starts from the kept basis |
+
+Every entry keeps the basis its solve ended on, and a call that raises before a solve runs (a refused problem, a column
+or an output that cannot be used, a refused room, `reserve` included) keeps the basis kept before. All four grow the
+room alike, so where it holds the problem `resolve_into` allocates no room in the solver either.
+
 ## How columns are read
 
 Every column is copied into the solver's own memory before the solve starts, and the solve then runs on that copy
@@ -121,9 +163,9 @@ sequence, is converted entry by entry with a range check.
 So `numpy.int64` tails, NumPy's default integer type, are accepted and converted. A buffer of `bool` reads as 0 and 1.
 Floats, characters, and integers in the other byte order than the machine's are refused.
 
-What a call allocates: where the room holds the problem, `solve_into` allocates no room in the solver; it still makes
-its answer, and a `memoryview` and an export record for each buffer it is handed. `solve` makes the lists of its
-`Solution` besides.
+What a call allocates: where the room holds the problem, `solve_into` and `resolve_into` allocate no room in the
+solver; they still make their answer, and a `memoryview` and an export record for each buffer they are handed. `solve`
+and `resolve` make the lists of their `Solution` besides.
 
 ## Refusals and other exceptions
 
@@ -168,7 +210,8 @@ Other mistakes raise the built-in exceptions:
 - `RuntimeError`: the solver is already in a call.
 
 A `ProblemError` is a `ValueError` too, so an `except ValueError` clause catches both; one for `ProblemError` first
-separates them. A refused problem has no work, and may still have grown the solver's room.
+separates them. A refused problem has no work, keeps the basis the solver kept, and may still have grown the solver's
+room.
 
 ## Threads and the GIL
 
@@ -199,8 +242,8 @@ or copied.
 ## Typing
 
 The package ships its stubs and the marker `py.typed`, and passes a strict type check. `Answer` is generic in its
-outcome: `solve` answers `Answer[Solution]` and `solve_into` answers `Answer[int]`. Columns are typed as sequences of
-integers or buffers, NumPy arrays included on Python 3.11.
+outcome: `solve` and `resolve` answer `Answer[Solution]`, `solve_into` and `resolve_into` answer `Answer[int]`. Columns
+are typed as sequences of integers or buffers, NumPy arrays included on Python 3.11.
 
 ## Other calls
 
@@ -211,13 +254,14 @@ integers or buffers, NumPy arrays included on Python 3.11.
 
 ## Examples
 
-Four scripts under `crates/kahlnws_python/examples/` solve one network, two warehouses that supply three shops, as a
+Five scripts under `crates/kahlnws_python/examples/` solve one network, two warehouses that supply three shops, as a
 user would. The examples of the other languages carry the same names and print the same lines.
 
 | Example | What it shows |
 |---|---|
 | `transport.py` | the smallest useful call, with plain lists: one solve, its cost and the flow on each lane |
 | `reuse.py` | one solver for three days of demand, its room reserved once, each day solved into NumPy arrays |
+| `resolve.py` | the three days again, each later day resolved from the day before, its pivots beside a fresh solve's |
 | `outcomes.py` | a problem with no flow, whose outcome is `None`, and a refused problem, raised as `ProblemError` |
 | `potentials.py` | the potentials, each lane's reduced cost, the check of the optimality conditions, and the work |
 

@@ -1,7 +1,7 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! What `NetworkSimplex.solve` finds for a problem that has a flow, owned by Python.
+//! What `NetworkSimplex.solve` and `NetworkSimplex.resolve` find for a problem that has a flow, owned by Python.
 
 use pyo3::PyTypeInfo;
 use pyo3::basic::CompareOp;
@@ -10,8 +10,8 @@ use pyo3::types::{PyList, PyTuple, PyType};
 
 /// A flow of least cost, with the potentials that prove it optimal and its cost.
 ///
-/// What `NetworkSimplex.solve` finds for a problem that has a flow. Each attribute answers the same object each time it
-/// is read; the lists are the solution's own, and no solve writes them again.
+/// What `NetworkSimplex.solve` and `NetworkSimplex.resolve` find for a problem that has a flow. Each attribute answers
+/// the same object each time it is read; the lists are the solution's own, and no solve writes them again.
 ///
 /// Plain data: compared by value, and hashed by value as the tuple of its parts is, so a solution whose lists the
 /// caller changes compares and hashes as changed; copied and pickled.

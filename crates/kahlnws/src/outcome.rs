@@ -69,11 +69,12 @@ pub struct Answer<T> {
 /// leaves and the arc moves to its other bound, a flip. A flip sends the arc's whole width, which is above zero, since
 /// an arc of no width never enters.
 ///
-/// The counts are a function of the problem as given, its arc order included, and of the crate's version, as the
-/// outcome is: the same problem gives the same work from a fresh solver and from one that solved others before. In
-/// every `Work` a solve answers, `degenerate_pivots <= pivots` and `first_arc_pivots <= pivots`, and the pivots that
-/// sent flow are `pivots - degenerate_pivots`. A solve that answers ran `pivots - first_arc_pivots + 1` block
-/// searches.
+/// The counts of a solve are a function of the problem as given, its arc order included, and of the crate's version, as
+/// the outcome is: the same problem gives the same work from a fresh solver and from one that solved others before.
+/// The counts of a resolve are a function of the problem and of the solves the solver made before it, and are those of
+/// a solve where it does not start from the kept basis. In every `Work`, `degenerate_pivots <= pivots` and
+/// `first_arc_pivots <= pivots`, and the pivots that sent flow are `pivots - degenerate_pivots`. A solve or a resolve
+/// that answers ran `pivots - first_arc_pivots + 1` block searches.
 ///
 /// ```
 /// use kahlnws::{Answer, NetworkSimplex, Outcome, Problem, ProblemError, Work};
@@ -106,7 +107,8 @@ pub struct Work {
     pub degenerate_pivots: u64,
     /// Of the pivots, those made by the arcs the solve tries before block search, chosen from the problem's
     /// structure, each where it violated its bound when its turn came. At most `pivots`. Zero where none was chosen
-    /// or none violated, and `pivots` where those arcs alone reached the outcome, optimal or infeasible.
+    /// or none violated, and in a resolve from the kept basis, which tries none; `pivots` where those arcs alone
+    /// reached the outcome, optimal or infeasible.
     pub first_arc_pivots: u64,
 }
 

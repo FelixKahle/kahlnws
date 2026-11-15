@@ -2,30 +2,42 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The columns of a run with the tree as one strongly feasible spanning-tree basis: the room they are kept in, the
-//! basis a start loads into it, the rows the pricing reads, the pivot, the decision whether every supply is routed, and
-//! the write-out of the flows.
+//! basis a start loads into it, from the star or from the basis the last run ended on, re-flowed; the rows the pricing
+//! reads, the pivot, the decision whether every supply is routed, the write-out of the flows, and the end of a run,
+//! which keeps its basis in the room.
 
 use core::hint::select_unpredictable;
 use core::iter::{self, FusedIterator, Zip};
+use core::mem;
 use core::ops::Range;
 use core::slice;
 
 use std::collections::TryReserveError;
 
 use itertools::izip;
+use typed_index_collections::TiSlice;
 
-use crate::problem::{CheckedArc, CheckedArcs, CheckedProblem};
+use crate::problem::{CheckedArc, CheckedArcs, CheckedProblem, NodeId};
 use crate::ranges::{narrow, widen};
 use crate::room::{refill, reserve_total};
 use crate::slot_order::{DealtSlotsIter, Slot};
-use crate::starting_basis::Start;
-use crate::tree::{Cycle, CycleWalk, Direction, Exchange, Link, Side, SpanningTree, TreeRoom};
+use crate::starting_basis::{Excesses, KeptStart, RootLink, Start, root_link};
+use crate::tree::{
+    Cycle, CycleWalk, Direction, Exchange, LentTree, Link, PruneStep, PruneWalk, Side, TightenWalk, TreeRoom,
+    root_link_cost,
+};
 
 /// The room a basis is kept in from one solve to the next: the arc and link columns and the room of the tree, holding
-/// whatever the last basis left.
+/// whatever the last basis left, and whether that is a whole basis.
 ///
-/// It only grows, and holds no basis: nothing is read from it but through the [`Basis`] that [`load`](Self::load)
-/// writes into it and lends. It has no invariant.
+/// It only grows. Nothing is read from it but through the [`Basis`] that [`load`](Self::load) writes into it, or that
+/// [`resume`](Self::resume) re-flows in it, and lends, and by the decision of `resume`, which reads the kept ends and
+/// states where the room holds a basis.
+///
+/// # Invariant
+/// `held` guards the arc and link columns: where it is `Held::Basis`, they are those of the basis a run ended on, as
+/// [`Basis::keep`] left them, beside the tree that keep left kept in the tree's room, which guards its own columns.
+/// Every load and every resume takes it out before its first write to a column, and only [`Basis::keep`] puts it in.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BasisRoom {
     /// Per slot: the arc's tail and head.
@@ -40,44 +52,71 @@ pub(crate) struct BasisRoom {
     flows: Vec<u64>,
     /// The room of the tree.
     tree: TreeRoom,
+    /// Whether the arc and link columns hold the basis a run ended on.
+    held: Held,
+}
+
+/// What a basis room's arc and link columns hold between runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Held {
+    /// No whole basis: before the first run's end, and from the first write of a load or a resume until its run ends.
+    #[default]
+    Nothing,
+    /// The basis the last run ended on.
+    Basis,
+}
+
+/// The basis a resume lends, by the start it was made from.
+#[derive(Debug)]
+pub(crate) enum Resumed<'r, 'p> {
+    /// The basis the last run ended on, re-flowed for the problem.
+    Kept(Basis<'r, 'p>),
+    /// The star, as [`BasisRoom::load`] makes it: the room held no basis, or the one it held cannot serve the problem.
+    Star(Basis<'r, 'p>),
 }
 
 /// A strongly feasible spanning-tree basis of one problem, extended by a root and one root link per node, loaded into
-/// the room it borrows for `'r`: what a run pivots on, from the star to its outcome.
+/// the room it borrows for `'r`: what a run pivots on, from its start to its outcome.
 ///
 /// The basis works on the problem with its lower bounds taken out: an arc of width `capacity − lower bound`, carrying
 /// flow above its lower bound, and each node's supply net of the lower bounds. Each node also has a root link that
-/// joins it to the root, of capacity `u64::MAX`: up from the node at cost zero where its net supply is zero or more,
-/// down to it at the root cost `M` where it is a demand. A link is an arc at its slot, or node `v`'s root link at
-/// `m + v`. Every potential is the tree node's, the root's last.
+/// joins it to the root, of capacity `u64::MAX`, up from the node at cost zero or down to it at the root cost `M`. A
+/// link is an arc at its slot, or node `v`'s root link at `m + v`. Every potential is the tree node's, the root's last.
 ///
 /// # Invariant
 /// With `n` nodes and `m` arcs in the problem it holds:
 /// - *Shape.* The arc columns hold `m` slots, the arc dealt to slot `s` at `s`, with its ends, both below `n`, and its
 ///   cost; the link columns hold `m + n` links, an arc's capacity being its width; the tree has `n` hung nodes,
 ///   `n + 1` potentials, the root's last, and `m + n` links.
-/// - *Tree.* An arc is in the tree exactly where it is some node's link; it then has the state `Unpriced`.
+/// - *Tree.* An arc is in the tree exactly where it is some node's link; it then has the state `Unpriced`. Each hung
+///   node's link joins it to its parent, the way its direction says: an arc's tail and head are the node and its
+///   parent, so a node that hangs by an arc hangs from a node below `n`, never from the root; a root link joins its
+///   own node and the root.
 /// - *Duality.* The root's potential is zero and every tree link is tight: its cost plus its tail's potential less its
-///   head's is zero. A root link costs zero where it points up and `M` where it points down; it points as it did in
-///   the star.
+///   head's is zero. A root link costs zero where it points up and `M` where it points down; the start sets which way
+///   a root link in the tree points, and no pivot changes it.
 /// - *Flow.* Every node conserves its net supply, root links counted; every flow lies within `0..=capacity`; an arc out
 ///   of the tree carries nothing (`AtLower`), its width (`AtUpper`), or has no width (`Unpriced`); a root link out of
 ///   the tree carries nothing.
 /// - *Strong feasibility.* Every tree link can carry more flow toward the root: a link that runs up from its node
 ///   carries less than its capacity, one that runs down to it more than nothing.
 ///
-/// [`BasisRoom::load`] establishes it; [`pivot`](Self::pivot) keeps it.
+/// [`BasisRoom::load`] and [`BasisRoom::resume`] establish it; [`pivot`](Self::pivot) keeps it; [`keep`](Self::keep)
+/// ends the run on it and leaves it in the room.
 #[derive(Debug)]
 pub(crate) struct Basis<'r, 'p> {
     /// What the pricing reads of each arc, and its state.
     arcs: ArcColumns<'r>,
     /// What each link can carry and carries.
     links: LinkColumns<'r>,
-    /// The tree, with each node's potential.
-    tree: SpanningTree<'r>,
+    /// The tree, with each node's potential, lent by the tree's room.
+    tree: LentTree<'r>,
     /// The problem the basis was loaded from, which the write-out reads again: kept here so that no other problem of
     /// the same arc count can be written out with these flows.
     problem: CheckedProblem<'p>,
+    /// What the room holds between runs: nothing while the basis is lent, the basis once [`keep`](Self::keep) ends
+    /// the run.
+    held: &'r mut Held,
 }
 
 /// What the pricing reads of each arc of a loaded basis, in slot order, with the arcs' states, which a pivot writes.
@@ -98,10 +137,10 @@ struct ArcColumns<'r> {
 /// What each link of a loaded basis can carry and carries: the arcs at their slots, then each node's root link.
 ///
 /// # Invariant
-/// Both columns hold exactly as many entries as the tree beside them in the [`Basis`] has links, `m + n`, so every
-/// [`Link`] of that tree indexes them; and no other tree's link ever does: this file reads links only from the tree
-/// its basis holds, the one the basis was loaded with, and a link does not outlive that tree's borrow. Since `m` is at
-/// most `m + n`, every [`ArcSlot`] indexes them too.
+/// Both columns hold exactly as many entries as the tree beside them in the [`Basis`] or the [`Reflow`] has links,
+/// `m + n`, so every [`Link`] of that tree indexes them; and no other tree's link ever does: this file reads links
+/// only from the tree held beside them, the one they were loaded or re-flowed with, and a link does not outlive that
+/// tree's borrow. Since `m` is at most `m + n`, every [`ArcSlot`] indexes them too.
 #[derive(Debug)]
 struct LinkColumns<'r> {
     /// Per link: the most it carries, in units of flow: an arc's width, `u64::MAX` for a root link.
@@ -113,9 +152,10 @@ struct LinkColumns<'r> {
 /// A slot of one loaded basis, below its arc count `m`: the index its arc columns, the rows lent from them, and the
 /// arc part of its link columns are read and written at without a check.
 ///
-/// What it proves: [`ArcColumns::slot`] made it from a [`Slot`] it checked against the arc count, and nothing else in
-/// this file makes one, its tests included. What remains this file's discipline: one is made within a call of the
-/// basis and used within that call on that basis, and never kept past it.
+/// What it proves: [`ArcColumns::slot`] made it from a [`Slot`], or [`ArcColumns::slot_of`] from a [`Link`], each
+/// checked against the arc count, and nothing else in this file makes one, its tests included. What remains this
+/// file's discipline: one is made within a call of the basis or the re-flow and used within that call on the same
+/// columns, and never kept past it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ArcSlot(usize);
 
@@ -127,8 +167,9 @@ struct ArcSlot(usize);
 /// noise elsewhere.
 ///
 /// # Invariant
-/// Only the load writes one into a room's ends column, from an arc of the [`CheckedProblem`] it loads: both ends lie
-/// below that problem's node count `n`, so below the `n + 1` potentials of the tree loaded beside them.
+/// Only [`BasisRoom::scatter`] writes one into a room's ends column, from an arc of the [`CheckedProblem`] a load or a
+/// re-flow places: both ends lie below that problem's node count `n`, so below the `n + 1` potentials of the tree
+/// beside them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Ends {
     /// The node the arc leaves.
@@ -208,6 +249,102 @@ struct LinkFill {
     capacity: u64,
 }
 
+/// The ends and the states of a held basis, of the counts of one problem: what is read of the kept basis to decide
+/// whether it can serve that problem, and what its arcs out of the tree carry.
+///
+/// # Invariant
+/// Only [`BasisRoom::held_arcs`] makes one, from the columns of a room that holds a whole basis: `ends` and `states`
+/// hold one entry per arc of `problem`, `m` each, so every slot a [`DealtSlotsIter`] deals for `m` arcs indexes them.
+#[derive(Clone, Copy, Debug)]
+struct HeldArcs<'r, 'p> {
+    /// Per slot: the kept arc's tail and head.
+    ends: &'r [Ends],
+    /// Per slot: where the kept arc stood.
+    states: &'r [ArcState],
+    /// The problem whose counts the columns hold.
+    problem: CheckedProblem<'p>,
+}
+
+/// The start of a problem over the basis a room holds, where that basis serves it: the proof the decision hands to
+/// the re-flow.
+///
+/// What it proves: only [`BasisRoom::kept_start`] makes one, and only after it found, in the room it read, that the
+/// tree room keeps a tree of the problem's `n` hung nodes and `m + n` links, that the arc columns hold `m` slots and
+/// the link columns `m + n` links, and that every slot holds the ends of the problem's arc dealt to it; and `start`
+/// holds the problem's excesses over that basis, within the limit, which [`KeptStart`] proves of itself.
+///
+/// What remains this file's discipline, since the value holds no borrow of the room: it is handed to the `reflow` of
+/// the same room, with nothing written to that room in between. [`BasisRoom::resume`], its one maker's one caller,
+/// makes the two calls one after the other.
+#[derive(Debug)]
+struct ServingStart<'p, 'e> {
+    /// The problem with its excesses.
+    start: KeptStart<'p, 'e>,
+}
+
+/// The columns of a held basis while the tree beside them is re-flowed for a new problem: the tree, and what the
+/// re-flow writes besides it.
+///
+/// # Invariant
+/// Only [`BasisRoom::reflow`] makes one, from a [`ServingStart`], with the problem's arcs just placed, which keeps
+/// every column's length. The columns have the *Shape* of [`Basis`] for the problem, with its ends, costs and widths;
+/// every arc stands where [`ArcState::at`] puts what its kept state gives it of its new width; the tree is the one the
+/// last run ended on, of the problem's `n` hung nodes and `m + n` links; a root link out of that tree carries nothing;
+/// and the excesses hold one entry per node ([`ReflowColumns`]). The tree keeps the *Tree* item of [`Basis`] all
+/// through the re-flow: each hung node's link joins it to its parent, an arc's link a node below `n`, since every arc
+/// has the ends it had in the basis the run ended on (`ServingStart`), and the prune only moves a node to its own root
+/// link.
+#[derive(Debug)]
+struct Reflow<'r, 'e> {
+    /// The tree the last run ended on, lent again.
+    tree: LentTree<'r>,
+    /// What the re-flow writes besides the tree.
+    columns: ReflowColumns<'r, 'e>,
+}
+
+/// The arc and link columns of a re-flow, with each node's excess still to send toward the root.
+///
+/// # Invariant
+/// The arc and link columns are those [`Reflow`] describes, and `excesses` holds one entry per node of the problem,
+/// `n`, its excess over the arcs as they stand ([`KeptStart`]), each node's children's transfers added once they are
+/// sent.
+#[derive(Debug)]
+struct ReflowColumns<'r, 'e> {
+    /// What the pricing reads of each arc, and its state.
+    arcs: ArcColumns<'r>,
+    /// What each link can carry and carries.
+    links: LinkColumns<'r>,
+    /// Per node: its excess, in units of flow.
+    excesses: &'e mut TiSlice<NodeId, i128>,
+}
+
+/// How a tree arc stands once its node's excess is sent along it toward the root. Plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreeArcFlow {
+    /// What the arc carries, in units of flow above its lower bound: within `0..=width`.
+    flow: u64,
+    /// What the excess of the node's parent gains, in units of flow: the flow where the arc runs up from the node, its
+    /// negation where it runs down to it.
+    to_parent: i128,
+    /// Whether the arc stays in the tree.
+    standing: Standing,
+}
+
+/// Whether a tree arc stays in the tree once its node's excess is sent along it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// It stays, carrying all of the node's excess, and can carry more toward the root.
+    InTree,
+    /// It leaves the tree at `state`, a bound, and its node hangs from the root by `root_link`, which carries what the
+    /// arc could not.
+    Leaves {
+        /// Where the arc stands out of the tree.
+        state: ArcState,
+        /// The node's root link.
+        root_link: RootLink,
+    },
+}
+
 /// The rows the pricing reads, lent by a loaded basis: per slot the arc's ends, cost and state, with every tree node's
 /// potential.
 ///
@@ -257,6 +394,7 @@ impl BasisRoom {
             capacities: Vec::new(),
             flows: Vec::new(),
             tree: TreeRoom::new(),
+            held: Held::Nothing,
         }
     }
 
@@ -279,7 +417,8 @@ impl BasisRoom {
     /// The star of `start`, written into this room and lent from it as a basis: every arc at its dealt slot with its
     /// width, out of the tree and carrying nothing, `AtLower`, or `Unpriced` where it has no width; every node hanging
     /// from the root by its root link, carrying the magnitude of its net supply, at potential zero below a link that
-    /// points up and the root cost below one that points down. Nothing of an earlier basis is kept but the room.
+    /// points up and the root cost below one that points down. Nothing of an earlier basis is kept but the room: a
+    /// basis the room held is taken out before the first write.
     ///
     /// # Panics
     /// On a target whose `usize` has 32 bits it can panic while it refills a column, where the column's room passes
@@ -287,24 +426,111 @@ impl BasisRoom {
     pub(crate) fn load<'p>(&mut self, start: &Start<'p, '_>) -> Basis<'_, 'p> {
         let problem = start.problem();
 
+        self.held = Held::Nothing;
         self.place_links(start);
         self.place_arcs(problem);
 
-        let Self { ends, costs, states, capacities, flows, tree } = self;
+        let Self { ends, costs, states, capacities, flows, tree, held } = self;
         let directions = start.root_links().map(|root_link| root_link.direction);
         // A checked problem keeps `n + 1` and `m + n` within the index limit, and the start gives one root link a
         // node: the star does not panic.
-        let tree = tree.star(problem.node_count(), problem.arc_count(), directions, start.root_cost());
+        let tree = tree.star(problem.node_count(), problem.arc_count(), directions, problem.root_cost());
 
-        Basis { arcs: ArcColumns { ends, costs, states }, links: LinkColumns { capacities, flows }, tree, problem }
+        Basis {
+            arcs: ArcColumns { ends, costs, states },
+            links: LinkColumns { capacities, flows },
+            tree,
+            problem,
+            held,
+        }
+    }
+
+    /// The basis of `start` from the basis the last run in this room ended on, re-flowed, where the room holds one of
+    /// the problem's node and arc counts and of the same tail and head at every arc, and the excesses over it keep
+    /// the limit of the start's net supplies; otherwise the star, as [`load`](Self::load) makes it.
+    ///
+    /// The re-flow keeps the tree and where each arc out of it stands, and reads every number anew from the problem:
+    /// an arc out of the tree carries its new width at its capacity and nothing at its lower bound; each node's excess
+    /// is sent toward the root along its link, from the leaves up, and a link that cannot carry it, or could carry no
+    /// more toward the root, leaves the tree for its node's root link; every potential is made tight from the root
+    /// down. It costs a few passes over the arcs and the nodes, O(m + n), and allocates nothing where `excesses`
+    /// holds room for the problem's nodes. Either way the room holds no basis until the run ends.
+    ///
+    /// # Panics
+    /// As [`load`](Self::load), and on such a target where `excesses` grows past `isize::MAX` bytes: they take `16·n`.
+    pub(crate) fn resume<'p>(&mut self, start: &Start<'p, '_>, excesses: &mut Excesses) -> Resumed<'_, 'p> {
+        if mem::take(&mut self.held) == Held::Nothing {
+            return Resumed::Star(self.load(start));
+        }
+
+        match self.kept_start(start, excesses) {
+            Some(serving) => Resumed::Kept(self.reflow(serving)),
+            None => Resumed::Star(self.load(start)),
+        }
+    }
+
+    /// The start of the problem of `start` over the kept basis, written into `excesses`, where the room holds that
+    /// basis, of the problem's counts and ends, and the excesses keep the limit; `None` otherwise. It writes nothing
+    /// but `excesses`.
+    fn kept_start<'p, 'e>(&self, start: &Start<'p, '_>, excesses: &'e mut Excesses) -> Option<ServingStart<'p, 'e>> {
+        let held = self.held_arcs(start.problem()).filter(HeldArcs::are_of_problem)?;
+
+        // Each arc out of the tree carries what its kept state gives it of its new width; a tree arc carries nothing
+        // here, and the re-flow of the tree writes it.
+        let start = match start.problem().arcs() {
+            CheckedArcs::WithoutLowerBounds(arcs) => excesses.gather(start, held.carried(arcs)),
+            CheckedArcs::WithLowerBounds(arcs) => excesses.gather(start, held.carried(arcs)),
+        }?;
+
+        // `held_arcs` compared the kept tree's counts and every column's length with the problem's counts, and
+        // `are_of_problem` every slot's ends: `ServingStart`'s invariant.
+        Some(ServingStart { start })
+    }
+
+    /// The ends and states of the basis this room holds, where the tree its tree room keeps is of the counts of
+    /// `problem`, `n` nodes and `m` arcs, and the arc and link columns hold them; `None` otherwise.
+    fn held_arcs<'p>(&self, problem: CheckedProblem<'p>) -> Option<HeldArcs<'_, 'p>> {
+        let (node_count, arc_count) = (problem.node_count(), problem.arc_count());
+        let kept = self.tree.kept()?;
+        // A checked problem keeps `m + n` within the index limit: the sum does not overflow.
+        let link_count = arc_count + node_count;
+        let counts = [kept.node_count, kept.link_count, self.ends.len(), self.states.len()];
+        let links = [self.capacities.len(), self.flows.len()];
+
+        (counts == [node_count, link_count, arc_count, arc_count] && links == [link_count, link_count])
+            .then_some(HeldArcs { ends: &self.ends, states: &self.states, problem })
+    }
+
+    /// The basis `serving` begins from: the basis this room holds, which serves its problem, re-flowed.
+    fn reflow<'p>(&mut self, serving: ServingStart<'p, '_>) -> Basis<'_, 'p> {
+        let ServingStart { start } = serving;
+        let problem = start.problem();
+
+        // The arcs' pass: every arc at its slot with its new ends, cost and width, carrying what its kept state gives
+        // it. The ends are the kept ones, so the tree's links join the same nodes as before.
+        self.place_arcs(problem);
+
+        let Self { ends, costs, states, capacities, flows, tree, held } = self;
+        // The tree room keeps a tree (`ServingStart`): the resume does not panic.
+        let tree = tree.resume();
+        let columns = ReflowColumns {
+            arcs: ArcColumns { ends, costs, states },
+            links: LinkColumns { capacities, flows },
+            excesses: start.into_excesses(),
+        };
+        let Reflow { tree, columns: ReflowColumns { arcs, links, .. } } =
+            Reflow { tree, columns }.flow_up().tighten(problem.root_cost());
+
+        Basis { arcs, links, tree, problem, held }
     }
 
     /// Rewrites the arc columns as the arcs of `problem` at their dealt slots, `m` entries each, and writes each arc's
-    /// width as the capacity of its slot's link: each arc with its ends, cost and width, in the state
-    /// [`ArcState::placed`] gives.
+    /// width as the capacity of its slot's link: each arc with its ends, cost and width, carrying what the state its
+    /// slot held gives it ([`ArcState::carried`]) and standing where that flow puts it ([`ArcState::at`]).
     ///
     /// # Panics
-    /// Panics if the link columns hold fewer than `m` links: [`place_links`](Self::place_links) places them first.
+    /// Panics if the link columns hold fewer than `m` links or the states fewer than `m` entries:
+    /// [`place_links`](Self::place_links) places them first.
     fn place_arcs(&mut self, problem: CheckedProblem<'_>) {
         let (arc_count, node_count) = (problem.arc_count(), problem.node_count());
         match problem.arcs() {
@@ -314,49 +540,62 @@ impl BasisRoom {
     }
 
     /// The arc columns as `arcs`, the arcs of a problem of `arc_count` arcs and `node_count` nodes in ascending arc
-    /// order, each at the slot the dealing of those counts gives it: afterwards the three arc columns hold `arc_count`
-    /// slots, each with its arc's ends, cost and the state [`ArcState::placed`] gives, and the first `arc_count`
-    /// capacities hold the arcs' widths at their slots; the capacities past them and the flows are as they were. Every
-    /// end of `arcs` is below `node_count`.
+    /// order, each at the slot the dealing of those counts gives it, the states holding one state a slot: afterwards
+    /// the three arc columns hold `arc_count` slots, each with its arc's ends and cost; the first `arc_count`
+    /// capacities hold the arcs' widths and the first `arc_count` flows what each arc carries, its width where the
+    /// state its slot held was `AtUpper` and nothing otherwise; and each arc stands where [`ArcState::at`] puts that
+    /// flow. The capacities and flows past them are as they were. Every end of `arcs` is below `node_count`.
     ///
     /// # Panics
-    /// Panics if the capacities hold fewer than `arc_count` entries.
+    /// Panics if the states, the capacities or the flows hold fewer than `arc_count` entries.
     fn scatter(&mut self, arcs: impl Iterator<Item = CheckedArc>, arc_count: usize, node_count: usize) {
+        let state_count = self.states.len();
+
         // Every slot is written below, since the dealing is a bijection onto the slots; the refill only sets the
         // lengths.
         refill(&mut self.ends, iter::repeat_n(Ends { tail: 0, head: 0 }, arc_count));
         refill(&mut self.costs, iter::repeat_n(0, arc_count));
-        refill(&mut self.states, iter::repeat_n(ArcState::Unpriced, arc_count));
-        let widths = &mut self.capacities[..arc_count];
+        let (ends, costs) = (&mut self.ends, &mut self.costs);
+        let (widths, flows) = (&mut self.capacities[..arc_count], &mut self.flows[..arc_count]);
+        let states = &mut self.states[..arc_count];
+        debug_assert_eq!(state_count, arc_count, "the states should hold the state each slot held, one a slot");
 
         for (arc, slot) in arcs.zip(DealtSlotsIter::new(arc_count, node_count)) {
             let at = usize::from(slot);
-            let (width, cost) = (arc.width(), arc.cost());
-            // A checked arc's ends are below `n`, and `n + 1` is at most `u32::MAX`: neither narrowing can fail.
-            let ends = Ends { tail: narrow(usize::from(arc.tail())), head: narrow(usize::from(arc.head())) };
-            let state = ArcState::placed(width);
 
             debug_assert!(
-                at < self.ends.len() && at < self.costs.len() && at < self.states.len() && at < widths.len(),
-                "a dealt slot should be below the arc count, the length of the three arc columns and of the widths"
+                at < ends.len() && at < costs.len() && at < states.len() && at < widths.len() && at < flows.len(),
+                "a dealt slot should be below the arc count, the length of the arc columns, the widths and the flows"
             );
             // SAFETY: `DealtSlotsIter` yields only slots below the arc count it was made for (its invariant), which
-            // is the length the three arc columns were refilled to and the arcs' part of the capacities sliced above.
-            unsafe {
-                *self.ends.get_unchecked_mut(at) = ends;
-                *self.costs.get_unchecked_mut(at) = cost;
-                *self.states.get_unchecked_mut(at) = state;
-                *widths.get_unchecked_mut(at) = width;
-            }
+            // is the length the ends and the costs were refilled to and the length of the states, the widths and the
+            // flows sliced above.
+            let (ends_at, cost_at, state_at, width_at, flow_at) = unsafe {
+                (
+                    ends.get_unchecked_mut(at),
+                    costs.get_unchecked_mut(at),
+                    states.get_unchecked_mut(at),
+                    widths.get_unchecked_mut(at),
+                    flows.get_unchecked_mut(at),
+                )
+            };
+
+            *ends_at = Ends::of(arc);
+            *cost_at = arc.cost();
+            *width_at = arc.width();
+            *flow_at = state_at.carried(*width_at);
+            *state_at = ArcState::at(*flow_at, *width_at);
         }
     }
 
-    /// Rewrites the link columns as the `m + n` links of `start`, each column whole: the arcs at their slots, carrying
-    /// nothing, of capacity zero until [`place_arcs`](Self::place_arcs) writes their widths; then each node's root
-    /// link in ascending node order, of capacity `u64::MAX`, carrying the magnitude of the node's net supply.
+    /// Rewrites the link columns as the `m + n` links of `start`, each column whole, and the states as the arcs' in the
+    /// star: the arcs at their slots, carrying nothing at their lower bounds (`AtLower`), of capacity zero until
+    /// [`place_arcs`](Self::place_arcs) writes their widths; then each node's root link in ascending node order, of
+    /// capacity `u64::MAX`, carrying the magnitude of the node's net supply.
     fn place_links(&mut self, start: &Start<'_, '_>) {
         let (arc_count, root_links) = (start.problem().arc_count(), start.root_links());
 
+        refill(&mut self.states, iter::repeat_n(ArcState::AtLower, arc_count));
         refill(&mut self.capacities, iter::repeat_n(0, arc_count).chain(iter::repeat_n(u64::MAX, root_links.len())));
         refill(&mut self.flows, iter::repeat_n(0, arc_count).chain(root_links.map(|root_link| root_link.flow)));
     }
@@ -450,15 +689,16 @@ impl<'r> Basis<'r, '_> {
     /// Where no arc violates its bound, it is false exactly where no flow within the bounds meets the supplies.
     pub(crate) fn routes_every_supply(&self) -> bool {
         // Where no arc violates and a root link carries flow, no flow within the bounds meets the supplies. Suppose one
-        // does, `x*`, and a demand link, into `d`, carries flow in the basis's `x`. The difference `x* − x` is a
-        // circulation of the extended network that only lowers root-link flows, so it decomposes into cycles conformal
-        // to it, one of which enters the root by lowering the flow down `d`'s link and leaves it by lowering the flow
-        // up some `s`'s link; the rest of it is a simple path from `s` to `d` of at most `n − 1` arcs, so its cost is
-        // at most `−M + (n − 1)·C = −1` (`root_cost`). Every step of it can move in `x`: each arc out of the tree
-        // stands at the bound it moves away from and does not violate, so its reduced cost in the step's direction is
-        // at least zero; each tree link, the two root links among them, which carry flow, is tight. So the cycle's
-        // cost, the sum of its steps' reduced costs, is at least zero: a contradiction. Every demand link carries
-        // nothing, and with the root conserving, every supply link.
+        // does, `x*`, and a root link that points down, into `d`, carries flow in the basis's `x`. The difference
+        // `x* − x` is a circulation of the extended network that only lowers root-link flows, so it decomposes into
+        // cycles conformal to it, one of which enters the root by lowering the flow down `d`'s link and leaves it by
+        // lowering the flow up some `s`'s link, which points up; the rest of it is a simple path from `s` to `d` of at
+        // most `n − 1` arcs, so its cost is at most `−M + (n − 1)·C = −1` (`root_cost`). Every step of it can move in
+        // `x`: each arc out of the tree stands at the bound it moves away from and does not violate, so its reduced
+        // cost in the step's direction is at least zero; each tree link, the two root links among them, which carry
+        // flow, is tight. So the cycle's cost, the sum of its steps' reduced costs, is at least zero: a contradiction.
+        // Every root link that points down carries nothing, and with the root conserving, every one that points up.
+        // No property of the start is used: which way each root link points is whatever the start set.
         //
         // Where every root link carries nothing, the arcs' flows meet the net supplies, and with the lower bounds
         // added the supplies. No arc of positive width violates, each tree arc is tight, and an arc of no width
@@ -487,13 +727,16 @@ impl<'r> Basis<'r, '_> {
         }
     }
 
-    /// Each node's potential, in units of cost, node `v` at `v`, lent for as long as the room is: what a run answers
-    /// when it is over.
+    /// Ends the run on this basis, optimal or infeasible alike: the room keeps it whole for the next
+    /// [`resume`](BasisRoom::resume), and each node's potential, in units of cost, node `v` at `v`, is lent for as
+    /// long as the room is: what a run answers when it is over.
     ///
     /// # Panics
     /// Panics if the tree holds no potential at all, which its `n + 1` potentials rule out (`Basis`, Shape).
-    pub(crate) fn into_potentials(self) -> &'r [i64] {
-        let (_root, nodes) = self.tree.into_potentials().split_last().expect("a tree should hold its root's potential");
+    pub(crate) fn keep(self) -> &'r [i64] {
+        let potentials = self.tree.keep();
+        *self.held = Held::Basis;
+        let (_root, nodes) = potentials.split_last().expect("a tree should hold its root's potential");
 
         nodes
     }
@@ -535,6 +778,20 @@ impl ArcColumns<'_> {
         (at < self.len()).then_some(ArcSlot(at))
     }
 
+    /// The slot of the arc `link` is, where it is an arc's link, below the arc count; `None` for a root link.
+    fn slot_of(&self, link: Link<'_>) -> Option<ArcSlot> {
+        let at = usize::from(link);
+
+        (at < self.len()).then_some(ArcSlot(at))
+    }
+
+    /// The cost of the arc at `slot`, in units of cost.
+    fn cost(&self, slot: ArcSlot) -> i64 {
+        debug_assert!(slot.0 < self.costs.len(), "an arc slot should be below the arc count");
+        // SAFETY: an `ArcSlot` is below the arc count `m` (`ArcSlot`), the length of this column (`ArcColumns`).
+        unsafe { *self.costs.get_unchecked(slot.0) }
+    }
+
     /// Makes `state` where the arc at `slot` stands.
     fn set_state(&mut self, slot: ArcSlot, state: ArcState) {
         debug_assert!(slot.0 < self.states.len(), "an arc slot should be below the arc count");
@@ -553,11 +810,11 @@ impl ArcColumns<'_> {
         self.set_state(arc.slot, ArcState::Unpriced);
 
         // A link leaves where its room was the step, so the flow sent has put it at one of its bounds; a root link only
-        // at zero, since its room the way it points never blocks (`NET_SUPPLY_LIMIT`).
+        // at zero, since its room the way it points never blocks (`NET_SUPPLY_LIMIT`). A tree arc has width, since only
+        // priced arcs enter, so a leaving arc stands at one of its two bounds.
         let LinkFill { flow, capacity } = links.fill(leaving);
-        debug_assert!(flow == 0 || flow == capacity, "a leaving link should stand at a bound");
         match self.states.get_mut(usize::from(leaving)) {
-            Some(state) => *state = if flow == 0 { ArcState::AtLower } else { ArcState::AtUpper },
+            Some(state) => *state = ArcState::at(flow, capacity),
             None => debug_assert_eq!(flow, 0, "a leaving root link should carry nothing"),
         }
     }
@@ -702,6 +959,164 @@ impl LinkColumns<'_> {
     }
 }
 
+impl HeldArcs<'_, '_> {
+    /// Whether every arc of the problem has, at its dealt slot, the tail and the head the kept arc there had.
+    fn are_of_problem(&self) -> bool {
+        match self.problem.arcs() {
+            CheckedArcs::WithoutLowerBounds(arcs) => self.have_ends_of(arcs),
+            CheckedArcs::WithLowerBounds(arcs) => self.have_ends_of(arcs),
+        }
+    }
+
+    /// Whether each arc of `arcs`, in ascending order, has the ends the kept arc at its dealt slot had; the arcs past
+    /// the problem's arc count are not compared.
+    fn have_ends_of(&self, arcs: impl Iterator<Item = CheckedArc>) -> bool {
+        let slots = DealtSlotsIter::new(self.problem.arc_count(), self.problem.node_count());
+
+        arcs.zip(slots).all(|(arc, slot)| {
+            let at = usize::from(slot);
+            debug_assert!(at < self.ends.len(), "a dealt slot should be below the arc count, the length of the ends");
+            // SAFETY: `DealtSlotsIter` yields only slots below the arc count `m` it was made for (its invariant), the
+            // problem's, and the ends hold `m` entries (`HeldArcs`).
+            let kept = unsafe { *self.ends.get_unchecked(at) };
+
+            kept == Ends::of(arc)
+        })
+    }
+
+    /// What each arc of `arcs`, in ascending order, carries above its lower bound out of the kept tree, arc `a`'s at
+    /// `a`: its width, as `arcs` gives it, where its slot's kept state is `AtUpper`, and nothing otherwise, a tree arc
+    /// included. As many flows as both `arcs` and the problem have arcs.
+    fn carried(&self, arcs: impl Iterator<Item = CheckedArc>) -> impl Iterator<Item = u64> {
+        let slots = DealtSlotsIter::new(self.problem.arc_count(), self.problem.node_count());
+        let states = self.states;
+
+        arcs.zip(slots).map(move |(arc, slot)| {
+            let at = usize::from(slot);
+            debug_assert!(at < states.len(), "a dealt slot should be below the arc count, the length of the states");
+            // SAFETY: `DealtSlotsIter` yields only slots below the arc count `m` it was made for (its invariant), the
+            // problem's, and the states hold `m` entries (`HeldArcs`).
+            let state = unsafe { *states.get_unchecked(at) };
+
+            state.carried(arc.width())
+        })
+    }
+}
+
+impl Reflow<'_, '_> {
+    /// Sends each node's excess toward the root along its link, from the leaves up, each node after its whole subtree:
+    /// afterwards every node conserves its net supply, root links counted; every flow lies within its bounds; every
+    /// arc out of the tree stands at a bound, and every tree arc is unpriced; every tree link can carry more toward the
+    /// root; and every root link carries at most the positive total of the excesses the re-flow began with.
+    fn flow_up(self) -> Self {
+        // Why the result is a basis of the new problem, item by item of `Basis`'s invariant, but for *Duality*, which
+        // `tighten` makes:
+        //
+        // - *Shape* holds: the counts are the kept ones, which are the problem's, and the arcs' pass wrote every arc.
+        // - *Tree*: the prune keeps the tree's invariant (`PruneWalk`); an arc that stays is made unpriced, one that
+        //   leaves is put at its bound, and every arc out of the tree stood out of it before.
+        // - *Flow*: node `v` holds its excess `E(v)` over the arcs out of the tree, plus what its children sent it.
+        //   It sends `g` along its link, or `−g` where the link runs down to it, and keeps the remainder `r` on its
+        //   root link where it hangs from the root: so it conserves. A tree arc carries `g` within `0..=w`, and one
+        //   that leaves stands at a bound, since a remainder other than zero means the clamp met a bound, and an arc
+        //   that leaves with none met the bound beyond which it has no room toward the root. A root link out of the
+        //   tree belongs to a node that stays on its arc, whose root link carried nothing in the kept basis and is not
+        //   written.
+        // - *Strong feasibility*: an arc stays only with room toward the root; a root link that points down carries
+        //   `|r| > 0`; one that points up carries at most the positive total `P` below, below `u64::MAX`.
+        //
+        // The root links carry at most `P`, the positive total of the excesses, at most `NET_SUPPLY_LIMIT`. Let `Φ`
+        // be the sum of the positive parts of the excesses not yet sent and of the remainders placed. A node with
+        // `e ≥ 0` splits `e` into `r ≥ 0` and a transfer `g ≥ 0` that raises its parent's positive part by at most
+        // `g`; one with `e < 0` keeps `r ≤ 0` and lowers its parent's excess. So `Φ` never rises, and the flow up the
+        // root links is at most `P`. Its mirror, the sum `Ψ` of the negative parts, never rises either, by the same
+        // argument with the signs turned, and starts at `P` too, since the excesses add up to zero. So every excess,
+        // transfer and remainder of the pass lies within `±P`: each sum is exact in an `i128`, and each remainder's
+        // magnitude fits a root link's flow. With the root links' totals at most `P` the two root-link arguments of
+        // `NET_SUPPLY_LIMIT` hold for the run that follows as they do for the star's.
+        //
+        // The star is the case of a tree whose every node hangs from the root, every arc at its lower bound: every
+        // excess is then a net supply, and each node takes the root link the star gives it.
+        let Self { tree, mut columns } = self;
+        let mut walk = PruneWalk::new(tree);
+
+        while let Some(step) = walk.step() {
+            columns.send(step);
+        }
+
+        Self { tree: walk.finish(), columns }
+    }
+
+    /// Makes every tree link tight under the problem's costs, from the root down, the root at zero: an arc costs its
+    /// cost, a root link zero where it points up and `root_cost` where it points down.
+    fn tighten(self, root_cost: i64) -> Self {
+        // Every potential is rewritten, so the potentials are the ones the tree implies under the new costs and the
+        // new root cost, within the bounds `cost_bound` argues for any tree.
+        let Self { tree, columns } = self;
+        let mut walk = TightenWalk::new(tree);
+
+        while let Some(step) = walk.step() {
+            let hanging = step.hanging();
+            let cost = match columns.arcs.slot_of(hanging.link) {
+                Some(slot) => columns.arcs.cost(slot),
+                None => root_link_cost(hanging.direction, root_cost),
+            };
+
+            step.tighten(cost);
+        }
+
+        Self { tree: walk.finish(), columns }
+    }
+}
+
+impl ReflowColumns<'_, '_> {
+    /// Decides the node of `step`, whose children have sent it their excesses: where it hangs by an arc, sends its
+    /// excess along the arc as far as the arc carries it, gives the parent what the arc carries, and keeps the arc in
+    /// the tree, unpriced, or puts it out at its bound and hangs the node from the root by its root link, which takes
+    /// the rest; where it hangs from the root, puts its excess on its root link.
+    fn send(&mut self, step: PruneStep<'_>) {
+        let node = NodeId::from(step.node());
+        debug_assert!(usize::from(node) < self.excesses.len(), "a hung node should be below the excesses' n");
+        // SAFETY: a step's node is below its tree's `n` hung nodes (`PruneStep`), the problem's (`ServingStart`,
+        // `Reflow`), and the excesses hold one entry per node (`ReflowColumns`).
+        let excess = unsafe { *self.excesses.get_unchecked(node) };
+
+        let hanging = step.hanging();
+        let direction = hanging.direction;
+        let Some(slot) = self.arcs.slot_of(hanging.link) else {
+            self.hang_from_root(step, root_link(excess));
+            return;
+        };
+
+        let TreeArcFlow { flow, to_parent, standing } = resend(excess, self.links.width(slot), direction);
+        self.links.set_arc_flow(slot, flow);
+        let parent = NodeId::from(step.parent());
+        debug_assert!(usize::from(parent) < self.excesses.len(), "an arc's other end should be below the excesses' n");
+        // SAFETY: a node that hangs by an arc hangs from a node below the problem's `n`, never from the root (`Basis`,
+        // Tree, which the re-flow's tree keeps: `Reflow`); the excesses hold one entry per node (`ReflowColumns`).
+        let parent_excess = unsafe { self.excesses.get_unchecked_mut(parent) };
+        // Every excess and transfer of the pass lies within `±P` (`Reflow::flow_up`): the sum is exact.
+        *parent_excess += to_parent;
+
+        match standing {
+            Standing::InTree => {
+                self.arcs.set_state(slot, ArcState::Unpriced);
+                step.stay();
+            }
+            Standing::Leaves { state, root_link } => {
+                self.arcs.set_state(slot, state);
+                self.hang_from_root(step, root_link);
+            }
+        }
+    }
+
+    /// Hangs the node of `step` from the root by its root link, carrying and pointing as `root_link` says.
+    fn hang_from_root(&mut self, step: PruneStep<'_>, root_link: RootLink) {
+        *self.links.flow_mut(step.root_link()) = root_link.flow;
+        step.hang_from_root(root_link.direction);
+    }
+}
+
 impl<'b> PricedRows<'b> {
     /// The number of rows, one per slot, `m`.
     pub(crate) fn len(&self) -> usize {
@@ -823,15 +1238,31 @@ impl ExactSizeIterator for ViolationsIter<'_> {}
 impl FusedIterator for ViolationsIter<'_> {}
 
 impl ArcState {
-    /// Where an arc of width `width` stands in the star: carrying nothing at its lower bound, or unpriced where it has
-    /// no width.
-    fn placed(width: u64) -> Self {
+    /// Where an arc out of the tree of width `width` stands that carries `flow`, nothing or its whole width: unpriced
+    /// where it has no width, at its lower bound where it carries nothing, and at its capacity where it carries its
+    /// width.
+    fn at(flow: u64, width: u64) -> Self {
+        debug_assert!(flow == 0 || flow == width, "an arc out of the tree should carry nothing or its width");
+
         // An arc of no width carries its lower bound in every flow within the bounds: a constant of the problem,
         // already counted in the net supplies. No basis needs it: every node has its root link, so a spanning tree
         // exists without it, and in a strongly feasible tree it could not stand, since it can carry no flow toward the
         // root. At the end its reduced cost may have either sign: no step can move its flow, so it meets the
         // optimality conditions either way.
-        if width == 0 { Self::Unpriced } else { Self::AtLower }
+        match (flow, width) {
+            (_, 0) => Self::Unpriced,
+            (0, _) => Self::AtLower,
+            _ => Self::AtUpper,
+        }
+    }
+
+    /// What an arc out of the tree that stands here carries of its width `width`, in units of flow: its width where it
+    /// stands at its capacity, nothing otherwise.
+    fn carried(self, width: u64) -> u64 {
+        match self {
+            Self::AtUpper => width,
+            Self::Unpriced | Self::AtLower => 0,
+        }
     }
 
     /// The violation of an arc that stands here at the reduced cost `reduced_cost`: the pricing sign times it.
@@ -875,6 +1306,14 @@ impl Bound {
     }
 }
 
+impl Ends {
+    /// The tail and the head of `arc`.
+    fn of(arc: CheckedArc) -> Self {
+        // A checked arc's ends are below `n`, and `n + 1` is at most `u32::MAX`: neither narrowing can fail.
+        Self { tail: narrow(usize::from(arc.tail())), head: narrow(usize::from(arc.head())) }
+    }
+}
+
 impl EnteringArc {
     /// What the arc carries once `step`, at most its width, is sent along the cycle: `step` where it left its lower
     /// bound, its width less `step` where it left its capacity.
@@ -888,6 +1327,9 @@ impl EnteringArc {
 
 /// The reduced cost of an arc of cost `cost` whose tail has the potential `tail_potential` and whose head
 /// `head_potential`: `cost + tail_potential − head_potential`, in units of cost. The one place it is written.
+// Always inlined: it is formed once for every row the pricing reads, in the loop a solve spends most of its time in,
+// and it is two operations, so a call that was not inlined would cost more than the work it holds.
+#[inline(always)]
 fn reduced_cost(cost: i64, tail_potential: i64, head_potential: i64) -> i64 {
     // The partial sum and the result are below `2^63` in magnitude for the costs and potentials of a basis
     // (`cost_bound`).
@@ -927,6 +1369,50 @@ fn room(capacity: u64, flow: u64, direction: Direction, flow_runs: Direction) ->
 fn sent(flow: u64, step: u64, direction: Direction, flow_runs: Direction) -> u64 {
     // The step is at most the link's room (`least_room`), so neither passes the link's bounds.
     if direction == flow_runs { flow + step } else { flow - step }
+}
+
+/// How a tree arc of width `width`, running `direction` seen from its node, stands once the node's excess `excess` is
+/// sent along it toward the root: it carries as much of the excess as it can, `g`, the excess where the arc runs up
+/// from the node and its negation where it runs down to it, clamped to `0..=width`; the parent gains `g` or `−g`. The
+/// arc stays where it carries the whole excess and can carry more toward the root, less than its width running up and
+/// more than nothing running down. Otherwise it leaves at the bound `g` stands at, and the node's root link takes the
+/// rest of the excess, as [`root_link`] gives it.
+///
+/// # Panics
+/// Panics if the rest of the excess passes `u64::MAX` in magnitude, which no excess of a start within the limit
+/// leaves (`Reflow::flow_up`).
+fn resend(excess: i128, width: u64, direction: Direction) -> TreeArcFlow {
+    // Within `±P` the negation is exact; past it the strict form states the bound.
+    let (flow, to_parent, rest, room) = match direction {
+        Direction::Up => {
+            let flow = within_width(excess, width);
+            (flow, i128::from(flow), excess - i128::from(flow), flow < width)
+        }
+        Direction::Down => {
+            let flow = within_width(excess.strict_neg(), width);
+            (flow, -i128::from(flow), excess + i128::from(flow), flow > 0)
+        }
+    };
+
+    // A rest other than zero means the clamp met a bound; no room toward the root means the flow stands at the bound
+    // beyond which the arc has none. Either way the arc carries nothing or its width, and stands where `at` puts it.
+    let standing = if rest == 0 && room {
+        Standing::InTree
+    } else {
+        Standing::Leaves { state: ArcState::at(flow, width), root_link: root_link(rest) }
+    };
+
+    TreeArcFlow { flow, to_parent, standing }
+}
+
+/// What an arc of width `width` carries of `demand`, in units of flow: nothing where it is zero or less, the demand
+/// up to the width otherwise.
+fn within_width(demand: i128, width: u64) -> u64 {
+    match u64::try_from(demand) {
+        Ok(demand) => demand.min(width),
+        Err(_) if demand < 0 => 0,
+        Err(_) => width,
+    }
 }
 
 /// Panics for a `slot` not below `arc_count`, as [`Basis::violates`] documents.
@@ -989,8 +1475,8 @@ pub(crate) mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use kahlnws_testing::{
-        MincostNetwork, OptimalFlow, TinyBounds, TinyCosts, brute_force_optimum, check_against_brute_force,
-        check_certificate, tiny_networks,
+        MincostNetwork, OptimalFlow, TinyBounds, TinyCosts, TinyMincostNetworks, TinySupplies, brute_force_optimum,
+        check_against_brute_force, check_certificate, tiny_networks,
     };
     use num_bigint::BigInt;
     use proptest::prelude::*;
@@ -1002,6 +1488,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::problem::Problem;
     use crate::problem::tests::problem_of;
+    use crate::ranges::NET_SUPPLY_LIMIT;
     use crate::slot_order::tests::arcs_of_slots;
     use crate::starting_basis::NetSupplies;
     use crate::tree::{PlainHanging, check_threading, cycle_walk, hangings_of};
@@ -1122,18 +1609,24 @@ pub(crate) mod tests {
             Self { arc_of_slot, net_supplies, root_cost: paths * largest + 1 }
         }
 
-        /// The tail, head and cost of `link` in `network`: an arc's at its slot, else a root link's, which runs up at
-        /// cost zero from a node of net supply zero or more and down at the root cost to a demand.
-        fn link(&self, network: &MincostNetwork, link: usize) -> (usize, usize, i128) {
+        /// The tail, head and cost of every link of `network` in a basis whose nodes hang as `hangings` says: an
+        /// arc's at its slot; a root link's as its node hangs by it, up at cost zero or down at the root cost; and a
+        /// root link out of the tree up, which matters to nothing, since it carries nothing.
+        fn links(&self, network: &MincostNetwork, hangings: &[PlainHanging]) -> Vec<(usize, usize, i128)> {
             let (node_count, arc_count) = (network.node_count(), network.arc_count());
-            if link < arc_count {
-                let arc = self.arc_of_slot[link];
-                (network.tails[arc], network.heads[arc], i128::from(network.costs[arc]))
-            } else if self.net_supplies[link - arc_count] >= 0 {
-                (link - arc_count, node_count, 0)
-            } else {
-                (node_count, link - arc_count, self.root_cost)
-            }
+            let arcs = self
+                .arc_of_slot
+                .iter()
+                .map(|&arc| (network.tails[arc], network.heads[arc], i128::from(network.costs[arc])));
+            let root_links = (0..node_count).map(|node| {
+                let in_tree = hangings.get(node).filter(|hanging| hanging.link == arc_count + node);
+                match in_tree.map(|hanging| hanging.direction) {
+                    Some(Direction::Down) => (node_count, node, self.root_cost),
+                    Some(Direction::Up) | None => (node, node_count, 0),
+                }
+            });
+
+            arcs.chain(root_links).collect()
         }
 
         /// What `link` of `network` can carry: an arc's width, `u64::MAX` for a root link.
@@ -1151,9 +1644,10 @@ pub(crate) mod tests {
     pub(crate) fn check(basis: &Basis<'_, '_>, network: &MincostNetwork) -> Result<(), String> {
         let model = Extended::of(network);
         check_shape(basis, network, &model)?;
-        let in_tree = check_tree(basis, network, &model)?;
-        check_duality(basis, network, &model)?;
-        check_flow(basis, network, &model, &in_tree)?;
+        let links = model.links(network, &hangings_of(&basis.tree));
+        let in_tree = check_tree(basis, network, &links)?;
+        check_duality(basis, network, &links)?;
+        check_flow(basis, network, &model, &links, &in_tree)?;
         check_strong_feasibility(basis)?;
 
         check_rows(basis, network, &model)
@@ -1187,16 +1681,20 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Tree: the parents lead to the root, each node hangs by a link that joins it to its parent the way it says, a
-    /// root link pointing as in the star, no link twice; the thread and the columns derived with it are the ones the
-    /// parents imply; every tree arc is unpriced. Answers which links are in the tree.
-    fn check_tree(basis: &Basis<'_, '_>, network: &MincostNetwork, model: &Extended) -> Result<Vec<bool>, String> {
+    /// Tree: the parents lead to the root, each node hangs by a link that joins it to its parent the way it says, its
+    /// own root link where it hangs from the root, no link twice; the thread and the columns derived with it are the
+    /// ones the parents imply; every tree arc is unpriced. Answers which links are in the tree.
+    fn check_tree(
+        basis: &Basis<'_, '_>,
+        network: &MincostNetwork,
+        links: &[(usize, usize, i128)],
+    ) -> Result<Vec<bool>, String> {
         // The parents leading to the root are checked with the threading, first.
         check_threading(&basis.tree)?;
         let mut in_tree = vec![false; basis.links.flows.len()];
 
         for (node, hanging) in hangings_of(&basis.tree).into_iter().enumerate() {
-            let (tail, head, _) = model.link(network, hanging.link);
+            let (tail, head, _) = links[hanging.link];
             let joined = match hanging.direction {
                 Direction::Up => (node, hanging.parent),
                 Direction::Down => (hanging.parent, node),
@@ -1214,14 +1712,18 @@ pub(crate) mod tests {
     }
 
     /// Duality: the root at zero and every tree link tight.
-    fn check_duality(basis: &Basis<'_, '_>, network: &MincostNetwork, model: &Extended) -> Result<(), String> {
+    fn check_duality(
+        basis: &Basis<'_, '_>,
+        network: &MincostNetwork,
+        links: &[(usize, usize, i128)],
+    ) -> Result<(), String> {
         let potentials: Vec<i128> = basis.tree.potentials().iter().map(|&potential| i128::from(potential)).collect();
         if potentials[network.node_count()] != 0 {
             return Err(format!("the root's potential is {}", potentials[network.node_count()]));
         }
 
         for hanging in hangings_of(&basis.tree) {
-            let (tail, head, cost) = model.link(network, hanging.link);
+            let (tail, head, cost) = links[hanging.link];
             let reduced = cost + potentials[tail] - potentials[head];
             if reduced != 0 {
                 return Err(format!("tree link {} has reduced cost {reduced}", hanging.link));
@@ -1237,6 +1739,7 @@ pub(crate) mod tests {
         basis: &Basis<'_, '_>,
         network: &MincostNetwork,
         model: &Extended,
+        links: &[(usize, usize, i128)],
         in_tree: &[bool],
     ) -> Result<(), String> {
         let (node_count, arc_count) = (network.node_count(), network.arc_count());
@@ -1245,7 +1748,7 @@ pub(crate) mod tests {
         excess.push(0);
 
         for (link, &flow) in flows.iter().enumerate() {
-            let (tail, head, _) = model.link(network, link);
+            let (tail, head, _) = links[link];
             excess[tail] -= i128::from(flow);
             excess[head] += i128::from(flow);
             let capacity = model.capacity(network, link);
@@ -1385,9 +1888,9 @@ pub(crate) mod tests {
     /// The cost of the flow of `basis`, loaded from `network`, above the lower bounds, root links counted at their
     /// costs, in big integers.
     fn extended_cost(basis: &Basis<'_, '_>, network: &MincostNetwork) -> BigInt {
-        let model = Extended::of(network);
+        let links = Extended::of(network).links(network, &hangings_of(&basis.tree));
 
-        basis.links.flows.iter().enumerate().map(|(link, &flow)| BigInt::from(flow) * model.link(network, link).2).sum()
+        basis.links.flows.iter().zip(links).map(|(&flow, (.., cost))| BigInt::from(flow) * cost).sum()
     }
 
     /// How a checked run ended. Plain data.
@@ -1405,31 +1908,29 @@ pub(crate) mod tests {
         (0..chosen).fold(1, |product, at| product * (total - at) / (at + 1))
     }
 
-    /// The most pivots a run on `network` makes, whatever arcs enter, if it never returns to a basis it left.
-    fn pivot_bound(network: &MincostNetwork) -> u128 {
+    /// The most pivots a run on `basis`, loaded from `network`, makes, whatever arcs enter, if it never returns to a
+    /// basis it left.
+    fn pivot_bound(basis: &Basis<'_, '_>, network: &MincostNetwork) -> u128 {
         // A pivot that sends flow lowers the cost of the flow, root links counted, by one at least (`Basis::pivot`).
-        // That cost starts at the star's: the demand links carry the positive net supplies' total `T` at the root cost
-        // `M`. It never falls below the least the arcs can cost, `−Σ |cost|·width`, the root links costing nothing
-        // less than zero. So at most `T·M + Σ |cost|·width` pivots send flow. A stretch of pivots that send nothing
-        // stays at one flow and visits each tree once at most, and a tree is a choice of `n` of the `m + n` links:
-        // before the first pivot that sends flow, between two, and after the last, at most `choose(m + n, n)` pivots.
-        let model = Extended::of(network);
+        // That cost starts at the starting basis's, and never falls below the least the arcs can cost,
+        // `−Σ |cost|·width`, the root links costing nothing less than zero. So at most the difference pivots send
+        // flow. A stretch of pivots that send nothing stays at one flow and visits each tree once at most, and a tree
+        // is a choice of `n` of the `m + n` links: before the first pivot that sends flow, between two, and after the
+        // last, at most `choose(m + n, n)` pivots.
         let wide = |value: usize| u128::try_from(value).expect("a test's count should fit a u128");
-        let total = model.net_supplies.iter().filter_map(|&net_supply| u128::try_from(net_supply).ok()).sum::<u128>();
-        let root_cost = u128::try_from(model.root_cost).expect("a root cost is positive");
         let arcs = (0..network.arc_count()).map(|arc| {
-            u128::from(network.costs[arc].unsigned_abs())
-                * u128::from(network.capacities[arc] - network.lower_bounds[arc])
+            BigInt::from(network.costs[arc].unsigned_abs()) * (network.capacities[arc] - network.lower_bounds[arc])
         });
-        let sending = total * root_cost + arcs.sum::<u128>();
+        let sending = extended_cost(basis, network) + arcs.sum::<BigInt>();
+        let sending = u128::try_from(sending).expect("a basis costs at least the least the arcs can cost");
         let trees = binomial(wide(network.arc_count() + network.node_count()), wide(network.node_count()));
 
         (sending + 1) * (trees + 1)
     }
 
-    /// A run from the star of a network, its whole invariant checked after the load and after every pivot, which fails
-    /// once it makes more pivots than [`pivot_bound`] allows: the one place a test pivots a basis to its end, under
-    /// whatever entering rule the test drives it with.
+    /// A run from a start of a network, the star or a kept basis re-flowed, its whole invariant checked after the start
+    /// and after every pivot, which fails once it makes more pivots than [`pivot_bound`] allows: the one place a test
+    /// pivots a basis to its end, under whatever entering rule the test drives it with.
     #[derive(Debug)]
     pub(crate) struct CheckedRun<'r, 'n> {
         /// The network the basis was loaded from, which the checks recompute the invariant from.
@@ -1438,8 +1939,37 @@ pub(crate) mod tests {
         basis: Basis<'r, 'n>,
         /// The pivots made so far.
         pivots: usize,
-        /// The most pivots the run may make: [`pivot_bound`] of the network.
+        /// The most pivots the run may make: [`pivot_bound`] of the starting basis.
         bound: u128,
+    }
+
+    /// Which start a resume gave a run.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Begun {
+        /// The kept basis, re-flowed.
+        Kept,
+        /// The star.
+        Star,
+    }
+
+    /// The basis `room` lends for `problem` from what it holds: the kept basis re-flowed, or the star, with which it
+    /// was.
+    ///
+    /// # Panics
+    /// Panics if the problem is refused.
+    fn resumed_in<'r, 'p>(
+        room: &'r mut BasisRoom,
+        excesses: &mut Excesses,
+        problem: &Problem<'p>,
+    ) -> (Basis<'r, 'p>, Begun) {
+        let problem = problem.checked().expect("the test's problem should be admitted");
+        let mut net_supplies = NetSupplies::new();
+        let start = net_supplies.gather(problem).expect("the test's net supplies should be in range");
+
+        match room.resume(&start, excesses) {
+            Resumed::Kept(basis) => (basis, Begun::Kept),
+            Resumed::Star(basis) => (basis, Begun::Star),
+        }
     }
 
     impl<'r, 'n> CheckedRun<'r, 'n> {
@@ -1455,8 +1985,37 @@ pub(crate) mod tests {
         ) -> Result<Self, String> {
             let basis = loaded(room, problem);
             check(&basis, network).map_err(|breach| format!("after the load: {breach}"))?;
+            let bound = pivot_bound(&basis, network);
 
-            Ok(Self { network, basis, pivots: 0, bound: pivot_bound(network) })
+            Ok(Self { network, basis, pivots: 0, bound })
+        }
+
+        /// The run of `problem`, which is `network` with its lower bounds given or, where they are all zero, not, from
+        /// what `room` holds once the run of `before`, from its star, has ended in it under the first eligible rule:
+        /// the kept basis re-flowed, or the star; and which.
+        ///
+        /// # Errors
+        /// Returns the breach of the invariant in the run of `before`, or after the resume.
+        ///
+        /// # Panics
+        /// Panics if either problem is refused.
+        pub(crate) fn resumed(
+            room: &'r mut BasisRoom,
+            excesses: &mut Excesses,
+            before: &MincostNetwork,
+            network: &'n MincostNetwork,
+            problem: &Problem<'n>,
+        ) -> Result<(Self, Begun), String> {
+            let mut rule = EnteringRule::FirstEligible;
+            CheckedRun::start(&mut *room, before, &problem_of(before))?
+                .run_to_end(|rows| rule.next(rows))
+                .map_err(|breach| format!("before the resume: {breach}"))?;
+
+            let (basis, begun) = resumed_in(room, excesses, problem);
+            check(&basis, network).map_err(|breach| format!("after the resume to {begun:?}: {breach}"))?;
+            let bound = pivot_bound(&basis, network);
+
+            Ok((Self { network, basis, pivots: 0, bound }, begun))
         }
 
         /// Pivots on the arc at `slot` and checks the invariant.
@@ -1520,7 +2079,7 @@ pub(crate) mod tests {
 
             let routed = self.basis.routes_every_supply();
             let (flows, total_cost) = written(&self.basis);
-            let potentials = self.basis.into_potentials().to_vec();
+            let potentials = self.basis.keep().to_vec();
 
             Ok(RunEnd { pivots: self.pivots, answer: routed.then_some(OptimalFlow { flows, potentials, total_cost }) })
         }
@@ -1599,7 +2158,7 @@ pub(crate) mod tests {
 
         assert!(basis.routes_every_supply());
         assert_eq!(written(&basis), (vec![2, 2, 2], 14));
-        assert_eq!(basis.into_potentials(), [0, 1, 5]);
+        assert_eq!(basis.keep(), [0, 1, 5]);
         assert_eq!(check_certificate(&network, &[2, 2, 2], &[0, 1, 5], 14), Ok(()));
     }
 
@@ -1844,7 +2403,7 @@ pub(crate) mod tests {
         assert_eq!(check(&basis, &network), Ok(()));
         assert!(basis.rows().len() == 0 && basis.routes_every_supply());
         assert_eq!(written(&basis), (vec![], 0));
-        assert_eq!(basis.into_potentials(), []);
+        assert_eq!(basis.keep(), [0_i64; 0]);
     }
 
     #[test]
@@ -1963,11 +2522,34 @@ pub(crate) mod tests {
 
     #[test]
     fn test_the_states_and_bounds_by_hand() {
-        assert_eq!((ArcState::placed(0), ArcState::placed(1), ArcState::placed(u64::MAX)), (IN_TREE, LOWER, LOWER));
+        assert_eq!((ArcState::at(0, 0), ArcState::at(0, 1), ArcState::at(0, u64::MAX)), (IN_TREE, LOWER, LOWER));
         assert_eq!([LOWER, IN_TREE, UPPER].map(|state| state.violation(-4)), [-4, 0, 4]);
         assert_eq!([LOWER, IN_TREE, UPPER].map(ArcState::bound), [Some(Bound::Lower), None, Some(Bound::Upper)]);
         assert_eq!((Bound::Lower.other(), Bound::Upper.other()), (Bound::Upper, Bound::Lower));
         assert_eq!((Bound::Lower.state(), Bound::Upper.state()), (LOWER, UPPER));
+    }
+
+    #[test]
+    fn test_where_an_arc_stands_for_what_it_carries_by_hand() {
+        // No width: unpriced, whatever it carries, which is nothing.
+        assert_eq!(ArcState::at(0, 0), IN_TREE);
+        // Nothing of a positive width: at its lower bound; its whole width: at its capacity.
+        assert_eq!((ArcState::at(0, 3), ArcState::at(3, 3)), (LOWER, UPPER));
+        assert_eq!((ArcState::at(0, u64::MAX), ArcState::at(u64::MAX, u64::MAX)), (LOWER, UPPER));
+    }
+
+    #[test]
+    fn test_what_an_arc_carries_where_it_stands_by_hand() {
+        assert_eq!([LOWER, IN_TREE, UPPER].map(|state| state.carried(5)), [0, 0, 5]);
+        assert_eq!([LOWER, IN_TREE, UPPER].map(|state| state.carried(0)), [0, 0, 0]);
+        assert_eq!(UPPER.carried(u64::MAX), u64::MAX);
+
+        // What an arc carries puts it back where it stood, but for an arc whose width has gone, which is unpriced.
+        for state in [LOWER, UPPER] {
+            assert_eq!(ArcState::at(state.carried(4), 4), state);
+            assert_eq!(ArcState::at(state.carried(0), 0), IN_TREE);
+        }
+        assert_eq!(ArcState::at(IN_TREE.carried(4), 4), LOWER, "a tree arc carries nothing out of the tree");
     }
 
     /// The slot `slot` of `basis`, made by the checked maker.
@@ -2245,6 +2827,7 @@ pub(crate) mod tests {
         room.place_links(&start);
         assert_eq!(room.capacities, [0, 0, 0, 0, 0, u64::MAX, u64::MAX]);
         assert_eq!(room.flows, [0, 0, 0, 0, 0, 2, 2]);
+        assert_eq!(room.states, [LOWER; 5], "every arc of the star at its lower bound");
 
         // By slot: arcs 0, 2, 4, 1, 3; arcs 2 and 3 have no width and are not priced.
         room.place_arcs(start.problem());
@@ -2252,7 +2835,7 @@ pub(crate) mod tests {
         assert_eq!(room.costs, [1, 5, -1, -2, 4]);
         assert_eq!(room.states, [LOWER, IN_TREE, LOWER, LOWER, IN_TREE]);
         assert_eq!(room.capacities, [2, 0, 1, 2, 0, u64::MAX, u64::MAX]);
-        assert_eq!(room.flows, [0, 0, 0, 0, 0, 2, 2], "the arcs leave the flows as they are");
+        assert_eq!(room.flows, [0, 0, 0, 0, 0, 2, 2], "the arcs carry nothing, the root links what they did");
     }
 
     #[test]
@@ -2262,11 +2845,36 @@ pub(crate) mod tests {
         let checked = problem.checked().expect("the five arcs should be admitted");
         let mut room = BasisRoom::new();
         room.capacities = vec![9; 7];
+        room.flows = vec![9; 7];
+        room.states = vec![LOWER; 5];
         let CheckedArcs::WithoutLowerBounds(arcs) = checked.arcs() else { panic!("no lower bounds are given") };
 
         room.scatter(arcs, 5, 2);
         assert_eq!(room.capacities, [2, 0, 1, 3, 2, 9, 9], "the widths of the arcs' slots, the rest as it was");
         assert_eq!(room.states, [LOWER, IN_TREE, LOWER, LOWER, LOWER]);
+        assert_eq!(room.flows, [0, 0, 0, 0, 0, 9, 9], "the arcs carry nothing, the rest as it was");
+    }
+
+    #[test]
+    fn test_scatter_restates_each_arc_from_the_state_its_slot_held_by_hand() {
+        // By slot: arcs 0, 2, 4, 1, 3 of the widths 2, 0, 1, 3, 2 without lower bounds. Slots 0 and 2 held arcs at
+        // their capacities, which carry their new widths; slot 1 held one at its capacity whose arc has no width now;
+        // slot 3 a tree arc and slot 4 one at its lower bound, which carry nothing.
+        let network = five_arcs();
+        let problem = Problem { lower_bounds: None, ..problem_of(&network) };
+        let checked = problem.checked().expect("the five arcs should be admitted");
+        let mut room = BasisRoom::new();
+        room.capacities = vec![9; 7];
+        room.flows = vec![9; 7];
+        room.states = vec![UPPER, UPPER, UPPER, IN_TREE, LOWER];
+        let CheckedArcs::WithoutLowerBounds(arcs) = checked.arcs() else { panic!("no lower bounds are given") };
+
+        room.scatter(arcs, 5, 2);
+        assert_eq!(room.capacities, [2, 0, 1, 3, 2, 9, 9]);
+        assert_eq!(room.flows, [2, 0, 1, 0, 0, 9, 9]);
+        assert_eq!(room.states, [UPPER, IN_TREE, UPPER, LOWER, LOWER]);
+        assert_eq!(room.ends, [ends(0, 1), ends(0, 0), ends(1, 1), ends(1, 0), ends(0, 1)]);
+        assert_eq!(room.costs, [1, 5, -1, -2, 4]);
     }
 
     #[test]
@@ -2425,11 +3033,21 @@ pub(crate) mod tests {
 
     #[test]
     fn test_the_pivot_bound_by_hand() {
-        // The depot: `T = 4`, `M = 11`, the arcs `5·3 + 1·4 + 1·2 = 21`, so 65 pivots that send flow; six links, three
-        // nodes, `choose(6, 3) = 20` trees: `66 · 21`.
+        // The depot's star: node 2's root link, which points down, carries `T = 4` at `M = 11`, and the arcs cost at
+        // least `−(5·3 + 1·4 + 1·2) = −21`, so 65 pivots that send flow; six links, three nodes, `choose(6, 3) = 20`
+        // trees: `66 · 21`.
         assert_eq!(binomial(6, 3), 20);
         assert_eq!((binomial(4, 0), binomial(4, 4), binomial(0, 0)), (1, 1, 1));
-        assert_eq!(pivot_bound(&depot()), 66 * 21);
+        let network = depot();
+        let mut room = BasisRoom::new();
+        let mut basis = loaded(&mut room, &problem_of(&network));
+        assert_eq!(pivot_bound(&basis, &network), 66 * 21);
+
+        // At the depot's optimum the flow costs 14: `14 + 21 = 35` pivots that send flow at most.
+        for slot in [0_usize, 2, 1, 0] {
+            basis.pivot(Slot::from(slot));
+        }
+        assert_eq!(pivot_bound(&basis, &network), 36 * 21);
     }
 
     #[test]
@@ -2640,6 +3258,406 @@ pub(crate) mod tests {
         assert!(zero_widths > 0 && loops > 0, "{zero_widths} arcs of no width and {loops} loops");
     }
 
+    /// A tree arc that stays, carrying `flow` and giving its parent `to_parent`, for a test to write out.
+    fn stays(flow: u64, to_parent: i128) -> TreeArcFlow {
+        TreeArcFlow { flow, to_parent, standing: Standing::InTree }
+    }
+
+    /// A tree arc that leaves at `state`, carrying `flow` and giving its parent `to_parent`, its node hanging from the
+    /// root by a root link carrying `rest` the way `direction` says, for a test to write out.
+    fn leaves(flow: u64, to_parent: i128, state: ArcState, rest: u64, direction: Direction) -> TreeArcFlow {
+        TreeArcFlow {
+            flow,
+            to_parent,
+            standing: Standing::Leaves { state, root_link: RootLink { flow: rest, direction } },
+        }
+    }
+
+    #[test]
+    fn test_resend_up_an_arc_on_every_case_by_hand() {
+        // The node is the arc's tail and sends its excess up the arc of width 5, as much as fits.
+        assert_eq!(resend(-3, 5, UP), leaves(0, 0, LOWER, 3, DOWN), "a demand: nothing up, the root link brings it");
+        assert_eq!(resend(0, 5, UP), stays(0, 0), "nothing to send, room to send more");
+        assert_eq!(resend(3, 5, UP), stays(3, 3), "within the width, room left");
+        assert_eq!(resend(5, 5, UP), leaves(5, 5, UPPER, 0, UP), "exactly the width: no room left toward the root");
+        assert_eq!(resend(8, 5, UP), leaves(5, 5, UPPER, 3, UP), "past the width: the rest up the root link");
+    }
+
+    #[test]
+    fn test_resend_down_an_arc_on_every_case_by_hand() {
+        // The node is the arc's head: the arc brings it the negation of its excess from the parent, as much as fits.
+        assert_eq!(resend(-3, 5, DOWN), stays(3, -3), "within the width, room to bring less");
+        assert_eq!(resend(0, 5, DOWN), leaves(0, 0, LOWER, 0, UP), "nothing brought: no room toward the root");
+        assert_eq!(resend(3, 5, DOWN), leaves(0, 0, LOWER, 3, UP), "a supply: nothing down, the root link takes it");
+        assert_eq!(resend(-5, 5, DOWN), stays(5, -5), "exactly the width: it can still bring less");
+        assert_eq!(resend(-8, 5, DOWN), leaves(5, -5, UPPER, 3, DOWN), "past the width: the rest down the root link");
+    }
+
+    #[test]
+    fn test_resend_along_an_arc_of_no_width_always_leaves_by_hand() {
+        assert_eq!(resend(2, 0, UP), leaves(0, 0, IN_TREE, 2, UP));
+        assert_eq!(resend(0, 0, UP), leaves(0, 0, IN_TREE, 0, UP));
+        assert_eq!(resend(-2, 0, DOWN), leaves(0, 0, IN_TREE, 2, DOWN));
+        assert_eq!(resend(0, 0, DOWN), leaves(0, 0, IN_TREE, 0, UP));
+    }
+
+    #[test]
+    fn test_resend_at_the_limit_and_the_widest_width_by_hand() {
+        let limit = i128::from(NET_SUPPLY_LIMIT);
+
+        assert_eq!(resend(limit, u64::MAX, UP), stays(NET_SUPPLY_LIMIT, limit));
+        assert_eq!(resend(-limit, u64::MAX, DOWN), stays(NET_SUPPLY_LIMIT, -limit));
+        assert_eq!(resend(-limit, 1, UP), leaves(0, 0, LOWER, NET_SUPPLY_LIMIT, DOWN));
+        assert_eq!(resend(limit, 1, UP), leaves(1, 1, UPPER, NET_SUPPLY_LIMIT - 1, UP));
+    }
+
+    #[test]
+    fn test_within_width_clamps_by_hand() {
+        assert_eq!([-7, 0, 3, 5, 9].map(|demand| within_width(demand, 5)), [0, 0, 3, 5, 5]);
+        assert_eq!(within_width(i128::from(u64::MAX) + 1, u64::MAX), u64::MAX);
+        assert_eq!(within_width(i128::MIN, 4), 0);
+        assert_eq!(within_width(i128::MAX, 4), 4);
+    }
+
+    /// The depot solved to its optimum in `room` by the pivots of its hand-worked run, the basis kept: arcs 0 and 1 in
+    /// the tree, carrying 2 each, node 0 up from the root at zero flow, node 1 below it by arc 1 and node 2 by arc 0,
+    /// both running down to them; arc 2 out of it at its capacity 2.
+    fn kept_depot(room: &mut BasisRoom) {
+        let network = depot();
+        let mut basis = checked_star(room, &network);
+        for slot in [0_usize, 2, 1, 0] {
+            basis.pivot(Slot::from(slot));
+        }
+
+        let _ = basis.keep();
+    }
+
+    /// The basis `room` lends for `network` from what it holds, its whole invariant checked, read out, with which
+    /// start it is.
+    ///
+    /// # Panics
+    /// Panics if the invariant fails after the resume.
+    fn reflowed(room: &mut BasisRoom, network: &MincostNetwork) -> (Snapshot, Begun) {
+        let mut excesses = Excesses::new();
+        let (basis, begun) = resumed_in(room, &mut excesses, &problem_of(network));
+        if let Err(breach) = check(&basis, network) {
+            panic!("the invariant should hold after the resume to {begun:?}: {breach}");
+        }
+
+        (snapshot(&basis), begun)
+    }
+
+    /// The depot's optimum as the re-flow keeps it where nothing moves: node 0 up from the root, nodes 1 and 2 below
+    /// it by arcs 1 and 0, running down to them; arc 2 at its capacity.
+    fn depot_tree() -> Vec<PlainHanging> {
+        vec![hung(3, 3, UP), hung(0, 1, DOWN), hung(0, 0, DOWN)]
+    }
+
+    #[test]
+    fn test_the_depot_re_flowed_for_less_supply_by_hand() {
+        // Node 0 sends 3 units. Arc 2 carries its width 2 out of the tree: the excesses are `3`, `0 − 2` and
+        // `−3 + 2`. Node 1 takes 2 down arc 1 and node 2 one down arc 0, both within their widths and above nothing;
+        // node 0 is left with `3 − 2 − 1 = 0` on its root link. The potentials are as before: no cost moved. Arc 2
+        // at its capacity has the reduced cost `1 + 1 − 5 = −3`, no violation: the optimum, without a pivot.
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        let network = MincostNetwork { supplies: vec![3, 0, -3], ..depot() };
+
+        let expected = Snapshot {
+            flows: vec![1, 2, 2, 0, 0, 0],
+            potentials: vec![0, 1, 5, 0],
+            states: vec![IN_TREE, IN_TREE, UPPER],
+            hangings: depot_tree(),
+            violations: vec![0, 0, 3],
+        };
+        assert_eq!(reflowed(&mut room, &network), (expected, Begun::Kept));
+    }
+
+    #[test]
+    fn test_the_depot_re_flowed_for_a_narrower_arc_out_of_the_tree_by_hand() {
+        // Arc 2 of capacity 1 carries its new width at its capacity: the excesses are `4`, `−1` and `−4 + 1`. Node 1
+        // takes 1 down arc 1, node 2 takes 3 down arc 0, its whole width, and stays, since it could bring less;
+        // node 0 is left with nothing on its root link.
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        let mut network = depot();
+        network.capacities[2] = 1;
+
+        let expected = Snapshot {
+            flows: vec![3, 1, 1, 0, 0, 0],
+            potentials: vec![0, 1, 5, 0],
+            states: vec![IN_TREE, IN_TREE, UPPER],
+            hangings: depot_tree(),
+            violations: vec![0, 0, 3],
+        };
+        assert_eq!(reflowed(&mut room, &network), (expected, Begun::Kept));
+    }
+
+    #[test]
+    fn test_the_depot_re_flowed_for_a_dearer_tree_arc_by_hand() {
+        // Arc 1 costs 6: the flows and the tree are kept, the root cost is `2 · 6 + 1 = 13`, and node 1 sits at 6 below
+        // arc 1 running down to it. Arc 2 at its capacity now has the reduced cost `1 + 6 − 5 = 2`: it violates.
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        let mut network = depot();
+        network.costs[1] = 6;
+
+        let expected = Snapshot {
+            flows: vec![2, 2, 2, 0, 0, 0],
+            potentials: vec![0, 6, 5, 0],
+            states: vec![IN_TREE, IN_TREE, UPPER],
+            hangings: depot_tree(),
+            violations: vec![0, 0, -2],
+        };
+        assert_eq!(reflowed(&mut room, &network), (expected, Begun::Kept));
+    }
+
+    #[test]
+    fn test_the_depot_re_flowed_for_a_tree_arc_of_no_width_by_hand() {
+        // Arc 1 of capacity 0: the excesses are `4`, `−2` and `−2`. Node 1 can take nothing down arc 1, which leaves
+        // unpriced, and hangs from the root by its root link, link 4, which brings it 2 down, at the potential
+        // `M = 11`; node 2 takes 2 down arc 0; node 0 sends 2 up its root link. Arc 2 at its capacity then has the
+        // reduced cost `1 + 11 − 5 = 7`: it violates.
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        let mut network = depot();
+        network.capacities[1] = 0;
+
+        let mut excesses = Excesses::new();
+        let (mut basis, begun) = resumed_in(&mut room, &mut excesses, &problem_of(&network));
+        assert_eq!(check(&basis, &network), Ok(()));
+        let expected = Snapshot {
+            flows: vec![2, 0, 2, 2, 2, 0],
+            potentials: vec![0, 11, 5, 0],
+            states: vec![IN_TREE, IN_TREE, UPPER],
+            hangings: vec![hung(3, 3, UP), hung(3, 4, DOWN), hung(0, 0, DOWN)],
+            violations: vec![0, 0, -7],
+        };
+        assert_eq!((snapshot(&basis), begun), (expected, Begun::Kept));
+
+        // Arc 2 from its capacity, sending from node 2: arc 0, along the cycle's flow down to node 2, has room 1, the
+        // least, below arc 2's width 2. One unit moves, arc 0 leaves at its capacity, and node 2 hangs from node 1 by
+        // arc 2, at `11 + 1`. Two root links still carry flow: arc 0 alone cannot carry the 4 units.
+        let ended = Snapshot {
+            flows: vec![3, 0, 1, 1, 1, 0],
+            potentials: vec![0, 11, 12, 0],
+            states: vec![UPPER, IN_TREE, IN_TREE],
+            hangings: vec![hung(3, 3, UP), hung(3, 4, DOWN), hung(1, 2, DOWN)],
+            violations: vec![7, 0, 0],
+        };
+        assert_eq!(pivoted(&mut basis, &network, 2), ended);
+        assert!(!basis.routes_every_supply());
+        assert_eq!(brute_force_optimum(&network), None);
+    }
+
+    /// Checks that `room` lends the star of `network` for it, as a fresh room loads it, and holds no basis meanwhile.
+    ///
+    /// # Panics
+    /// Panics if it does not.
+    fn assert_resumes_to_the_star(room: &mut BasisRoom, network: &MincostNetwork) {
+        let star = snapshot(&checked_star(&mut BasisRoom::new(), network));
+        let mut excesses = Excesses::new();
+
+        let (basis, begun) = resumed_in(room, &mut excesses, &problem_of(network));
+        assert_eq!((snapshot(&basis), begun), (star, Begun::Star));
+        assert_eq!(*basis.held, Held::Nothing);
+    }
+
+    #[test]
+    fn test_a_room_that_holds_nothing_resumes_to_the_star() {
+        assert_resumes_to_the_star(&mut BasisRoom::new(), &depot());
+
+        // A load takes out what the room held.
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        assert_eq!(*loaded(&mut room, &problem_of(&depot())).held, Held::Nothing);
+        assert_resumes_to_the_star(&mut room, &depot());
+    }
+
+    #[test]
+    fn test_a_basis_of_other_counts_resumes_to_the_star() {
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        assert_resumes_to_the_star(&mut room, &network_of_two_parallel_arcs());
+
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        let arcs = [(0, 2, 0, 3, 5), (0, 1, 0, 4, 1), (1, 2, 0, 2, 1), (0, 2, 0, 1, 9)];
+        let more_arcs = MincostNetwork::from_arcs(&[4, 0, -4], &arcs);
+        assert_resumes_to_the_star(&mut room, &more_arcs);
+    }
+
+    #[test]
+    fn test_a_basis_with_another_end_at_a_slot_resumes_to_the_star() {
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+        let turned = MincostNetwork::from_arcs(&[4, 0, -4], &[(0, 2, 0, 3, 5), (0, 1, 0, 4, 1), (2, 1, 0, 2, 1)]);
+
+        assert_resumes_to_the_star(&mut room, &turned);
+    }
+
+    #[test]
+    fn test_excesses_past_the_limit_resume_to_the_star() {
+        // Two arcs of cost −1 between two nodes of no supply. The first enters degenerately, node 0 hanging up from
+        // node 1 by it; the second, at `−1 + 0 − 1 = −2`, fills the cycle with one unit, and the first leaves at its
+        // capacity.
+        let cycle = MincostNetwork::from_arcs(&[0, 0], &[(0, 1, 0, 1, -1), (1, 0, 0, 1, -1)]);
+        let mut room = BasisRoom::new();
+        let mut rule = EnteringRule::FirstEligible;
+        let end = CheckedRun::start(&mut room, &cycle, &problem_of(&cycle))
+            .and_then(|run| run.run_to_end(|rows| rule.next(rows)))
+            .expect("the cycle should run to its end");
+        assert_eq!(end.answer.map(|answer| answer.flows), Some(vec![1, 1]));
+        assert_eq!(room.states, [UPPER, IN_TREE]);
+
+        // Both arcs as wide as a `u64` holds: the first, at its capacity, carries `u64::MAX` from node 0 to node 1,
+        // one past the limit.
+        let wide = MincostNetwork::from_arcs(&[0, 0], &[(0, 1, 0, u64::MAX, -1), (1, 0, 0, u64::MAX, -1)]);
+        assert_resumes_to_the_star(&mut room, &wide);
+
+        // One unit narrower and the excesses keep the limit: the kept basis serves.
+        let mut room = BasisRoom::new();
+        let _ = CheckedRun::start(&mut room, &cycle, &problem_of(&cycle))
+            .and_then(|run| run.run_to_end(|rows| EnteringRule::FirstEligible.next(rows)));
+        let at_limit = MincostNetwork::from_arcs(&[0, 0], &[(0, 1, 0, u64::MAX - 1, -1), (1, 0, 0, u64::MAX, -1)]);
+        assert_eq!(reflowed(&mut room, &at_limit).1, Begun::Kept);
+    }
+
+    #[test]
+    fn test_keep_puts_the_basis_in_the_room_and_a_clone_keeps_it() {
+        let mut room = BasisRoom::new();
+        assert_eq!(room.held, Held::Nothing);
+        kept_depot(&mut room);
+
+        assert_eq!(room.held, Held::Basis);
+        assert_eq!(room.tree.kept().map(|kept| (kept.node_count, kept.link_count)), Some((3, 6)));
+        let mut copy = room.clone();
+        assert_eq!(copy.held, room.held);
+        assert_eq!(reflowed(&mut copy, &depot()).1, Begun::Kept);
+    }
+
+    #[test]
+    fn test_a_run_unwound_after_the_resume_leaves_nothing_kept() {
+        // The resume takes the basis out before it writes; the pivot of arc 1, in the tree, panics with the basis lent.
+        let mut room = BasisRoom::new();
+        kept_depot(&mut room);
+
+        let network = depot();
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let mut excesses = Excesses::new();
+            let (mut basis, begun) = resumed_in(&mut room, &mut excesses, &problem_of(&network));
+            assert_eq!(begun, Begun::Kept);
+            basis.pivot(Slot::from(1_usize));
+        }));
+        assert!(unwound.is_err(), "a pivot of an arc in the tree should panic");
+        assert_eq!(room.held, Held::Nothing);
+        assert_resumes_to_the_star(&mut room, &depot());
+    }
+
+    /// Runs `network` from the star in `room` under the first eligible rule to its end, its invariant checked after
+    /// every pivot, and keeps the basis; answers the basis read out at its end.
+    ///
+    /// # Errors
+    /// As [`CheckedRun::pivot_next`].
+    fn ended(room: &mut BasisRoom, network: &MincostNetwork) -> Result<Snapshot, String> {
+        let mut rule = EnteringRule::FirstEligible;
+        let mut run = CheckedRun::start(room, network, &problem_of(network))?;
+        while run.pivot_next(|rows| rule.next(rows))?.is_some() {}
+
+        let end = snapshot(&run.basis);
+        let _ = run.basis.keep();
+        Ok(end)
+    }
+
+    /// Runs `network` from the basis the run of `before` ended on, under the first eligible, the most violating and
+    /// the seeded random entering rule, each to its end with the invariant checked after the re-flow and after every
+    /// pivot, and checks each end against the brute force.
+    fn check_every_rule_from_the_kept_basis(
+        before: &MincostNetwork,
+        network: &MincostNetwork,
+        seed: u64,
+    ) -> Result<(), TestCaseError> {
+        let rules = [
+            EnteringRule::FirstEligible,
+            EnteringRule::MostViolating,
+            EnteringRule::RandomEligible(Xoshiro256PlusPlus::seed_from_u64(seed)),
+        ];
+        for mut rule in rules {
+            let name = format!("{rule:?}");
+            let fail = |breach: String| TestCaseError::fail(format!("{name}: {breach}"));
+            let (mut room, mut excesses) = (BasisRoom::new(), Excesses::new());
+
+            let (run, begun) =
+                CheckedRun::resumed(&mut room, &mut excesses, before, network, &problem_of(network)).map_err(fail)?;
+            prop_assert_eq!(begun, Begun::Kept, "a pair on the same arcs of tiny numbers");
+            let end = run.run_to_end(|rows| rule.next(rows)).map_err(fail)?;
+            check_against_brute_force(network, end.answer.as_ref()).map_err(|breach| fail(breach.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// The pairs of tiny networks on the same arcs the re-flow is tried on: up to seven arcs, the most the brute force
+    /// enumerates, costs that tie often, supplies half the time a flow's.
+    fn tiny_pairs() -> impl Strategy<Value = (MincostNetwork, MincostNetwork)> {
+        TinyMincostNetworks {
+            arcs: 0..=7,
+            costs: TinyCosts::ZeroOrUniform(-9..=9),
+            supplies: TinySupplies::OfAFlowOrRandom,
+            bounds: TinyBounds::Ordered,
+        }
+        .pairs()
+    }
+
+    #[test]
+    fn test_the_tiny_pairs_reach_every_way_the_re_flow_goes() {
+        // The cases the pair property test draws: a tree arc that leaves for its node's root link, one whose parent's
+        // arc leaves too, a root link turned the other way, a kept basis that ended infeasible, a re-flow that leaves
+        // the optimum as it was and one after which the run pivots, and a run from the kept basis that ends
+        // infeasible.
+        const CASES: usize = 256;
+        let mut runner = TestRunner::deterministic();
+        let strategy = tiny_pairs();
+        let (mut cuts, mut nested, mut turned, mut idle, mut busy) = (0, 0, 0, 0, 0);
+        let (mut kept_infeasible, mut ended_infeasible) = (0, 0);
+
+        for _ in 0..CASES {
+            let (before, network) = strategy.new_tree(&mut runner).expect("a pair should be drawn").current();
+            let mut room = BasisRoom::new();
+            let end = ended(&mut room, &before).expect("the first run should keep the invariant");
+
+            let (mut run, begun) = {
+                let mut excesses = Excesses::new();
+                let (basis, begun) = resumed_in(&mut room, &mut excesses, &problem_of(&network));
+                check(&basis, &network).expect("the invariant should hold after the re-flow");
+                let bound = pivot_bound(&basis, &network);
+                (CheckedRun { network: &network, basis, pivots: 0, bound }, begun)
+            };
+            assert_eq!(begun, Begun::Kept);
+            let arc_count = network.arc_count();
+            let hangings = hangings_of(&run.basis.tree);
+            let cut = |node: usize| end.hangings[node].link < arc_count && hangings[node].link >= arc_count;
+            for (node, (old, new)) in end.hangings.iter().zip(&hangings).enumerate() {
+                cuts += usize::from(cut(node));
+                nested += usize::from(cut(node) && old.parent < hangings.len() && cut(old.parent));
+                turned += usize::from(old.link >= arc_count && old.link == new.link && old.direction != new.direction);
+            }
+            kept_infeasible += usize::from(end.flows[arc_count..].iter().any(|&flow| flow > 0));
+
+            let mut rule = EnteringRule::FirstEligible;
+            while run.pivot_next(|rows| rule.next(rows)).expect("every pivot should keep the invariant").is_some() {}
+            if run.pivots == 0 {
+                idle += 1;
+            } else {
+                busy += 1;
+            }
+            ended_infeasible += usize::from(!run.basis.routes_every_supply());
+        }
+
+        let reached = [cuts, nested, turned, kept_infeasible, idle, busy, ended_infeasible];
+        assert!(reached.iter().all(|&count| count > 0), "{reached:?}");
+    }
+
     proptest! {
         #[test]
         fn test_tiny_runs_keep_the_invariant_and_end_optimal(
@@ -2671,6 +3689,43 @@ pub(crate) mod tests {
             let not_given = CheckedRun::start(&mut room, &network, &problem)
                 .and_then(|run| run.run_to_end(|rows| rule.next(rows)));
             prop_assert_eq!(given, not_given);
+        }
+
+        #[test]
+        fn test_tiny_pairs_keep_the_invariant_from_the_kept_basis_and_end_optimal(
+            (before, network) in tiny_pairs(),
+            seed in any::<u64>(),
+        ) {
+            check_every_rule_from_the_kept_basis(&before, &network, seed)?;
+        }
+
+        #[test]
+        fn test_the_same_problem_again_starts_from_its_own_end(
+            network in tiny_networks(TinyCosts::ZeroOrUniform(-9..=9), TinyBounds::Ordered),
+        ) {
+            let mut room = BasisRoom::new();
+            let end = ended(&mut room, &network).map_err(TestCaseError::fail)?;
+            prop_assert!(end.violations.iter().all(|&violation| violation >= 0), "{end:?}");
+
+            let (again, begun) = reflowed(&mut room, &network);
+            prop_assert_eq!(begun, Begun::Kept);
+            prop_assert_eq!(again, end);
+        }
+
+        #[test]
+        fn test_costs_alone_changed_keep_the_tree_and_the_flows(
+            (network, costs) in tiny_networks(TinyCosts::ZeroOrUniform(-9..=9), TinyBounds::Ordered)
+                .prop_flat_map(|network| {
+                    let arcs = network.arc_count();
+                    (Just(network), proptest::collection::vec(-9_i64..=9, arcs))
+                }),
+        ) {
+            let mut room = BasisRoom::new();
+            let end = ended(&mut room, &network).map_err(TestCaseError::fail)?;
+
+            let (again, begun) = reflowed(&mut room, &MincostNetwork { costs, ..network });
+            prop_assert_eq!(begun, Begun::Kept);
+            prop_assert_eq!((again.flows, again.states, again.hangings), (end.flows, end.states, end.hangings));
         }
     }
 }

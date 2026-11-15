@@ -9,11 +9,11 @@ The public surface is ten items:
 | Item | What it is |
 |---|---|
 | `Problem` | the six borrowed tables of one problem |
-| `NetworkSimplex` | the solver, with the room it keeps from one solve to the next |
+| `NetworkSimplex` | the solver, with the room and the basis it keeps from one solve to the next |
 | `Answer<T>` | what a solve answers: its `outcome` and its `work` |
 | `Outcome<T>` | `Optimal(T)` or `Infeasible` |
-| `Solution` | the owned optimum of `solve`: `flows`, `potentials`, `total_cost` |
-| `Optimum<'s>` | the optimum of `solve_into`: `total_cost`, and `potentials` lent by the solver |
+| `Solution` | the owned optimum of `solve` and `resolve`: `flows`, `potentials`, `total_cost` |
+| `Optimum<'s>` | the optimum of `solve_into` and `resolve_into`: `total_cost`, and `potentials` lent by the solver |
 | `Work` | the counts of a solve: `pivots`, `degenerate_pivots`, `first_arc_pivots` |
 | `ProblemError` | why a problem is refused, with the values of the breach |
 | `Table` | which per-arc table a `ProblemError::Length` names |
@@ -97,6 +97,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `solve_into` panics if the buffer holds another number of entries than the problem has arcs; the buffer is compared
 first, whether or not the problem would be refused. Where the outcome is infeasible, or the problem is refused, the
 buffer is as it was.
+
+## Solve again from the last basis
+
+A solver keeps the basis its last solve ended on, optimal or infeasible. `resolve` and `resolve_into` take the
+arguments of `solve` and `solve_into`, answer the same types and refuse the same problems, and start from that basis
+where it can serve the problem, as [solving again](problem-and-guarantees.md#solving-again) states. Every number is
+read anew, so supplies, bounds, capacities and costs may all differ. Where only some of them did, a resolve often
+makes far fewer pivots than a solve; the same problem again, where the basis serves, makes none. Where it cannot
+serve, as on a new solver or for a problem of other counts, a resolve is a solve, its answer and its work included, so
+it is never wrong to call one.
+
+```rust
+use kahlnws::{NetworkSimplex, Outcome, Problem};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Two warehouses (nodes 0 and 1) serve three shops (nodes 2 to 4); every lane carries up to 20 units.
+    let (tails, heads) = ([0, 0, 0, 1, 1, 1], [2, 3, 4, 2, 3, 4]);
+    let (capacities, costs) = ([20; 6], [8, 6, 10, 9, 12, 13]);
+    let days = [[20, 30, -10, -25, -15], [20, 30, -20, -20, -10], [20, 30, -5, -15, -30]];
+
+    let mut solver = NetworkSimplex::new();
+    solver.try_reserve(5, 6)?;
+    let mut flows = [0; 6];
+
+    let mut answered = Vec::new();
+    for (day, supplies) in days.iter().enumerate() {
+        let problem = Problem {
+            tails: &tails,
+            heads: &heads,
+            lower_bounds: None,
+            capacities: &capacities,
+            costs: &costs,
+            supplies,
+        };
+
+        // The first day is solved; each later day starts from the basis the day before ended on.
+        let answer = if day == 0 {
+            solver.solve_into(&problem, &mut flows)?
+        } else {
+            solver.resolve_into(&problem, &mut flows)? // allocates nothing
+        };
+        let Outcome::Optimal(optimum) = answer.outcome else {
+            unreachable!("the warehouses cover every day's demand");
+        };
+        let fresh = NetworkSimplex::new().solve(&problem)?.work.pivots;
+        answered.push((optimum.total_cost, answer.work.pivots, fresh));
+    }
+
+    // Each day's cost, the pivots of this solver, and those of a fresh solve of the same day.
+    assert_eq!(answered, [(465, 6, 6), (430, 1, 5), (525, 1, 7)]);
+
+    Ok(())
+}
+```
+
+The outcome and the cost of a resolve are those of the problem, and its potentials prove its flows optimal, as a
+solve's do. Which optimal flow it answers among several, its potentials and its work depend on the solves before it
+as well: they are a function of the problem and of those solves, the same every time. A resolve that starts from the
+kept basis tries no arcs before block search, so its `first_arc_pivots` is zero. A refused call, or one that panics on
+its buffer, keeps the basis kept before it; a solve that panics after it began to write the basis leaves none, and the
+next resolve is then a solve.
+
+`try_reserve` also makes the room a start from a kept basis reads, which a solve does not make: after it,
+`resolve_into` of a problem within the reserved counts allocates nothing. Without a reservation, a resolve that
+started from a kept basis makes that room, and a later `resolve_into` of a problem no larger allocates nothing.
 
 ## Check an optimal answer
 
@@ -357,7 +422,7 @@ fn main() {
 
 ## Examples
 
-Four programs under `crates/kahlnws/examples/` solve one network, two warehouses that supply three shops, as a user
+Five programs under `crates/kahlnws/examples/` solve one network, two warehouses that supply three shops, as a user
 would. The examples of the other languages carry the same names and print the same lines. Each program asserts its
 optimum, worked out by hand, and `cargo test` runs each as a test.
 
@@ -365,6 +430,7 @@ optimum, worked out by hand, and `cargo test` runs each as a test.
 |---|---|
 | `transport` | the smallest useful call: one solve, its cost and the flow on each lane |
 | `reuse` | one solver for three days of demand, its room reserved once, each day solved into the same buffer |
+| `resolve` | the days of `reuse`, each after the first resolved from the day before, beside a fresh solve's pivots |
 | `outcomes` | a problem with no flow, answered as an outcome, and a refused problem, answered as an error |
 | `potentials` | the potentials, each lane's reduced cost, the check of the optimality conditions, and the work |
 

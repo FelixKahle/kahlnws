@@ -116,14 +116,15 @@ def test_the_stubs_declare_every_name_with_the_docstring_the_module_gives_it() -
     declared = {name for name in pairs if "." not in name}
     assert declared == {name for name in kahlnws.__all__ if name != "__version__"}
     assert words(ast.get_docstring(stubs)) == words(_kahlnws.__doc__)
-    assert "NetworkSimplex.solve_into" in pairs
+    entries = ["solve", "solve_into", "resolve", "resolve_into"]
+    assert all(f"NetworkSimplex.{entry}" in pairs for entry in entries)
     assert "Breach.NetSupplyBeyondRange.total" in pairs
     assert (PACKAGE / "py.typed").is_file()
 
 
 def test_the_package_never_imports_numpy() -> None:
     # A fresh interpreter, in which importing NumPy fails: the package imports, reads every kind of plain column and
-    # buffer, solves at both levels, raises, and NumPy is not among the modules loaded.
+    # buffer, solves and resolves at both levels, raises, and NumPy is not among the modules loaded.
     program = """
 import sys
 from array import array
@@ -144,11 +145,13 @@ answer = solver.solve(**depot, costs=memoryview(array("q", [5, 1, 1])))
 solution = answer.outcome
 flows = array("Q", [0, 0, 0])
 cost = solver.solve_into(**depot, costs=[5, 1, 1], flows=flows).outcome
+again = solver.resolve(**depot, costs=(5, 1, 1)).work.pivots
+fewer = solver.resolve_into(**depot | {"supplies": [3, 0, -3]}, costs=[5, 1, 1], flows=flows).outcome
 try:
     solver.solve(tails=[0], heads=[5], capacities=[1], costs=[1], supplies=[1, -1])
 except kahlnws.ProblemError as error:
     breach = error.breach
-assert (solution.flows, cost, flows.tolist()) == ([2, 2, 2], 14, [2, 2, 2])
+assert (solution.flows, cost, again, fewer, flows.tolist()) == ([2, 2, 2], 14, 0, 9, [1, 2, 2])
 assert breach == kahlnws.Breach.HeadOutsideNodes(arc=0, head=5, node_count=2)
 assert not any(name == "numpy" or name.startswith("numpy.") for name in sys.modules), "numpy was imported"
 print("solved without numpy")
@@ -159,8 +162,9 @@ print("solved without numpy")
     assert finished.stdout == "solved without numpy\n"
 
 
-def test_the_example_of_the_workspace_s_readme_runs() -> None:
-    readme = (Path(__file__).parents[3] / "README.md").read_text()
+@pytest.mark.parametrize("folders_up", [3, 1], ids=["workspace", "package"])
+def test_the_example_of_the_workspace_s_and_of_the_package_s_readme_runs(folders_up: int) -> None:
+    readme = (Path(__file__).parents[folders_up] / "README.md").read_text()
     examples = readme.split("```python\n")[1:]
 
     assert len(examples) == 1

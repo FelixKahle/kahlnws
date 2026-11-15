@@ -1,10 +1,10 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The seeded networks of the benchmark suite: each family at the sizes its rows sweep, every network a pure function
-//! of its family and size, and the tie-breaks its distinct costs are made with.
+//! The seeded networks the benchmark suites share: each family at the sizes its rows sweep, every network a pure
+//! function of its family and size, and the tie-breaks its distinct costs are made with.
 //!
-//! Each kind of number of a network is drawn from a substream split off the suite's seed by the network's family, its
+//! Each kind of number of a network is drawn from a substream split off the suites' seed by the network's family, its
 //! size and the kind of number, never by the position of a draw, so no network depends on which others exist or are
 //! drawn first. A split mixes one step under one domain with one round of SplitMix64, so a family, a size and a kind of
 //! number never meet on one seed.
@@ -15,13 +15,13 @@ use rand_xoshiro::{SplitMix64, Xoshiro256PlusPlus};
 use crate::mincost_network::MincostNetwork;
 use crate::sized_networks::{ShapeDraws, assignment_sized, costed_grid, supply_sized};
 
-/// The seed every substream of the benchmark suite is split from.
+/// The seed every substream of the benchmark suites is split from.
 const SUITE: Seed = Seed(0x6b61_686c_6172_6320);
 
 /// The number of tie-breaks: they are `1..=4095`, below `2^12`.
 const TIE_BREAK_MOST: u64 = (1 << 12) - 1;
 
-/// A family of the benchmark suite's min-cost networks.
+/// A family of the benchmark suites' min-cost networks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     /// The supply shape, [`supply_sized`](crate::supply_sized); the size is the number of demands.
@@ -52,12 +52,27 @@ impl Family {
     /// # Panics
     /// Panics if `size` is zero.
     pub fn network(self, size: usize) -> MincostNetwork {
-        let seed = SUITE.split(self.part()).sized(size);
+        self.network_with_costs(size, self.seed(size).stream(Stream::Costs))
+    }
+
+    /// The family's network of `size` with every cost drawn by `costs` in place of the suite's costs stream: the nodes,
+    /// arcs, capacities and supplies of [`network`](Self::network), and each arc's cost drawn from the range its role
+    /// in the family draws from, or given by the rule a derived cost follows, such as the grid's slack arc.
+    ///
+    /// # Panics
+    /// Panics if `size` is zero.
+    pub fn network_with_costs(self, size: usize, mut costs: Xoshiro256PlusPlus) -> MincostNetwork {
+        let seed = self.seed(size);
         match self {
-            Self::Supply => supply_sized(size, &mut shape_draws(seed)),
-            Self::Assignment => assignment_sized(size, &mut shape_draws(seed)),
-            Self::Grid => costed_grid(size, &mut seed.stream(Stream::Capacities), &mut seed.stream(Stream::Costs)),
+            Self::Supply => supply_sized(size, &mut shape_draws(seed, costs)),
+            Self::Assignment => assignment_sized(size, &mut shape_draws(seed, costs)),
+            Self::Grid => costed_grid(size, &mut seed.stream(Stream::Capacities), &mut costs),
         }
+    }
+
+    /// The seed every stream of the family's network of `size` is split from.
+    fn seed(self, size: usize) -> Seed {
+        SUITE.split(self.part()).sized(size)
     }
 
     /// The part this family mixes into the suite's seed; it never changes once given.
@@ -71,7 +86,7 @@ impl Family {
 }
 
 /// The tie-breaks of the arcs `0..arc_count` with which [`distinct_costs`](crate::distinct_costs) makes the costs of
-/// the benchmark suite's distinct rows: arc `a`'s is `1 + splitmix64(a) mod 4095`, where `splitmix64(a)` is the first
+/// the benchmark suites' distinct rows: arc `a`'s is `1 + splitmix64(a) mod 4095`, where `splitmix64(a)` is the first
 /// output of SplitMix64 seeded with `a`. Each lies in `1..=4095`, and neighbouring arcs get spread values.
 ///
 /// # Panics
@@ -111,13 +126,9 @@ impl Stream {
 }
 
 /// The generators of a network of the supply or the assignment shape from its `seed`, one substream per kind of
-/// number.
-fn shape_draws(seed: Seed) -> ShapeDraws {
-    ShapeDraws {
-        topology: seed.stream(Stream::Topology),
-        supplies: seed.stream(Stream::Supplies),
-        costs: seed.stream(Stream::Costs),
-    }
+/// number, with `costs` drawing its costs.
+fn shape_draws(seed: Seed, costs: Xoshiro256PlusPlus) -> ShapeDraws {
+    ShapeDraws { topology: seed.stream(Stream::Topology), supplies: seed.stream(Stream::Supplies), costs }
 }
 
 /// The kind of step a seed is split by; each is mixed under its own domain.
@@ -263,6 +274,47 @@ mod tests {
             let made_distinct = MincostNetwork { costs: distinct_costs(&network, &tie_breaks), ..network };
             if let Some(distinct) = distinct {
                 assert_eq!(made_distinct.fingerprint(), distinct, "{family:?} {size} at distinct costs");
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_network_with_its_costs_drawn_anew_keeps_everything_else_and_each_role_s_range() {
+        // The smallest network of each family, its costs drawn from another stream. Everything but the costs is the
+        // suite's network; the costs moved; and each role keeps its range: twin arcs share one cost, the slack arcs of
+        // the supply shape lie in 100..150 and of the assignment shape in 50..70, every other arc of the two shapes
+        // below 12, and every grid arc in 1..=20 but the slack arc, whose cost the side gives, 20 a unit per row.
+        for family in Family::ALL {
+            let size = family.sizes()[0];
+            let suite = family.network(size);
+            let redrawn = family.network_with_costs(size, Xoshiro256PlusPlus::seed_from_u64(17));
+
+            assert_eq!(MincostNetwork { costs: suite.costs.clone(), ..redrawn.clone() }, suite, "{family:?}");
+            assert_ne!(redrawn.costs, suite.costs, "{family:?}");
+
+            for arc in 0..suite.arc_count() {
+                // Twins are made as two arcs in a row of the same ends and capacity; an arc to the sink beside a
+                // write-off to it has the same ends, but another capacity.
+                let twin = arc + 1 < suite.arc_count()
+                    && (suite.tails[arc], suite.heads[arc], suite.capacities[arc])
+                        == (suite.tails[arc + 1], suite.heads[arc + 1], suite.capacities[arc + 1]);
+                if twin {
+                    assert_eq!(redrawn.costs[arc], redrawn.costs[arc + 1], "{family:?} twins at arc {arc}");
+                }
+            }
+
+            let slack = 20 * i64::try_from(size).expect("a size should fit an i64");
+            let role_range = |network: &MincostNetwork, arc: usize| match family {
+                Family::Supply if network.costs[arc] >= 100 => 100..150,
+                Family::Assignment if network.costs[arc] >= 50 => 50..70,
+                Family::Supply | Family::Assignment => 0..12,
+                Family::Grid if arc + 1 == network.arc_count() => slack..slack + 1,
+                Family::Grid => 1..21,
+            };
+            for arc in 0..suite.arc_count() {
+                let range = role_range(&suite, arc);
+                assert_eq!(role_range(&redrawn, arc), range, "{family:?} arc {arc} keeps its role");
+                assert!(range.contains(&redrawn.costs[arc]), "{family:?} arc {arc}: {}", redrawn.costs[arc]);
             }
         }
     }

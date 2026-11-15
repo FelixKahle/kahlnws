@@ -26,6 +26,7 @@ edition = "2024"
 rust-version = "1.99.1"
 license = "MIT OR Apache-2.0"
 authors = ["Felix Kahle"]
+repository = "https://github.com/FelixKahle/kahlnws"
 
 [workspace.dependencies]
 # Error enums: `Display` and `source()` derived from one message per variant: the library's `ProblemError`, the
@@ -53,7 +54,7 @@ kahlnws_testing = { path = "crates/kahlnws_testing" }
 # shares among them. `std` alone: the runner and its failure persistence; the tests run in process, so neither `fork`
 # nor `timeout` is wanted, and nothing uses the `bit-set` strategies.
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
-# The timing of the benchmark suite. No default feature: the suite reads its numbers from the terminal and from the
+# The timing of the benchmark suites. No default feature: the suites read their numbers from the terminal and from the
 # estimates criterion writes, so neither plots (`plotters`) nor parallel analysis (`rayon`) is wanted;
 # `cargo_bench_support` switches on no code of this version.
 criterion = { version = "0.8.2", default-features = false }

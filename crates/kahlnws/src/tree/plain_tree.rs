@@ -4,8 +4,9 @@
 //! The model the tree's tests check against: a rooted tree as each node's parent and the link it hangs by, with every
 //! column a threaded tree derives recomputed from those alone by loops over explicit stacks.
 //!
-//! It knows one change of a tree, stated by its parent links: the stem reversed and the entering end hung under the
-//! other end. It knows nothing of threads being cut and spliced, so it shares no reasoning with the tree's own update.
+//! It knows two changes of a tree, each stated by its parent links: the stem reversed and the entering end hung under
+//! the other end; and the prune, in which the nodes told to hang from the root do so by their root links. It knows
+//! nothing of threads being cut and spliced, so it shares no reasoning with the tree's own updates.
 
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -20,6 +21,15 @@ pub(super) struct PlainTree {
     pub(super) parents: Vec<usize>,
     /// Per node below the root, node `v` at `v`: the link it hangs by and which way that link runs.
     pub(super) hangings: Vec<(usize, Direction)>,
+}
+
+/// What a prune tells one node below the root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Decision {
+    /// It stays on its link, under its parent.
+    Stay,
+    /// It hangs from the root by its root link, running the way given, seen from the node.
+    Root(Direction),
 }
 
 /// Every column of a threaded tree as plain numbers, as a test reads them out of the tree under test. Plain data.
@@ -139,6 +149,28 @@ impl PlainTree {
             };
             hanging = (link, turned);
             below = node;
+        }
+
+        tree
+    }
+
+    /// The tree after a prune of a tree of `link_count` links that tells node `v` `decisions[v]`: a node told to hang
+    /// from the root gets the root as its parent and its root link `link_count − n + v`, running the way it is told;
+    /// every other node keeps its parent and its link.
+    ///
+    /// # Panics
+    /// Panics if `decisions` holds another number of decisions than the tree has nodes below the root.
+    pub(super) fn pruned(&self, decisions: &[Decision], link_count: usize) -> Self {
+        let root = self.root();
+        let given = decisions.len();
+        assert!(given == root, "called `PlainTree::pruned` with {given} decisions for {root} nodes below the root");
+        let mut tree = self.clone();
+
+        for (node, &decision) in decisions.iter().enumerate() {
+            if let Decision::Root(direction) = decision {
+                tree.parents[node] = root;
+                tree.hangings[node] = (link_count - root + node, direction);
+            }
         }
 
         tree
@@ -380,6 +412,28 @@ mod tests {
         let alone = tree.exchanged(4, 2, 4, (8, Direction::Down));
         assert_eq!(alone.parents, [1, 3, 5, 5, 2, 5]);
         assert_eq!(alone.hangings[4], (8, Direction::Down));
+    }
+
+    #[test]
+    fn test_a_prune_hangs_the_nodes_told_from_the_root_by_their_root_links_by_hand() {
+        // 0 under the root 3, 1 under 0, 2 under 1; six links, so the root links are 3, 4 and 5.
+        let (up, down) = (Direction::Up, Direction::Down);
+        let tree = PlainTree { parents: vec![3, 0, 1, 3], hangings: vec![(0, up), (1, up), (2, down)] };
+
+        let pruned = tree.pruned(&[Decision::Stay, Decision::Root(down), Decision::Stay], 6);
+        assert_eq!(pruned.parents, [3, 3, 1, 3], "2 goes with 1");
+        assert_eq!(pruned.hangings, [(0, up), (4, down), (2, down)]);
+
+        // A node under the root told to hang from it turns to its root link.
+        let turned = tree.pruned(&[Decision::Root(down), Decision::Stay, Decision::Stay], 6);
+        assert_eq!((turned.parents, turned.hangings[0]), (vec![3, 0, 1, 3], (3, down)));
+        assert_eq!(tree.pruned(&[Decision::Stay; 3], 6), tree);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `PlainTree::pruned` with 1 decisions for 5 nodes below the root")]
+    fn test_a_prune_refuses_too_few_decisions() {
+        let _ = five_nodes().pruned(&[Decision::Stay], 10);
     }
 
     #[test]

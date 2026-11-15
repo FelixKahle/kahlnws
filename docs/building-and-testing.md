@@ -38,8 +38,9 @@ A change is ready when the gates pass, run from the root of the repository:
 ./gates.sh
 ```
 
-The steps run in this order; the first four cover the whole workspace, and each builds on at most `KAHLNWS_JOBS`
-cores, 4 unless the variable is set:
+The steps run in this order; the first four cover the whole workspace. `KAHLNWS_JOBS`, 4 unless the variable is set,
+bounds cargo's build jobs and the test threads, each on its own; the cargo that the tests of the C boundary start to
+build the C library keeps the same bound on its jobs, which run beside the other test threads:
 
 1. `cargo fmt --all --check`: every source is formatted as `rustfmt` writes it.
 2. `cargo clippy --locked --workspace --all-targets -- -D warnings`: no lint fires, in the code, the tests or the
@@ -66,9 +67,12 @@ Each kind of test checks something the others cannot.
   cases worked by hand: the dealing of the arcs, the net supplies, the ratio test, each step of the tree update.
 - **The basis invariant after every pivot.** A test-only check verifies the whole invariant of the basis (the shape of
   its columns, the tree, the potentials, the flows and strong feasibility) after the starting basis and after every
-  pivot, on hand-worked networks pivot by pivot and on tiny random networks under four rules for the entering arc.
-- **The tree against a model.** After random exchanges, every column of the threaded tree is compared with a plain
-  model that recomputes it from the parent links alone.
+  pivot, on hand-worked networks pivot by pivot and on tiny random networks under four rules for the entering arc;
+  and after a kept basis is made a basis of a second network on the same arcs, on hand-worked changes of one network
+  and on tiny random pairs of networks, whose second answer the brute force checks.
+- **The tree against a model.** After random exchanges, and after the two walks that make a kept tree a tree of a new
+  problem, given random decisions and costs, every column of the threaded tree is compared with a plain model that
+  recomputes it from the parent links alone.
 - **Property tests against simple models.** Tiny random networks are solved and compared with a brute force that
   tries every integral flow; larger seeded networks with the optimum cost of a linear-programming solver. Neither model
   shares the solver's reasoning.
@@ -76,9 +80,14 @@ Each kind of test checks something the others cannot.
   and meeting every supply, the potentials pricing it optimal, and the cost as stated.
 - **The ranges.** Problems at both ends of every range, and one past each, are solved or refused, with the bounds
   recomputed in big integers apart from the arithmetic under test.
+- **Solving again.** Sequences of seeded networks, each with a few numbers moved from the one before, are resolved by
+  one solver and answer the outcome and the cost of a fresh solve, with a certificate; where the kept basis cannot
+  serve, as on a new solver, for other counts or past the limit of the excesses, a resolve answers exactly what a
+  solve answers, its work included. The same problem again, where the kept basis serves, makes no pivot.
 - **Allocation.** A counting allocator shows that a solve into the caller's buffer allocates nothing after a
-  reservation, nor from the second solve on for a problem no larger than the first, and that the C library's reserved
-  solve allocates nothing.
+  reservation, nor from the second solve on for a problem no larger than the first; that a resolve into it allocates
+  nothing after a reservation, from a kept basis or from the star, nor after a resolve that started from a kept
+  basis; and that the C library's reserved solve and resolve allocate nothing.
 - **The C and C++ programs.** The header is compiled as C99, C11, C17, C++11 and C++17 with every warning an error,
   and a C program and two C++ programs are built against the static library and run; the C++ header is compiled in
   every standard from C++11 on.
@@ -118,30 +127,45 @@ workspace.
 
 ## Miri
 
-Miri runs the tests in an interpreter that reports undefined behaviour. It needs a nightly toolchain:
+Miri runs the tests in an interpreter that reports undefined behaviour. It needs a nightly toolchain. The library's
+tests run module by module, and the public tests file by file, each a command of its own:
 
 ```sh
 rustup toolchain install nightly --component miri
-MIRIFLAGS=-Zmiri-disable-isolation PROPTEST_CASES=2 cargo +nightly miri test -p kahlnws -- \
+export MIRIFLAGS=-Zmiri-disable-isolation PROPTEST_CASES=2
+cargo +nightly miri test -p kahlnws --lib tree:: -- \
+    --skip test_every_exchange_reachable_from_the_star_keeps_every_column \
+    --skip test_the_random_exchanges_reach_every_kind_of_exchange
+cargo +nightly miri test -p kahlnws --lib basis::
+cargo +nightly miri test -p kahlnws --lib solver::
+cargo +nightly miri test -p kahlnws --test allocation
+cargo +nightly miri test -p kahlnws --test solve -- \
     --skip test_the_seeded_shapes_against_the_oracle \
     --skip test_the_benchmark_networks_of_a_few_thousand_arcs_against_the_oracle \
     --skip test_one_solver_answers_every_problem_as_a_fresh_one \
     --skip test_a_refused_buffer_leaves_the_solver_answering_as_a_fresh_one \
-    --skip test_every_exchange_reachable_from_the_star_keeps_every_column \
-    --skip test_the_random_exchanges_reach_every_kind_of_exchange
+    --skip test_a_resolve_of_a_fresh_solver_answers_as_a_solve \
+    --skip test_the_same_problem_resolved_makes_no_pivot_where_a_solve_makes_some \
+    --skip test_a_problem_of_other_counts_resolves_as_a_solve
 cargo +nightly miri test -p kahlnws_testing counting_allocator -- --skip test_a_request_the_system_refuses_counts_too
 ```
 
-`MIRIFLAGS=-Zmiri-disable-isolation` lets the property tests read the working directory, where proptest keeps the
-failures it persists; Miri's isolation refuses that read. `PROPTEST_CASES` cuts the property tests that take the
-default number of cases. The tests left out cannot run under
-Miri, for these reasons:
+A test filter matches every test whose path contains it, so `basis::` runs the tests of `starting_basis` too. The
+library's other modules run the same way, each by its name after `--lib`. `MIRIFLAGS=-Zmiri-disable-isolation` lets
+the property tests read the working directory, where proptest keeps the failures it persists; Miri's isolation refuses
+that read. `PROPTEST_CASES` cuts the property tests that take the default number of cases. The tests left out cannot
+run under Miri, for these reasons:
 
-- the four public tests that reach the linear-programming oracle: the oracle is foreign code, which Miri does not
-  interpret;
+- the seven public tests that reach the linear-programming oracle, directly or through the networks they solve in turn:
+  the oracle is foreign code, which Miri cannot call;
 - the allocator test that asks for $2^{62}$ bytes: Miri cannot refuse an allocation;
 - the exhaustive exchange test and the exchange coverage run: each runs too long in an interpreter; the same exchange
   code runs in the random exchange tests.
 
-Run so, with debug assertions on, Miri reports no undefined behaviour in any test of the library or of the counting
-allocator.
+The longest test that stays in, the sequences of perturbed networks resolved in turn, takes a few minutes under Miri.
+
+Run so, with debug assertions on, the commands above for the tree, the basis with the starting basis, the solver, and
+the two files of public tests run 221 tests, and Miri reports no undefined behaviour in any of them; they reach every
+`unsafe` block of the solve from a kept basis. The library's other modules (the problem, the ranges, the arc order, the
+pricing, the first pivots, the answer and the room) and the counting allocator were last run under Miri before the
+solve from a kept basis was added, and it reported no undefined behaviour in them then.

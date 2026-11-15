@@ -53,6 +53,15 @@ def test_reuse_prints_the_hand_worked_optimum_of_each_day() -> None:
     ]
 
 
+def test_resolve_prints_the_optimum_of_each_day_and_fewer_pivots_from_the_kept_basis() -> None:
+    # The costs are those of `reuse`; the example works out each day's pivots by hand, kept and fresh alike.
+    assert run("resolve").splitlines() == [
+        f"day 1: cost {TRANSPORT_COST}, pivots 6 (a fresh solve: 6)",
+        f"day 2: cost {550 - 120}, pivots 1 (a fresh solve: 5)",
+        f"day 3: cost {615 - 90}, pivots 1 (a fresh solve: 7)",
+    ]
+
+
 def test_outcomes_prints_that_no_flow_exists_and_the_refusal() -> None:
     # Warehouse 0's three lanes cut to 5 carry 15 of its 20 units; the last lane enters node 5 of five nodes.
     assert run("outcomes").splitlines() == [

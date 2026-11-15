@@ -3,7 +3,8 @@
 
 # The checks a change passes before it is merged into `main`: the gates of `gates.sh`, one job per gate, and the
 # checks of the Python package. They run once per change, on the pull request (and in a merge queue, where one is
-# used), and not again on the push the merge makes: `main` only ever receives what has passed here.
+# used), and not again on the push the merge makes: `main` only ever receives what has passed here. A release runs
+# them once more, on the commit it publishes.
 
 name: CI
 
@@ -12,6 +13,8 @@ on:
     branches: [main]
   merge_group:
   workflow_dispatch:
+  # The release runs these checks on the tagged commit before it publishes anything.
+  workflow_call:
 
 # A newer push to the same pull request replaces the run of the older one.
 concurrency:

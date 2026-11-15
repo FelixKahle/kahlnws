@@ -45,11 +45,13 @@ cc -std=c99 -Wall -Wextra -Wpedantic -Werror -I crates/kahlnws_capi/include depo
     -L target/release -lkahlnws_capi -o depot
 ```
 
-On macOS the dynamic library's install name is the absolute path of the file cargo wrote under
-`target/release/deps/`, so a program linked against it loads it from there. A program that ships the library
-elsewhere sets another install name, for example with `install_name_tool -id @rpath/libkahlnws_capi.dylib`, and adds
-the matching run path to the program. On Windows, a program that links the dynamic library defines `KAHLNWS_SHARED`
-before it includes the header, so that every function is imported from it.
+On macOS the dynamic library's install name is the absolute path of the file `rustc` wrote in cargo's build directory,
+not of its copy in `target/release/`, so a program linked against it loads it from there, and only while that file
+exists. Where in the build directory it lies is cargo's own affair and differs between cargo's versions:
+`otool -D target/release/libkahlnws_capi.dylib` prints it. A program that ships the library elsewhere sets another
+install name, for example with `install_name_tool -id @rpath/libkahlnws_capi.dylib`, and adds the matching run path
+to the program. On Windows, a program that links the dynamic library defines `KAHLNWS_SHARED` before it includes the
+header, so that every function is imported from it.
 
 ## The header
 
@@ -124,7 +126,7 @@ further: an infeasible problem, a refused one with its message, the version and 
 
 ## Examples
 
-`crates/kahlnws_capi/examples/` holds four programs, the same four the other guides show in their languages. Each
+`crates/kahlnws_capi/examples/` holds five programs, the same five the other guides show in their languages. Each
 solves a small transport network, two warehouses that serve three shops, checks every status a call answers and frees
 its solver on every path:
 
@@ -132,6 +134,7 @@ its solver on every path:
 |---|---|
 | `transport.c` | the smallest useful call: one solve, its cost and the flow on each lane |
 | `reuse.c` | one solver for three days of demands, its room reserved once, each day solved into the same buffer |
+| `resolve.c` | the days of `reuse.c`, each after the first resolved from the day before, beside fresh pivots |
 | `outcomes.c` | the answers that are not an optimal flow: no flow exists, and a refused problem with its message |
 | `potentials.c` | the potentials, each lane's reduced cost, the optimality conditions checked, the solve's work |
 
@@ -173,6 +176,36 @@ The room of a solver only grows. `kahlnws_solver_reserve(solver, node_count, arc
 to those counts; a solve of such a problem, or of one no larger than an earlier solve's, allocates nothing. A solve
 grows the room to the problem's counts before it checks the problem, so a refused problem may have grown it, and a
 problem too large for memory answers `KAHLNWS_STATUS_NO_ROOM` before it could be refused as too large.
+
+## Solving again
+
+A solver keeps the basis its last solve ended on, optimal or infeasible. `kahlnws_solver_resolve` takes the same
+arguments as `kahlnws_solver_solve`, answers the same statuses and writes the same outputs on each, and starts from that
+basis where it serves: where the problem has the node and arc counts of that solve and every arc the tail and the head
+it had, and the supplies the basis leaves stay within the range a solve admits. The tree is kept and every number is
+read anew, so supplies, bounds, capacities and costs may all have changed. Where only some of them did, a resolve often
+makes far fewer pivots than a solve, and the same problem again, where the kept basis serves, makes none. Where the
+basis cannot serve, as on a new solver or for a problem of other counts, a resolve answers and writes exactly what
+`kahlnws_solver_solve` does, its work included; so it is never wrong to call it.
+
+```c
+kahlnws_status status = kahlnws_solver_solve(solver, &problem, flows, NULL, &total_cost, &work, NULL);
+/* ... the program changes some supplies or costs of the same arcs ... */
+status = kahlnws_solver_resolve(solver, &problem, flows, NULL, &total_cost, &work, NULL);
+```
+
+What each entry guarantees:
+
+| | `kahlnws_solver_solve` | `kahlnws_solver_resolve` |
+|---|---|---|
+| status and cost | those of the problem | the same |
+| potentials | prove the flows optimal | prove the flows optimal |
+| flows among tied optima, potentials, work | a function of the problem | of the problem and the solves before it |
+| `first_arc_pivots` | as the problem's structure gives | 0 where it starts from the kept basis |
+
+Each entry keeps the basis an optimal or infeasible answer ended on. A call that answers any other status keeps the
+basis kept before, but `KAHLNWS_STATUS_INTERNAL_ERROR`, which may leave none. Both entries grow the room alike, so
+after `kahlnws_solver_reserve` a resolve allocates nothing either.
 
 ## Statuses
 

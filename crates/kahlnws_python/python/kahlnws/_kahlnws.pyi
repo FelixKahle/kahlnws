@@ -22,7 +22,8 @@ _Column: TypeAlias = Sequence[SupportsIndex] | Buffer | _ArrayExporter
 # A room a solve writes a column of its answer to: a writable buffer of one dimension.
 _Room: TypeAlias = Buffer | _ArrayExporter
 
-# What a solve found where a flow meets the supplies: a `Solution` from `solve`, the cost from `solve_into`.
+# What a solve found where a flow meets the supplies: a `Solution` from `solve` and `resolve`, the cost from
+# `solve_into` and `resolve_into`.
 _Found_co = TypeVar("_Found_co", covariant=True)
 
 __all__ = [
@@ -61,9 +62,16 @@ class NetworkSimplex:
 
     `solve` answers an `Answer[Solution]`, whose outcome owns plain lists; `solve_into` writes into buffers the
     caller owns, made once and reused, and answers an `Answer[int]` with the cost. Both answer the `Work` the solve
-    did. The room is kept from one solve to the next and only grows: a solve of a problem with no more nodes and no
-    more arcs than the room was made for, by `reserve` or by an earlier solve, allocates no room, and a solve that is
-    refused may still have grown it. Nothing of an earlier problem or its answer is kept.
+    did. `resolve` and `resolve_into` take the same arguments and answer the same, starting from the basis the
+    solver's last solve ended on where it serves. The room is kept from one solve to the next and only grows: a solve
+    of a problem with no more nodes and no more arcs than the room was made for, by `reserve` or by an earlier solve,
+    allocates no room, and a solve that is refused may still have grown it.
+
+    The solver also keeps the basis its last solve ended on, by any of the four entries, optimal or infeasible alike;
+    nothing else of an earlier problem or its answer is kept. Only `resolve` and `resolve_into` read it: what `solve`
+    and `solve_into` answer, the work included, is a function of the problem alone. A call that raises before a solve
+    runs, `reserve` included, keeps the basis kept before it: a refused problem, a column or an output that cannot be
+    used, or room that is refused.
 
     The solve runs with the interpreter released, on the solver's own copy of the columns: other threads run
     meanwhile, and nothing they do reaches the solve. A column that another thread writes, without the interpreter,
@@ -135,12 +143,11 @@ class NetworkSimplex:
             MemoryError: The memory for the copy of a column or for the room of the problem is refused.
             RuntimeError: The solver is already in a call.
 
-            What an exporter, a sequence or an entry's `__index__` raises is passed on, with a note that names the
-            argument.
+        What an exporter, a sequence or an entry's `__index__` raises is passed on, with a note that names the argument.
 
         Example:
             >>> solver = kahlnws.NetworkSimplex()
-            >>> solver.solve(tails=[0], heads=[1], capacities=[1], costs=[1], supplies=[2, -2])
+            >>> solver.solve(tails=[0, 1], heads=[1, 0], capacities=[1, 5], costs=[1, 1], supplies=[2, -2])
             Answer(outcome=None, work=Work(pivots=1, degenerate_pivots=0, first_arc_pivots=0))
         """
 
@@ -196,8 +203,7 @@ class NetworkSimplex:
             MemoryError: The memory for the copy of a column or for the room of the problem is refused.
             RuntimeError: The solver is already in a call.
 
-            What an exporter, a sequence or an entry's `__index__` raises is passed on, with a note that names the
-            argument.
+        What an exporter, a sequence or an entry's `__index__` raises is passed on, with a note that names the argument.
 
         Example:
             >>> from array import array
@@ -206,6 +212,130 @@ class NetworkSimplex:
             ...                                             costs=[5, 1, 1], supplies=[4, 0, -4], flows=flows)
             >>> answer.outcome, flows.tolist()
             (14, [2, 2, 2])
+        """
+
+    def resolve(
+        self,
+        *,
+        tails: _Column,
+        heads: _Column,
+        capacities: _Column,
+        costs: _Column,
+        supplies: _Column,
+        lower_bounds: _Column | None = None,
+    ) -> Answer[Solution]:
+        """Solve the problem from the basis the solver's last solve ended on, where it serves, and answer what the solve
+        found with the work it did.
+
+        The basis serves where it is the one the solver's last solve ended on, by any of the four entries, optimal or
+        infeasible, also where that call raised after its solve ended, while its answer was written out; where the
+        problem has that solve's node and arc counts and every arc the tail and the head it had; and where the supplies
+        net of the flows the basis puts on its arcs out of the tree stay within the limit `Breach.NetSupplyBeyondRange`
+        names. The solve then starts from that basis's tree, with every number read anew: where only some numbers
+        changed it often makes far fewer pivots than `solve`, the same problem again makes none, and
+        `work.first_arc_pivots` is 0, since no arc is tried before block search. Where the basis cannot serve, as on a
+        new solver or for a problem of other counts, it answers exactly what `solve` answers, its work included, so any
+        problem is solved after any call.
+
+        It answers the outcome and the cost `solve` answers, with potentials that prove the flows optimal. Of a problem
+        with several optimal flows it may answer another than `solve` does, and other potentials: its flows, potentials
+        and work are a function of the problem and of the solves before it.
+
+        Args:
+            tails: The node each arc leaves, one per arc.
+            heads: The node each arc enters, one per arc.
+            capacities: The most flow of each arc, one per arc.
+            costs: The cost of a unit of flow on each arc, of either sign, one per arc.
+            supplies: The supply of each node: positive where it sends flow, negative where it takes it.
+            lower_bounds: The least flow of each arc, one per arc; left out where every arc's is zero.
+
+        Returns:
+            An `Answer[Solution]`: its `outcome` is the `Solution` (the flows, the potentials that prove them optimal,
+            and the cost), or `None` where no flow within the bounds meets the supplies; its `work` is the `Work` the
+            solve did either way.
+
+        Raises:
+            ProblemError: The problem is one no solve admits; its `breach` says why. A `ValueError`.
+            TypeError: A column is neither a sequence nor a buffer of integers, an entry is no integer, or a buffer's
+                items are no integers in the machine's byte order.
+            OverflowError: An entry lies outside the range of its column.
+            ValueError: A buffer has other than one dimension.
+            MemoryError: The memory for the copy of a column or for the room of the problem is refused.
+            RuntimeError: The solver is already in a call.
+
+        What an exporter, a sequence or an entry's `__index__` raises is passed on, with a note that names the argument.
+
+        Example:
+            >>> solver = kahlnws.NetworkSimplex()
+            >>> depot = dict(tails=[0, 0, 1], heads=[2, 1, 2], capacities=[3, 4, 2], costs=[5, 1, 1])
+            >>> solver.solve(**depot, supplies=[4, 0, -4]).work.pivots
+            4
+            >>> answer = solver.resolve(**depot, supplies=[3, 0, -3])
+            >>> answer.outcome.flows, answer.outcome.total_cost, answer.work.pivots
+            ([1, 2, 2], 9, 0)
+        """
+
+    def resolve_into(
+        self,
+        *,
+        tails: _Column,
+        heads: _Column,
+        capacities: _Column,
+        costs: _Column,
+        supplies: _Column,
+        flows: _Room,
+        lower_bounds: _Column | None = None,
+        potentials: _Room | None = None,
+    ) -> Answer[int]:
+        """Solve the problem from the basis the solver's last solve ended on, where it serves, write its flows, and its
+        potentials where asked, into buffers the caller owns, and answer the cost with the work the solve did.
+
+        It starts from the basis as `resolve` does, and answers what `resolve` answers, the cost in place of the
+        `Solution`: where the basis cannot serve, exactly what `solve_into` answers, its work included. The outputs are
+        checked and written as `solve_into` checks and writes them. Where the room holds the problem, made by `reserve`
+        or by an earlier solve, the solver allocates nothing; what a call still makes is a `memoryview` and an export
+        record for each buffer it is handed, and the answer.
+
+        Args:
+            tails: The node each arc leaves, one per arc.
+            heads: The node each arc enters, one per arc.
+            capacities: The most flow of each arc, one per arc.
+            costs: The cost of a unit of flow on each arc, of either sign, one per arc.
+            supplies: The supply of each node: positive where it sends flow, negative where it takes it.
+            flows: A writable buffer of one dimension with one unsigned 64-bit integer per arc, such as
+                `numpy.empty(arc_count, dtype=numpy.uint64)` or `array.array("Q", ...)`.
+            lower_bounds: The least flow of each arc, one per arc; left out where every arc's is zero.
+            potentials: A writable buffer of one dimension with one signed 64-bit integer per node, such as
+                `numpy.empty(node_count, dtype=numpy.int64)`, sharing no memory with `flows`; left out where the
+                potentials are not wanted.
+
+        Returns:
+            An `Answer[int]`: its `outcome` is the cost of the flow written, an exact `int`, or `None` where no flow
+            within the bounds meets the supplies; its `work` is the `Work` the solve did either way.
+
+        Raises:
+            ProblemError: The problem is one no solve admits; its `breach` says why. A `ValueError`.
+            TypeError: A column is neither a sequence nor a buffer of integers, an entry is no integer, a buffer's
+                items are no integers in the machine's byte order, an output is no buffer, or its items are not
+                exactly the integers written.
+            OverflowError: An entry lies outside the range of its column.
+            ValueError: A buffer has other than one dimension, an output is read-only, of another length than the
+                problem's arcs or nodes, strided with items that cannot be written as they lie, or shares memory with
+                the other.
+            MemoryError: The memory for the copy of a column or for the room of the problem is refused.
+            RuntimeError: The solver is already in a call.
+
+        What an exporter, a sequence or an entry's `__index__` raises is passed on, with a note that names the argument.
+
+        Example:
+            >>> from array import array
+            >>> solver, flows = kahlnws.NetworkSimplex(), array("Q", [0, 0, 0])
+            >>> depot = dict(tails=[0, 0, 1], heads=[2, 1, 2], capacities=[3, 4, 2], costs=[5, 1, 1], flows=flows)
+            >>> solver.solve_into(**depot, supplies=[4, 0, -4]).outcome
+            14
+            >>> answer = solver.resolve_into(**depot, supplies=[3, 0, -3])
+            >>> answer.outcome, answer.work.pivots, flows.tolist()
+            (9, 0, [1, 2, 2])
         """
 
 @final
@@ -217,12 +347,13 @@ class Work:
     place; where the arc's own width is the least, no link leaves and the arc moves to its other bound, a flip, which
     is a pivot too.
 
-    The counts depend on the problem as given, its arc order included, and on the version of the package, as the answer
-    does: the same problem gives the same work from a fresh solver and from one that solved others before. A solve
-    answers `degenerate_pivots <= pivots` and `first_arc_pivots <= pivots`; the pivots that sent flow are
-    `pivots - degenerate_pivots`. The block search that chooses the other pivots runs
-    `pivots - first_arc_pivots + 1` times, once for each of them and once more to find that no arc violates its bound,
-    so it is not counted apart.
+    The counts of `solve` and `solve_into` depend on the problem as given, its arc order included, and on the version
+    of the package, as the answer does: the same problem gives the same work from a fresh solver and from one that
+    solved others before. Those of `resolve` and `resolve_into` depend on the problem and on the solves the solver made
+    before it, and are those of `solve` where the basis it kept cannot serve. A solve answers
+    `degenerate_pivots <= pivots` and `first_arc_pivots <= pivots`; the pivots that sent flow are
+    `pivots - degenerate_pivots`. The block search that chooses the other pivots runs `pivots - first_arc_pivots + 1`
+    times, once for each of them and once more to find that no arc violates its bound, so it is not counted apart.
 
     Plain data: immutable, compared and hashed by value, matched by position in the order of its attributes, copied
     and pickled.
@@ -257,18 +388,18 @@ class Work:
     @property
     def first_arc_pivots(self) -> int:
         """Of the pivots, those made by the arcs the solve tries before block search, chosen from the problem's
-        structure, each where it violated its bound when its turn came. At most `pivots`, and `pivots` where those arcs
-        alone reached the optimum.
+        structure, each where it violated its bound when its turn came. At most `pivots`: 0 in a resolve from the basis
+        the solver kept, which tries none, and `pivots` where those arcs alone reached the optimum.
         """
 
 @final
 class Answer(Generic[_Found_co]):
     """What a solve answers: what it found, and the work it did to find it, as one value.
 
-    `NetworkSimplex.solve` answers an `Answer[Solution]`: its `outcome` is the `Solution`, or `None` where no flow
-    meets the supplies. `NetworkSimplex.solve_into` answers an `Answer[int]`: its `outcome` is the cost of the flow it
-    wrote, or `None`. The work is answered either way. A refused problem raises and answers nothing, since no solve
-    ran.
+    `NetworkSimplex.solve` and `NetworkSimplex.resolve` answer an `Answer[Solution]`: its `outcome` is the `Solution`,
+    or `None` where no flow meets the supplies. `NetworkSimplex.solve_into` and `NetworkSimplex.resolve_into` answer an
+    `Answer[int]`: its `outcome` is the cost of the flow written, or `None`. The work is answered either way. A refused
+    problem raises and answers nothing, since no solve ran.
 
     Plain data: immutable, compared and hashed by value (its outcome and its work), matched by position, copied and
     pickled.
@@ -297,8 +428,8 @@ class Answer(Generic[_Found_co]):
 
     @property
     def outcome(self) -> _Found_co | None:
-        """What the solve found: the `Solution` of `solve` or the cost of `solve_into` where a flow meets the supplies,
-        `None` where none does.
+        """What the solve found: the `Solution` of `solve` and `resolve` or the cost of `solve_into` and `resolve_into`
+        where a flow meets the supplies, `None` where none does.
         """
 
     @property
@@ -309,8 +440,8 @@ class Answer(Generic[_Found_co]):
 class Solution:
     """A flow of least cost, with the potentials that prove it optimal and its cost.
 
-    What `NetworkSimplex.solve` finds for a problem that has a flow. Each attribute answers the same object each time it
-    is read; the lists are the solution's own, and no solve writes them again.
+    What `NetworkSimplex.solve` and `NetworkSimplex.resolve` find for a problem that has a flow. Each attribute answers
+    the same object each time it is read; the lists are the solution's own, and no solve writes them again.
 
     Plain data: compared by value, and hashed by value as the tuple of its parts is, so a solution whose lists the
     caller changes compares and hashes as changed; copied and pickled.
@@ -527,12 +658,13 @@ class Breach:
             """Their sum, in units of flow."""
 
 class ProblemError(ValueError):
-    """A problem no solve admits, raised by `NetworkSimplex.solve` and `NetworkSimplex.solve_into`.
+    """A problem no solve admits, raised by `NetworkSimplex.solve`, `solve_into`, `resolve` and `resolve_into`.
 
     The problem has a table of the wrong length, too many nodes or arcs, an arc whose numbers lie outside the range
     a solve admits, or supplies that do not balance. A problem with several breaches is refused with the first, in the
     order of the classes of `Breach`, where those about one arc are taken arc by arc: the lowest arc with any of them,
-    and its first. A refused solve answers no work, and may still have grown the solver's room.
+    and its first. A refused solve answers no work, keeps the basis the solver kept, and may still have grown the
+    solver's room.
 
     Attributes:
         breach: The breach as a `Breach`, whose class names the kind and whose attributes hold the values; `None` on a

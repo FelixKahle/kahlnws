@@ -14,12 +14,13 @@ use pyo3::types::{PyTuple, PyType};
 /// place; where the arc's own width is the least, no link leaves and the arc moves to its other bound, a flip, which
 /// is a pivot too.
 ///
-/// The counts depend on the problem as given, its arc order included, and on the version of the package, as the answer
-/// does: the same problem gives the same work from a fresh solver and from one that solved others before. A solve
-/// answers `degenerate_pivots <= pivots` and `first_arc_pivots <= pivots`; the pivots that sent flow are
-/// `pivots - degenerate_pivots`. The block search that chooses the other pivots runs
-/// `pivots - first_arc_pivots + 1` times, once for each of them and once more to find that no arc violates its bound,
-/// so it is not counted apart.
+/// The counts of `solve` and `solve_into` depend on the problem as given, its arc order included, and on the version
+/// of the package, as the answer does: the same problem gives the same work from a fresh solver and from one that
+/// solved others before. Those of `resolve` and `resolve_into` depend on the problem and on the solves the solver made
+/// before it, and are those of `solve` where the basis it kept cannot serve. A solve answers
+/// `degenerate_pivots <= pivots` and `first_arc_pivots <= pivots`; the pivots that sent flow are
+/// `pivots - degenerate_pivots`. The block search that chooses the other pivots runs `pivots - first_arc_pivots + 1`
+/// times, once for each of them and once more to find that no arc violates its bound, so it is not counted apart.
 ///
 /// Plain data: immutable, compared and hashed by value, matched by position in the order of its attributes, copied
 /// and pickled.
@@ -47,18 +48,18 @@ pub(crate) struct Work {
     #[pyo3(get)]
     degenerate_pivots: u64,
     /// Of the pivots, those made by the arcs the solve tries before block search, chosen from the problem's
-    /// structure, each where it violated its bound when its turn came. At most `pivots`, and `pivots` where those arcs
-    /// alone reached the optimum.
+    /// structure, each where it violated its bound when its turn came. At most `pivots`: 0 in a resolve from the basis
+    /// the solver kept, which tries none, and `pivots` where those arcs alone reached the optimum.
     #[pyo3(get)]
     first_arc_pivots: u64,
 }
 
 /// What a solve answers: what it found, and the work it did to find it, as one value.
 ///
-/// `NetworkSimplex.solve` answers an `Answer[Solution]`: its `outcome` is the `Solution`, or `None` where no flow
-/// meets the supplies. `NetworkSimplex.solve_into` answers an `Answer[int]`: its `outcome` is the cost of the flow it
-/// wrote, or `None`. The work is answered either way. A refused problem raises and answers nothing, since no solve
-/// ran.
+/// `NetworkSimplex.solve` and `NetworkSimplex.resolve` answer an `Answer[Solution]`: its `outcome` is the `Solution`,
+/// or `None` where no flow meets the supplies. `NetworkSimplex.solve_into` and `NetworkSimplex.resolve_into` answer an
+/// `Answer[int]`: its `outcome` is the cost of the flow written, or `None`. The work is answered either way. A refused
+/// problem raises and answers nothing, since no solve ran.
 ///
 /// Plain data: immutable, compared and hashed by value (its outcome and its work), matched by position, copied and
 /// pickled.
@@ -74,8 +75,8 @@ pub(crate) struct Work {
 #[pyclass(module = "kahlnws", frozen)]
 #[derive(Debug)]
 pub(crate) struct Answer {
-    /// What the solve found: the `Solution` of `solve` or the cost of `solve_into` where a flow meets the supplies,
-    /// `None` where none does.
+    /// What the solve found: the `Solution` of `solve` and `resolve` or the cost of `solve_into` and `resolve_into`
+    /// where a flow meets the supplies, `None` where none does.
     #[pyo3(get)]
     outcome: Py<PyAny>,
     /// The work the solve did, optimal or infeasible alike.

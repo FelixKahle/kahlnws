@@ -1,7 +1,8 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The solver C holds a pointer to, and what a reservation and a solve do once every pointer has been read.
+//! The solver C holds a pointer to, and what a reservation and a solve by either entry do once every pointer has been
+//! read.
 
 use core::mem::MaybeUninit;
 
@@ -16,8 +17,10 @@ use crate::work::Work;
 ///
 /// Opaque: C holds it only by the pointer `kahlnws_solver_new` answers, passes that pointer to the other entries, and
 /// gives it back to `kahlnws_solver_free`. The room only grows, by `kahlnws_solver_reserve` or by a solve of a
-/// problem larger than the room held; a solve of a problem within the room allocates nothing. Nothing of an earlier
-/// problem or of what a solve of it found is kept: what a solve finds depends on its problem alone.
+/// problem larger than the room held; a solve of a problem within the room allocates nothing.
+///
+/// It also keeps the basis its last solve ended on, by either entry, optimal or infeasible, which only
+/// `kahlnws_solver_resolve` reads: what `kahlnws_solver_solve` finds depends on its problem alone.
 ///
 /// One thread at a time uses a solver: no two calls that take the same solver may run at once. A solver may move
 /// from one thread to another between calls, and distinct solvers may be used on distinct threads at once.
@@ -30,8 +33,8 @@ pub struct Solver {
     flows: Vec<u64>,
 }
 
-/// One call of `kahlnws_solver_solve`, its pointers read: the problem, and where what the solve finds goes. The
-/// outputs are written, never read, so their storage need not hold values before the call.
+/// One call of `kahlnws_solver_solve` or `kahlnws_solver_resolve`, its pointers read: the problem, and where what the
+/// solve finds goes. The outputs are written, never read, so their storage need not hold values before the call.
 ///
 /// # Invariant
 /// Only [`Call::new`] makes one: every per-arc table of `problem` holds one entry per tail, so a solve never refuses
@@ -52,6 +55,15 @@ pub(crate) struct Call<'a> {
     refusal: Option<&'a mut MaybeUninit<Refusal>>,
 }
 
+/// The entry a solve is called by, which decides the basis it starts from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Entry {
+    /// `kahlnws_solver_solve`: from the problem alone.
+    Solve,
+    /// `kahlnws_solver_resolve`: from the basis the solver's last solve ended on, where it serves the problem.
+    Resolve,
+}
+
 impl Solver {
     /// A solver that holds no room yet; it allocates nothing.
     pub(crate) const fn new() -> Self {
@@ -70,11 +82,12 @@ impl Solver {
         }
     }
 
-    /// Solves the problem of `call`, writes what it found and its work where `call` says, and answers how it went:
-    /// [`Status::Optimal`], [`Status::Infeasible`], [`Status::Refused`], or [`Status::NoRoom`] where the memory for
-    /// the room the problem needs is refused. Only an optimal solve writes the flows, the potentials and the cost, an
-    /// optimal or an infeasible one the work, and only a refused one the refusal.
-    pub(crate) fn solve(&mut self, mut call: Call<'_>) -> Status {
+    /// Solves the problem of `call` as `entry` does, writes what it found and its work where `call` says, and answers
+    /// how it went: [`Status::Optimal`], [`Status::Infeasible`], [`Status::Refused`], or [`Status::NoRoom`] where the
+    /// memory for the room the problem needs is refused. Only an optimal solve writes the flows, the potentials and
+    /// the cost, an optimal or an infeasible one the work, and only a refused one the refusal. A solve that answers
+    /// keeps the basis it ended on; one that does not keeps the basis kept before.
+    pub(crate) fn solve(&mut self, entry: Entry, mut call: Call<'_>) -> Status {
         // The room is made before the solve, by a reservation that can be refused: a solve that grew its own room
         // could only end the process where the memory runs out.
         if self.reserve(call.node_count(), call.arc_count()) == Status::NoRoom {
@@ -85,7 +98,11 @@ impl Solver {
         // the solve writes every flow it answers and nothing reads them before.
         self.flows.resize(call.arc_count(), 0);
 
-        let Answer { outcome, work } = match self.simplex.solve_into(&call.problem, &mut self.flows) {
+        let answered = match entry {
+            Entry::Solve => self.simplex.solve_into(&call.problem, &mut self.flows),
+            Entry::Resolve => self.simplex.resolve_into(&call.problem, &mut self.flows),
+        };
+        let Answer { outcome, work } = match answered {
             Ok(answer) => answer,
             Err(breach) => {
                 call.write_refusal(breach);
@@ -245,9 +262,9 @@ mod tests {
         }
     }
 
-    /// Solves `problem` with `solver`, every output given and starting as [`untouched`] says, and answers what it
-    /// wrote.
-    fn solved(solver: &mut Solver, problem: kahlnws::Problem<'_>) -> Written {
+    /// Solves `problem` with `solver` as `entry` does, every output given and starting as [`untouched`] says, and
+    /// answers what it wrote.
+    fn solved(solver: &mut Solver, entry: Entry, problem: kahlnws::Problem<'_>) -> Written {
         let before = untouched(problem, Status::Optimal);
         let mut flows: Vec<_> = before.flows.into_iter().map(MaybeUninit::new).collect();
         let mut potentials: Vec<_> = before.potentials.into_iter().map(MaybeUninit::new).collect();
@@ -263,7 +280,7 @@ mod tests {
             Some(&mut work),
             Some(&mut refusal),
         );
-        let status = solver.solve(call);
+        let status = solver.solve(entry, call);
 
         Written {
             status,
@@ -280,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_an_optimal_solve_writes_the_flows_the_potentials_the_cost_and_the_work() {
-        let written = solved(&mut Solver::new(), depot());
+        let written = solved(&mut Solver::new(), Entry::Solve, depot());
 
         assert_eq!(
             written,
@@ -303,7 +320,7 @@ mod tests {
         let mut work = MaybeUninit::uninit();
         let call = Call::new(depot(), &mut flows, Some(&mut potentials), Some(&mut total_cost), Some(&mut work), None);
 
-        assert_eq!(Solver::new().solve(call), Status::Optimal);
+        assert_eq!(Solver::new().solve(Entry::Solve, call), Status::Optimal);
         assert_eq!((written(&flows), written(&potentials)), (vec![2, 2, 2], vec![0, 1, 5]));
         assert_eq!((written_one(&total_cost), written_one(&work)), (Int128 { low: 14, high: 0 }, DEPOT_WORK));
     }
@@ -323,7 +340,10 @@ mod tests {
 
         let work = Work { pivots: 1, degenerate_pivots: 0, first_arc_pivots: 0 };
 
-        assert_eq!(solved(&mut Solver::new(), problem), Written { work, ..untouched(problem, Status::Infeasible) });
+        assert_eq!(
+            solved(&mut Solver::new(), Entry::Solve, problem),
+            Written { work, ..untouched(problem, Status::Infeasible) }
+        );
     }
 
     #[test]
@@ -331,7 +351,10 @@ mod tests {
         let problem = kahlnws::Problem { supplies: &[4, 0, -3], ..depot() };
         let refusal = Refusal::of(ProblemError::Unbalanced { total: 1 });
 
-        assert_eq!(solved(&mut Solver::new(), problem), Written { refusal, ..untouched(problem, Status::Refused) });
+        assert_eq!(
+            solved(&mut Solver::new(), Entry::Solve, problem),
+            Written { refusal, ..untouched(problem, Status::Refused) }
+        );
     }
 
     #[test]
@@ -339,7 +362,7 @@ mod tests {
         let mut flows = [MaybeUninit::uninit(); 3];
         let call = Call::new(depot(), &mut flows, None, None, None, None);
 
-        assert_eq!(Solver::new().solve(call), Status::Optimal);
+        assert_eq!(Solver::new().solve(Entry::Solve, call), Status::Optimal);
         assert_eq!(written(&flows), [2, 2, 2]);
     }
 
@@ -351,7 +374,7 @@ mod tests {
         assert!(solver.flows.capacity() >= 3, "the flows have room for three arcs");
         assert_eq!(solver.reserve(usize::MAX, 0), Status::NoRoom);
         assert_eq!(solver.reserve(0, usize::MAX), Status::NoRoom);
-        assert_eq!(solved(&mut solver, depot()).status, Status::Optimal);
+        assert_eq!(solved(&mut solver, Entry::Solve, depot()).status, Status::Optimal);
     }
 
     #[test]
@@ -367,9 +390,61 @@ mod tests {
         let mut solver = Solver::new();
         let refused = kahlnws::Problem { supplies: &[4, 0, -3], ..depot() };
 
-        assert_eq!(solved(&mut solver, refused).status, Status::Refused);
-        assert_eq!(solved(&mut solver, depot()), solved(&mut Solver::new(), depot()));
-        assert_eq!(solved(&mut solver, refused), solved(&mut Solver::new(), refused));
+        assert_eq!(solved(&mut solver, Entry::Solve, refused).status, Status::Refused);
+        assert_eq!(solved(&mut solver, Entry::Solve, depot()), solved(&mut Solver::new(), Entry::Solve, depot()));
+        assert_eq!(solved(&mut solver, Entry::Solve, refused), solved(&mut Solver::new(), Entry::Solve, refused));
+    }
+
+    #[test]
+    fn test_a_resolve_of_the_problem_solved_last_makes_no_pivot_and_answers_its_optimum() {
+        let mut solver = Solver::new();
+        let first = solved(&mut solver, Entry::Solve, depot());
+
+        // The basis the solve ended on is the optimum of the same numbers: nothing violates, and nothing moves.
+        let again = solved(&mut solver, Entry::Resolve, depot());
+        assert_eq!(first.work, DEPOT_WORK);
+        assert_eq!(again, Written { work: Work::default(), ..first });
+    }
+
+    #[test]
+    fn test_a_resolve_of_a_solver_that_never_solved_answers_what_a_solve_answers() {
+        let infeasible = kahlnws::Problem { capacities: &[1, 1, 1], ..depot() };
+        let refused = kahlnws::Problem { supplies: &[4, 0, -3], ..depot() };
+
+        for problem in [depot(), infeasible, refused] {
+            let resolved = solved(&mut Solver::new(), Entry::Resolve, problem);
+
+            assert_eq!(resolved, solved(&mut Solver::new(), Entry::Solve, problem), "{problem:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_resolve_of_other_counts_answers_what_a_solve_answers() {
+        // The chain has four nodes where the depot has three: the depot's basis cannot serve it.
+        let chain = kahlnws::Problem {
+            tails: &[0, 1, 2],
+            heads: &[1, 2, 3],
+            lower_bounds: None,
+            capacities: &[5, 5, 5],
+            costs: &[1, 1, 1],
+            supplies: &[2, 0, 0, -2],
+        };
+        let mut solver = Solver::new();
+        assert_eq!(solved(&mut solver, Entry::Solve, depot()).status, Status::Optimal);
+
+        assert_eq!(solved(&mut solver, Entry::Resolve, chain), solved(&mut Solver::new(), Entry::Solve, chain));
+    }
+
+    #[test]
+    fn test_a_refused_resolve_and_a_refused_reservation_keep_the_basis() {
+        let mut solver = Solver::new();
+        assert_eq!(solved(&mut solver, Entry::Solve, depot()).work, DEPOT_WORK);
+
+        let refused = kahlnws::Problem { supplies: &[4, 0, -3], ..depot() };
+        assert_eq!(solved(&mut solver, Entry::Resolve, refused).status, Status::Refused);
+        assert_eq!(solver.reserve(usize::MAX, 0), Status::NoRoom);
+
+        assert_eq!(solved(&mut solver, Entry::Resolve, depot()).work, Work::default());
     }
 
     #[test]

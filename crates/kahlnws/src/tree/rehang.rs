@@ -367,7 +367,7 @@ fn old_side_end(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::{BTreeSet, HashSet, VecDeque};
 
     use proptest::collection::vec;
@@ -379,8 +379,8 @@ mod tests {
     use super::*;
     use crate::tree::cycle::tests::cycle_walk;
     use crate::tree::plain_tree::{PlainColumns, PlainTree, link_count_of, plain_trees, seven_nodes};
-    use crate::tree::spanning_tree::TreeRoom;
     use crate::tree::spanning_tree::tests::{columns_of, load, plain_tree_of, tree_node, tree_of};
+    use crate::tree::spanning_tree::{LentTree, TreeRoom};
 
     /// The nodes of `moving` as plain numbers: `enter`, `attach`, `cut`, `join`, `cut`'s old parent, the node before
     /// it in the thread, and the last node of `S`.
@@ -396,7 +396,7 @@ mod tests {
     /// # Panics
     /// Panics if that walk does not find `cut`.
     fn exchange_keeping<'t>(
-        tree: &'t mut SpanningTree<'_>,
+        tree: &'t mut LentTree<'_>,
         [first, second]: [usize; 2],
         side: Side,
         cut: usize,
@@ -732,7 +732,7 @@ mod tests {
 
     /// The choices of one exchange, each read against the tree it is made on.
     #[derive(Clone, Copy, Debug)]
-    struct ExchangePick {
+    pub(in crate::tree) struct ExchangePick {
         /// What the pick aims at.
         aim: Aim,
         /// The leaving node, among those the aim allows.
@@ -751,7 +751,7 @@ mod tests {
 
     /// What one exchange was. Plain data.
     #[derive(Clone, Copy, Debug)]
-    struct Kind {
+    pub(in crate::tree) struct Kind {
         /// The side of the cycle the leaving node lay on.
         side: Side,
         /// The number of stem nodes.
@@ -767,13 +767,13 @@ mod tests {
     /// A loaded tree with its model and the cost of each link, which exchange after exchange on that one tree keep
     /// agreeing.
     #[derive(Debug)]
-    struct ExchangeRun<'r> {
+    pub(in crate::tree) struct ExchangeRun<'r> {
         /// The tree under test, loaded once for the whole run.
-        tree: SpanningTree<'r>,
+        pub(in crate::tree) tree: LentTree<'r>,
         /// Its model.
-        model: PlainTree,
+        pub(in crate::tree) model: PlainTree,
         /// Per link: its cost, under which every tree link is tight.
-        costs: Vec<i64>,
+        pub(in crate::tree) costs: Vec<i64>,
     }
 
     impl<'r> ExchangeRun<'r> {
@@ -784,7 +784,12 @@ mod tests {
 
         /// The run of the star `room` makes of `directions` after arcs costing `arc_costs`, a root link pointing down
         /// costing `root_cost`.
-        fn star(room: &'r mut TreeRoom, directions: &[Direction], arc_costs: &[i64], root_cost: i64) -> Self {
+        pub(in crate::tree) fn star(
+            room: &'r mut TreeRoom,
+            directions: &[Direction],
+            arc_costs: &[i64],
+            root_cost: i64,
+        ) -> Self {
             let tree = room.star(directions.len(), arc_costs.len(), directions.iter().copied(), root_cost);
             let root_links = directions.iter().map(|direction| match direction {
                 Direction::Up => 0,
@@ -851,7 +856,8 @@ mod tests {
     /// The exchanges one property case makes, each checked against the model.
     const EXCHANGES: usize = 48;
 
-    fn exchange_picks() -> impl Strategy<Value = ExchangePick> {
+    /// One exchange a test aims at, drawn.
+    pub(in crate::tree) fn exchange_picks() -> impl Strategy<Value = ExchangePick> {
         let aims = prop_oneof![
             4 => Just(Aim::Any),
             1 => Just(Aim::StemOfOne),
@@ -889,7 +895,10 @@ mod tests {
 
     /// Runs `picks` on `run`, one exchange after another on its one tree, failing at the first exchange whose tree
     /// the model does not rebuild.
-    fn run_exchanges(run: &mut ExchangeRun<'_>, picks: &[ExchangePick]) -> Result<Vec<Kind>, TestCaseError> {
+    pub(in crate::tree) fn run_exchanges(
+        run: &mut ExchangeRun<'_>,
+        picks: &[ExchangePick],
+    ) -> Result<Vec<Kind>, TestCaseError> {
         let mut kinds = Vec::with_capacity(picks.len());
         for (number, &pick) in picks.iter().enumerate() {
             let kind =

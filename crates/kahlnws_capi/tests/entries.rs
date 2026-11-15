@@ -7,11 +7,16 @@
 //! valid, and counts past `isize::MAX` bytes; the outputs as they were on every status but optimal, the work written
 //! on infeasible too; a reservation; a solver reused; the cost bound, the status names and the version.
 //!
-//! Two answers of `kahlnws_solver_solve` are not reached here. `KAHLNWS_STATUS_NO_ROOM` needs counts whose room the
+//! `kahlnws_solver_resolve` takes the arguments `kahlnws_solver_solve` takes, and every test of pointers and storage
+//! calls both. A resolve of a solver that never solved answers each problem as a solve does; one of the problem solved
+//! last makes no pivot, one of fewer units moves them along the kept tree without a pivot, one of other counts
+//! answers as a solve, and a refused call between a solve and a resolve keeps the basis.
+//!
+//! Two answers of the entries that solve are not reached here. `KAHLNWS_STATUS_NO_ROOM` needs counts whose room the
 //! memory refuses, and a refusal as too large needs `2^32` nodes or arcs; both need tables of that many entries, more
 //! than a test holds, since the tables are lent for the counts before the room is made. The refusal as too large is
 //! checked through `kahlnws_refusal_message` from a refusal made by hand, and the room's refusal through
-//! `kahlnws_solver_reserve`, which `kahlnws_solver_solve` makes its room by.
+//! `kahlnws_solver_reserve`, which both entries make their room by.
 
 use core::ffi::{CStr, c_char};
 use core::mem::MaybeUninit;
@@ -19,9 +24,25 @@ use core::ptr;
 
 use kahlnws_capi::{
     Int128, Problem, Refusal, RefusalKind, Solver, StatusCode, UInt128, Work, kahlnws_cost_bound,
-    kahlnws_refusal_message, kahlnws_solver_free, kahlnws_solver_new, kahlnws_solver_reserve, kahlnws_solver_solve,
-    kahlnws_status_name, kahlnws_version,
+    kahlnws_refusal_message, kahlnws_solver_free, kahlnws_solver_new, kahlnws_solver_reserve, kahlnws_solver_resolve,
+    kahlnws_solver_solve, kahlnws_status_name, kahlnws_version,
 };
+
+/// An entry that solves, as C declares `kahlnws_solver_solve` and `kahlnws_solver_resolve`, which take the same
+/// arguments.
+type SolveEntry = unsafe extern "C" fn(
+    *mut Solver,
+    *const Problem,
+    *mut u64,
+    *mut i64,
+    *mut Int128,
+    *mut Work,
+    *mut Refusal,
+) -> StatusCode;
+
+/// Both entries that solve, each with its name.
+const SOLVE_ENTRIES: [(&str, SolveEntry); 2] =
+    [("kahlnws_solver_solve", kahlnws_solver_solve), ("kahlnws_solver_resolve", kahlnws_solver_resolve)];
 
 /// The tables of a problem, owned by the test; [`Tables::problem`] points a `kahlnws_problem` at them.
 #[derive(Clone, Debug, Default)]
@@ -108,14 +129,14 @@ fn new_solver() -> *mut Solver {
     solver
 }
 
-/// Solves `tables` with `solver` into `outputs`, every output given, and answers the status.
-fn solve(solver: *mut Solver, tables: &Tables, outputs: &mut Outputs) -> StatusCode {
+/// Solves `tables` with `solver` by `entry` into `outputs`, every output given, and answers the status.
+fn solve(entry: SolveEntry, solver: *mut Solver, tables: &Tables, outputs: &mut Outputs) -> StatusCode {
     let problem = tables.problem();
 
     // SAFETY: `solver` is the test's live solver; the problem points into `tables` and every output into `outputs`,
     // each for the counts the problem states, and nothing else uses them during the call.
     unsafe {
-        kahlnws_solver_solve(
+        entry(
             solver,
             &raw const problem,
             outputs.flows.as_mut_ptr(),
@@ -127,11 +148,11 @@ fn solve(solver: *mut Solver, tables: &Tables, outputs: &mut Outputs) -> StatusC
     }
 }
 
-/// What a fresh solver answers and writes for `tables`.
-fn solved(tables: &Tables) -> (StatusCode, Outputs) {
+/// What a fresh solver answers and writes for `tables` by `entry`.
+fn solved(entry: SolveEntry, tables: &Tables) -> (StatusCode, Outputs) {
     let solver = new_solver();
     let mut outputs = Outputs::marked(tables);
-    let status = solve(solver, tables, &mut outputs);
+    let status = solve(entry, solver, tables, &mut outputs);
     // SAFETY: `solver` is the live solver made above, used by nothing else from here on.
     unsafe { kahlnws_solver_free(solver) };
 
@@ -154,7 +175,7 @@ fn message(refusal: &Refusal, capacity: usize) -> (Vec<u8>, usize) {
 /// # Panics
 /// Panics if `tables` is not refused, or the message is not whole, NUL-terminated UTF-8.
 fn refused_with(tables: &Tables) -> (Refusal, String) {
-    let (status, outputs) = solved(tables);
+    let (status, outputs) = solved(kahlnws_solver_solve, tables);
     assert_eq!(status, StatusCode::REFUSED, "the problem should be refused");
     assert_eq!(
         Outputs { refusal: Refusal { arc: 7, ..Refusal::default() }, ..outputs.clone() },
@@ -198,7 +219,7 @@ fn chain() -> Tables {
 
 #[test]
 fn test_the_depot_is_solved_with_its_flows_potentials_and_cost() {
-    let (status, outputs) = solved(&depot());
+    let (status, outputs) = solved(kahlnws_solver_solve, &depot());
 
     assert_eq!(status, StatusCode::OPTIMAL);
     assert_eq!(
@@ -217,14 +238,14 @@ fn test_the_depot_is_solved_with_its_flows_potentials_and_cost() {
 fn test_lower_bounds_given_as_zeros_answer_as_none_given() {
     let zeros = Tables { lower_bounds: vec![0; 3], ..depot() };
 
-    assert_eq!(solved(&zeros), solved(&depot()));
+    assert_eq!(solved(kahlnws_solver_solve, &zeros), solved(kahlnws_solver_solve, &depot()));
 }
 
 #[test]
 fn test_lower_bounds_are_carried() {
     // Arc 0 must carry 3, its capacity: one unit is left to go through the hub, at a cost of `3 · 5 + 1 + 1 = 17`.
     let bounded = Tables { lower_bounds: vec![3, 0, 0], ..depot() };
-    let (status, outputs) = solved(&bounded);
+    let (status, outputs) = solved(kahlnws_solver_solve, &bounded);
 
     assert_eq!(status, StatusCode::OPTIMAL);
     assert_eq!((outputs.flows, outputs.total_cost), (vec![3, 1, 1], Int128 { low: 17, high: 0 }));
@@ -241,7 +262,7 @@ fn test_a_negative_cost_comes_back_in_two_halves() {
         costs: vec![-5],
         supplies: vec![1, -1],
     };
-    let (status, outputs) = solved(&tables);
+    let (status, outputs) = solved(kahlnws_solver_solve, &tables);
 
     assert_eq!(status, StatusCode::OPTIMAL);
     assert_eq!(outputs.total_cost, Int128 { low: u64::MAX - 4, high: -1 });
@@ -262,43 +283,52 @@ fn test_an_infeasible_cut_writes_the_work_alone() {
     };
     let work = Work { pivots: 1, degenerate_pivots: 0, first_arc_pivots: 0 };
 
-    assert_eq!(solved(&tables), (StatusCode::INFEASIBLE, Outputs { work, ..Outputs::marked(&tables) }));
-    assert_eq!(solved(&narrow_depot()).1, Outputs { work: NARROW_DEPOT_WORK, ..Outputs::marked(&narrow_depot()) });
+    assert_eq!(
+        solved(kahlnws_solver_solve, &tables),
+        (StatusCode::INFEASIBLE, Outputs { work, ..Outputs::marked(&tables) })
+    );
+    assert_eq!(
+        solved(kahlnws_solver_solve, &narrow_depot()).1,
+        Outputs { work: NARROW_DEPOT_WORK, ..Outputs::marked(&narrow_depot()) }
+    );
 }
 
 #[test]
 fn test_a_problem_of_no_node_and_no_arc_needs_no_storage() {
-    let problem = Problem {
-        node_count: 0,
-        arc_count: 0,
-        tails: ptr::null(),
-        heads: ptr::null(),
-        lower_bounds: ptr::null(),
-        capacities: ptr::null(),
-        costs: ptr::null(),
-        supplies: ptr::null(),
-    };
-    let solver = new_solver();
-    let mut total_cost = Int128 { low: 7, high: 7 };
-    let mut work = Work { pivots: 7, degenerate_pivots: 7, first_arc_pivots: 7 };
+    for (name, entry) in SOLVE_ENTRIES {
+        let problem = Problem {
+            node_count: 0,
+            arc_count: 0,
+            tails: ptr::null(),
+            heads: ptr::null(),
+            lower_bounds: ptr::null(),
+            capacities: ptr::null(),
+            costs: ptr::null(),
+            supplies: ptr::null(),
+        };
+        let solver = new_solver();
+        let mut total_cost = Int128 { low: 7, high: 7 };
+        let mut work = Work { pivots: 7, degenerate_pivots: 7, first_arc_pivots: 7 };
 
-    // SAFETY: the solver is live; every count is zero, so no table and no flow is read, and the cost and the work are
-    // the test's.
-    let status = unsafe {
-        kahlnws_solver_solve(
-            solver,
-            &raw const problem,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &raw mut total_cost,
-            &raw mut work,
-            ptr::null_mut(),
-        )
-    };
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
+        // SAFETY: the solver is live; every count is zero, so no table and no flow is read, and the cost and the work
+        // are the test's.
+        let status = unsafe {
+            entry(
+                solver,
+                &raw const problem,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &raw mut total_cost,
+                &raw mut work,
+                ptr::null_mut(),
+            )
+        };
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
 
-    assert_eq!((status, total_cost, work), (StatusCode::OPTIMAL, Int128::default(), Work::default()), "no pivot");
+        let expected = (StatusCode::OPTIMAL, Int128::default(), Work::default());
+        assert_eq!((status, total_cost, work), expected, "{name}: no pivot");
+    }
 }
 
 #[test]
@@ -493,95 +523,100 @@ fn test_a_message_is_written_into_storage_that_held_no_values() {
 
 #[test]
 fn test_a_null_pointer_in_every_needed_position_writes_nothing() {
-    let tables = depot();
-    let problem = tables.problem();
-    let refused = [
-        Problem { tails: ptr::null(), ..problem },
-        Problem { heads: ptr::null(), ..problem },
-        Problem { capacities: ptr::null(), ..problem },
-        Problem { costs: ptr::null(), ..problem },
-        Problem { supplies: ptr::null(), ..problem },
-    ];
-    let solver = new_solver();
+    for (name, entry) in SOLVE_ENTRIES {
+        let tables = depot();
+        let problem = tables.problem();
+        let refused = [
+            Problem { tails: ptr::null(), ..problem },
+            Problem { heads: ptr::null(), ..problem },
+            Problem { capacities: ptr::null(), ..problem },
+            Problem { costs: ptr::null(), ..problem },
+            Problem { supplies: ptr::null(), ..problem },
+        ];
+        let solver = new_solver();
 
-    for problem in refused {
+        for problem in refused {
+            let mut outputs = Outputs::marked(&tables);
+            // SAFETY: the solver is live; every table of the problem but the null one points into `tables`, the null
+            // one is checked and never read; every output points into `outputs` for the problem's counts.
+            let status = unsafe {
+                entry(
+                    solver,
+                    &raw const problem,
+                    outputs.flows.as_mut_ptr(),
+                    outputs.potentials.as_mut_ptr(),
+                    &raw mut outputs.total_cost,
+                    &raw mut outputs.work,
+                    &raw mut outputs.refusal,
+                )
+            };
+            assert_eq!((status, outputs), (StatusCode::NULL_POINTER, Outputs::marked(&tables)), "{name}, {problem:?}");
+        }
+
         let mut outputs = Outputs::marked(&tables);
-        // SAFETY: the solver is live; every table of the problem but the null one points into `tables`, the null one
-        // is checked and never read; every output points into `outputs` for the problem's counts.
-        let status = unsafe {
-            kahlnws_solver_solve(
-                solver,
-                &raw const problem,
-                outputs.flows.as_mut_ptr(),
-                outputs.potentials.as_mut_ptr(),
-                &raw mut outputs.total_cost,
-                &raw mut outputs.work,
-                &raw mut outputs.refusal,
-            )
+        let (flows, potentials) = (outputs.flows.as_mut_ptr(), outputs.potentials.as_mut_ptr());
+        let (total_cost, work, refusal) =
+            (&raw mut outputs.total_cost, &raw mut outputs.work, &raw mut outputs.refusal);
+        // SAFETY: each call passes the live solver, the depot and the test's outputs, but for the one null pointer,
+        // which is checked and never read.
+        let statuses = unsafe {
+            [
+                entry(ptr::null_mut(), &raw const problem, flows, potentials, total_cost, work, refusal),
+                entry(solver, ptr::null(), flows, potentials, total_cost, work, refusal),
+                entry(solver, &raw const problem, ptr::null_mut(), potentials, total_cost, work, refusal),
+            ]
         };
-        assert_eq!((status, outputs), (StatusCode::NULL_POINTER, Outputs::marked(&tables)), "{problem:?}");
+        assert_eq!(statuses, [StatusCode::NULL_POINTER; 3], "{name}");
+        assert_eq!(outputs, Outputs::marked(&tables), "{name}");
+
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
     }
-
-    let mut outputs = Outputs::marked(&tables);
-    let (flows, potentials) = (outputs.flows.as_mut_ptr(), outputs.potentials.as_mut_ptr());
-    let (total_cost, work, refusal) = (&raw mut outputs.total_cost, &raw mut outputs.work, &raw mut outputs.refusal);
-    // SAFETY: each call passes the live solver, the depot and the test's outputs, but for the one null pointer, which
-    // is checked and never read.
-    let statuses = unsafe {
-        [
-            kahlnws_solver_solve(ptr::null_mut(), &raw const problem, flows, potentials, total_cost, work, refusal),
-            kahlnws_solver_solve(solver, ptr::null(), flows, potentials, total_cost, work, refusal),
-            kahlnws_solver_solve(solver, &raw const problem, ptr::null_mut(), potentials, total_cost, work, refusal),
-        ]
-    };
-    assert_eq!(statuses, [StatusCode::NULL_POINTER; 3]);
-    assert_eq!(outputs, Outputs::marked(&tables));
-
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
 }
 
 #[test]
 fn test_outputs_passed_as_null_are_not_wanted() {
-    let tables = depot();
-    let problem = tables.problem();
-    let solver = new_solver();
-    let mut flows = [7; 3];
+    for (name, entry) in SOLVE_ENTRIES {
+        let tables = depot();
+        let problem = tables.problem();
+        let solver = new_solver();
+        let mut flows = [7; 3];
 
-    // SAFETY: the solver is live, the problem points into `tables` and the flows into `flows`; the other outputs are
-    // null, which asks for none of them.
-    let status = unsafe {
-        kahlnws_solver_solve(
-            solver,
-            &raw const problem,
-            flows.as_mut_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    assert_eq!((status, flows), (StatusCode::OPTIMAL, [2, 2, 2]));
+        // SAFETY: the solver is live, the problem points into `tables` and the flows into `flows`; the other outputs
+        // are null, which asks for none of them.
+        let status = unsafe {
+            entry(
+                solver,
+                &raw const problem,
+                flows.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!((status, flows), (StatusCode::OPTIMAL, [2, 2, 2]), "{name}");
 
-    let unbalanced = Tables { supplies: vec![4, 0, -3], ..depot() };
-    let problem = unbalanced.problem();
-    // SAFETY: the solver is live, the problem points into `unbalanced` and the flows into `flows`; the other outputs
-    // are null, which asks for none of them.
-    let status = unsafe {
-        kahlnws_solver_solve(
-            solver,
-            &raw const problem,
-            flows.as_mut_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    assert_eq!((status, flows), (StatusCode::REFUSED, [2, 2, 2]), "a refusal with nowhere to go");
+        let unbalanced = Tables { supplies: vec![4, 0, -3], ..depot() };
+        let problem = unbalanced.problem();
+        // SAFETY: the solver is live, the problem points into `unbalanced` and the flows into `flows`; the other
+        // outputs are null, which asks for none of them.
+        let status = unsafe {
+            entry(
+                solver,
+                &raw const problem,
+                flows.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!((status, flows), (StatusCode::REFUSED, [2, 2, 2]), "{name}: a refusal with nowhere to go");
 
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
+    }
 }
 
 #[test]
@@ -600,8 +635,12 @@ fn test_a_reservation_answers_reserved_no_room_or_a_null_pointer() {
     assert_eq!(statuses, [StatusCode::RESERVED, StatusCode::NO_ROOM, StatusCode::NO_ROOM, StatusCode::NULL_POINTER]);
 
     let mut outputs = Outputs::marked(&depot());
-    assert_eq!(solve(solver, &depot(), &mut outputs), StatusCode::OPTIMAL, "a refused reservation leaves it usable");
-    assert_eq!(outputs, solved(&depot()).1);
+    assert_eq!(
+        solve(kahlnws_solver_solve, solver, &depot(), &mut outputs),
+        StatusCode::OPTIMAL,
+        "a refused reservation leaves it usable"
+    );
+    assert_eq!(outputs, solved(kahlnws_solver_solve, &depot()).1);
 
     // SAFETY: the solver is live and used by nothing else from here on.
     unsafe { kahlnws_solver_free(solver) };
@@ -621,10 +660,140 @@ fn test_one_solver_answers_each_problem_as_a_fresh_one() {
 
     for tables in &problems {
         let mut outputs = Outputs::marked(tables);
-        let status = solve(solver, tables, &mut outputs);
+        let status = solve(kahlnws_solver_solve, solver, tables, &mut outputs);
 
-        assert_eq!((status, outputs), solved(tables), "{tables:?}");
+        assert_eq!((status, outputs), solved(kahlnws_solver_solve, tables), "{tables:?}");
     }
+
+    // SAFETY: the solver is live and used by nothing else from here on.
+    unsafe { kahlnws_solver_free(solver) };
+}
+
+#[test]
+fn test_a_solve_after_a_resolve_answers_as_a_fresh_one() {
+    let problems = [depot(), Tables { supplies: vec![3, 0, -3], ..depot() }, narrow_depot(), chain(), depot()];
+    let solver = new_solver();
+
+    for tables in &problems {
+        let mut outputs = Outputs::marked(tables);
+        assert_ne!(solve(kahlnws_solver_resolve, solver, tables, &mut outputs), StatusCode::INTERNAL_ERROR);
+
+        let mut outputs = Outputs::marked(tables);
+        let status = solve(kahlnws_solver_solve, solver, tables, &mut outputs);
+        assert_eq!((status, outputs), solved(kahlnws_solver_solve, tables), "{tables:?}");
+    }
+
+    // SAFETY: the solver is live and used by nothing else from here on.
+    unsafe { kahlnws_solver_free(solver) };
+}
+
+#[test]
+fn test_a_resolve_of_a_solver_that_never_solved_answers_what_a_solve_answers() {
+    let problems = [
+        depot(),
+        Tables { lower_bounds: vec![3, 0, 0], ..depot() },
+        narrow_depot(),
+        Tables { supplies: vec![4, 0, -3], ..depot() },
+        Tables { tails: vec![0, 1, 4], ..chain() },
+        Tables { lower_bounds: vec![0, 6, 0], ..chain() },
+    ];
+
+    for tables in &problems {
+        assert_eq!(solved(kahlnws_solver_resolve, tables), solved(kahlnws_solver_solve, tables), "{tables:?}");
+    }
+    assert_eq!(solved(kahlnws_solver_resolve, &depot()).1.work, DEPOT_WORK, "the work of a solve from the star");
+}
+
+/// What `solver` answers and writes for `tables` by `kahlnws_solver_resolve`, every output given.
+fn resolved(solver: *mut Solver, tables: &Tables) -> (StatusCode, Outputs) {
+    let mut outputs = Outputs::marked(tables);
+    let status = solve(kahlnws_solver_resolve, solver, tables, &mut outputs);
+
+    (status, outputs)
+}
+
+#[test]
+fn test_a_resolve_of_the_problem_solved_last_makes_no_pivot_and_answers_its_optimum() {
+    let solver = new_solver();
+    let (status, solved_outputs) = solved(kahlnws_solver_solve, &depot());
+    let mut outputs = Outputs::marked(&depot());
+    assert_eq!(solve(kahlnws_solver_solve, solver, &depot(), &mut outputs), status);
+
+    // The basis the solve ended on is the optimum of the same numbers: nothing violates, and nothing moves.
+    let expected = Outputs { work: Work::default(), ..solved_outputs };
+    assert_eq!(resolved(solver, &depot()), (StatusCode::OPTIMAL, expected));
+
+    // SAFETY: the solver is live and used by nothing else from here on.
+    unsafe { kahlnws_solver_free(solver) };
+}
+
+#[test]
+fn test_a_resolve_of_fewer_units_sends_them_along_the_kept_tree_without_a_pivot() {
+    // The depot ends with arcs 0 and 1 in the tree, below node 0, and arc 2 full out of it, at potentials 0, 1 and 5.
+    // With 3 units, arc 2 still carries its 2, arc 0 the 1 node 2 lacks and arc 1 the 2 that node 1 passes on: the
+    // flows 1, 2, 2 at a cost of `5 + 2 + 2 = 9`, every arc as it stood, so nothing violates.
+    let fewer = Tables { supplies: vec![3, 0, -3], ..depot() };
+    let solver = new_solver();
+    let mut outputs = Outputs::marked(&depot());
+    assert_eq!(solve(kahlnws_solver_solve, solver, &depot(), &mut outputs), StatusCode::OPTIMAL);
+
+    let expected = Outputs {
+        flows: vec![1, 2, 2],
+        potentials: vec![0, 1, 5],
+        total_cost: Int128 { low: 9, high: 0 },
+        work: Work::default(),
+        ..Outputs::marked(&fewer)
+    };
+    assert_eq!(resolved(solver, &fewer), (StatusCode::OPTIMAL, expected));
+    let (status, fresh) = solved(kahlnws_solver_solve, &fewer);
+    assert_eq!((status, fresh.total_cost), (StatusCode::OPTIMAL, Int128 { low: 9, high: 0 }), "the same cost");
+    assert_ne!(fresh.work, Work::default(), "a solve of the same problem makes pivots");
+
+    // SAFETY: the solver is live and used by nothing else from here on.
+    unsafe { kahlnws_solver_free(solver) };
+}
+
+#[test]
+fn test_a_resolve_of_other_counts_answers_what_a_solve_answers() {
+    // The chain has four nodes where the depot has three: the depot's basis cannot serve it.
+    let solver = new_solver();
+    let mut outputs = Outputs::marked(&depot());
+    assert_eq!(solve(kahlnws_solver_solve, solver, &depot(), &mut outputs), StatusCode::OPTIMAL);
+
+    assert_eq!(resolved(solver, &chain()), solved(kahlnws_solver_solve, &chain()));
+
+    // SAFETY: the solver is live and used by nothing else from here on.
+    unsafe { kahlnws_solver_free(solver) };
+}
+
+#[test]
+fn test_a_call_refused_between_a_solve_and_a_resolve_keeps_the_basis() {
+    let solver = new_solver();
+    let mut outputs = Outputs::marked(&depot());
+    assert_eq!(solve(kahlnws_solver_solve, solver, &depot(), &mut outputs), StatusCode::OPTIMAL);
+
+    let unbalanced = Tables { supplies: vec![4, 0, -3], ..depot() };
+    assert_eq!(resolved(solver, &unbalanced).0, StatusCode::REFUSED);
+    let tables = depot();
+    let problem = tables.problem();
+    // SAFETY: the solver is live and the problem points into `tables`; the null flows are checked and never written.
+    let status = unsafe {
+        kahlnws_solver_resolve(
+            solver,
+            &raw const problem,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, StatusCode::NULL_POINTER);
+    // SAFETY: the solver is live and used by nothing else meanwhile.
+    assert_eq!(unsafe { kahlnws_solver_reserve(solver, usize::MAX, 1) }, StatusCode::NO_ROOM);
+
+    let (status, outputs) = resolved(solver, &depot());
+    assert_eq!((status, outputs.work), (StatusCode::OPTIMAL, Work::default()), "the kept basis makes no pivot");
 
     // SAFETY: the solver is live and used by nothing else from here on.
     unsafe { kahlnws_solver_free(solver) };
@@ -647,98 +816,107 @@ fn test_the_cost_bound_by_hand() {
 
 #[test]
 fn test_the_depot_is_solved_into_storage_that_held_no_values() {
-    let tables = depot();
-    let problem = tables.problem();
-    let solver = new_solver();
-    let mut flows = [MaybeUninit::<u64>::uninit(); 3];
-    let mut potentials = [MaybeUninit::<i64>::uninit(); 3];
-    let mut total_cost = MaybeUninit::<Int128>::uninit();
-    let mut work = MaybeUninit::<Work>::uninit();
+    for (name, entry) in SOLVE_ENTRIES {
+        let tables = depot();
+        let problem = tables.problem();
+        let solver = new_solver();
+        let mut flows = [MaybeUninit::<u64>::uninit(); 3];
+        let mut potentials = [MaybeUninit::<i64>::uninit(); 3];
+        let mut total_cost = MaybeUninit::<Int128>::uninit();
+        let mut work = MaybeUninit::<Work>::uninit();
 
-    // SAFETY: the solver is live, the problem points into `tables`, and each output is storage of the test's for the
-    // counts the problem states, used by nothing else meanwhile.
-    let status = unsafe {
-        kahlnws_solver_solve(
-            solver,
-            &raw const problem,
-            flows.as_mut_ptr().cast(),
-            potentials.as_mut_ptr().cast(),
-            total_cost.as_mut_ptr(),
-            work.as_mut_ptr(),
-            ptr::null_mut(),
-        )
-    };
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
+        // SAFETY: the solver is live, the problem points into `tables`, and each output is storage of the test's for
+        // the counts the problem states, used by nothing else meanwhile.
+        let status = unsafe {
+            entry(
+                solver,
+                &raw const problem,
+                flows.as_mut_ptr().cast(),
+                potentials.as_mut_ptr().cast(),
+                total_cost.as_mut_ptr(),
+                work.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
 
-    assert_eq!(status, StatusCode::OPTIMAL);
-    // SAFETY: an optimal solve wrote every flow, every potential and the cost.
-    let written =
-        unsafe { (flows.map(|flow| flow.assume_init()), potentials.map(|potential| potential.assume_init())) };
-    assert_eq!(written, ([2, 2, 2], [0, 1, 5]));
-    // SAFETY: an optimal solve wrote the cost.
-    assert_eq!(unsafe { total_cost.assume_init() }, Int128 { low: 14, high: 0 });
-    // SAFETY: an optimal solve wrote the work.
-    assert_eq!(unsafe { work.assume_init() }, DEPOT_WORK);
+        assert_eq!(status, StatusCode::OPTIMAL, "{name}");
+        // SAFETY: an optimal solve wrote every flow, every potential and the cost.
+        let written =
+            unsafe { (flows.map(|flow| flow.assume_init()), potentials.map(|potential| potential.assume_init())) };
+        assert_eq!(written, ([2, 2, 2], [0, 1, 5]));
+        // SAFETY: an optimal solve wrote the cost.
+        assert_eq!(unsafe { total_cost.assume_init() }, Int128 { low: 14, high: 0 });
+        // SAFETY: an optimal solve wrote the work.
+        assert_eq!(unsafe { work.assume_init() }, DEPOT_WORK);
+    }
 }
 
 #[test]
 fn test_the_work_of_an_infeasible_solve_is_written_into_storage_that_held_no_value() {
-    let tables = narrow_depot();
-    let problem = tables.problem();
-    let solver = new_solver();
-    let mut flows = [MaybeUninit::<u64>::uninit(); 3];
-    let mut work = MaybeUninit::<Work>::uninit();
+    for (name, entry) in SOLVE_ENTRIES {
+        let tables = narrow_depot();
+        let problem = tables.problem();
+        let solver = new_solver();
+        let mut flows = [MaybeUninit::<u64>::uninit(); 3];
+        let mut work = MaybeUninit::<Work>::uninit();
 
-    // SAFETY: the solver is live, the problem points into `tables`, and the flows and the work are storage of the
-    // test's, used by nothing else meanwhile.
-    let status = unsafe {
-        kahlnws_solver_solve(
-            solver,
-            &raw const problem,
-            flows.as_mut_ptr().cast(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            work.as_mut_ptr(),
-            ptr::null_mut(),
-        )
-    };
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
+        // SAFETY: the solver is live, the problem points into `tables`, and the flows and the work are storage of the
+        // test's, used by nothing else meanwhile.
+        let status = unsafe {
+            entry(
+                solver,
+                &raw const problem,
+                flows.as_mut_ptr().cast(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                work.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
 
-    assert_eq!(status, StatusCode::INFEASIBLE);
-    // SAFETY: an infeasible solve wrote the work.
-    assert_eq!(unsafe { work.assume_init() }, NARROW_DEPOT_WORK);
+        assert_eq!(status, StatusCode::INFEASIBLE, "{name}");
+        // SAFETY: an infeasible solve wrote the work.
+        assert_eq!(unsafe { work.assume_init() }, NARROW_DEPOT_WORK);
+    }
 }
 
 #[test]
 fn test_a_refusal_is_written_into_storage_that_held_no_value() {
-    let tables = Tables { supplies: vec![4, 0, -3], ..depot() };
-    let problem = tables.problem();
-    let solver = new_solver();
-    let mut flows = [MaybeUninit::<u64>::uninit(); 3];
-    let mut refusal = MaybeUninit::<Refusal>::uninit();
+    for (name, entry) in SOLVE_ENTRIES {
+        let tables = Tables { supplies: vec![4, 0, -3], ..depot() };
+        let problem = tables.problem();
+        let solver = new_solver();
+        let mut flows = [MaybeUninit::<u64>::uninit(); 3];
+        let mut refusal = MaybeUninit::<Refusal>::uninit();
 
-    // SAFETY: the solver is live, the problem points into `tables`, and the flows and the refusal are storage of the
-    // test's, used by nothing else meanwhile.
-    let status = unsafe {
-        kahlnws_solver_solve(
-            solver,
-            &raw const problem,
-            flows.as_mut_ptr().cast(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            refusal.as_mut_ptr(),
-        )
-    };
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
+        // SAFETY: the solver is live, the problem points into `tables`, and the flows and the refusal are storage of
+        // the test's, used by nothing else meanwhile.
+        let status = unsafe {
+            entry(
+                solver,
+                &raw const problem,
+                flows.as_mut_ptr().cast(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                refusal.as_mut_ptr(),
+            )
+        };
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
 
-    assert_eq!(status, StatusCode::REFUSED);
-    // SAFETY: a refused solve wrote the refusal.
-    let refusal = unsafe { refusal.assume_init() };
-    assert_eq!(refusal, Refusal { kind: RefusalKind::UNBALANCED, supply_total: Int128::from(1), ..Refusal::default() });
+        assert_eq!(status, StatusCode::REFUSED, "{name}");
+        // SAFETY: a refused solve wrote the refusal.
+        let refusal = unsafe { refusal.assume_init() };
+        assert_eq!(
+            refusal,
+            Refusal { kind: RefusalKind::UNBALANCED, supply_total: Int128::from(1), ..Refusal::default() }
+        );
+    }
 }
 
 /// A pointer one byte past `start`: never aligned for a type wider than a byte.
@@ -748,119 +926,110 @@ fn misaligned<T>(start: *const T) -> *const T {
 
 #[test]
 fn test_a_misaligned_pointer_in_every_position_is_invalid_and_writes_nothing() {
-    let tables = depot();
-    let problem = tables.problem();
-    let refused = [
-        Problem { tails: misaligned(problem.tails), ..problem },
-        Problem { heads: misaligned(problem.heads), ..problem },
-        Problem { lower_bounds: misaligned(tables.capacities.as_ptr()), ..problem },
-        Problem { capacities: misaligned(problem.capacities), ..problem },
-        Problem { costs: misaligned(problem.costs), ..problem },
-        Problem { supplies: misaligned(problem.supplies), ..problem },
-    ];
-    let solver = new_solver();
+    for (name, entry) in SOLVE_ENTRIES {
+        let tables = depot();
+        let problem = tables.problem();
+        let refused = [
+            Problem { tails: misaligned(problem.tails), ..problem },
+            Problem { heads: misaligned(problem.heads), ..problem },
+            Problem { lower_bounds: misaligned(tables.capacities.as_ptr()), ..problem },
+            Problem { capacities: misaligned(problem.capacities), ..problem },
+            Problem { costs: misaligned(problem.costs), ..problem },
+            Problem { supplies: misaligned(problem.supplies), ..problem },
+        ];
+        let solver = new_solver();
 
-    for problem in refused {
+        for problem in refused {
+            let mut outputs = Outputs::marked(&tables);
+            // SAFETY: the solver is live; every table of the problem but the misaligned one points into `tables`, the
+            // misaligned one is checked and never read; every output points into `outputs` for the problem's counts.
+            let status = unsafe {
+                entry(
+                    solver,
+                    &raw const problem,
+                    outputs.flows.as_mut_ptr(),
+                    outputs.potentials.as_mut_ptr(),
+                    &raw mut outputs.total_cost,
+                    &raw mut outputs.work,
+                    &raw mut outputs.refusal,
+                )
+            };
+            assert_eq!(
+                (status, outputs),
+                (StatusCode::INVALID_ARGUMENT, Outputs::marked(&tables)),
+                "{name}, {problem:?}"
+            );
+        }
+
         let mut outputs = Outputs::marked(&tables);
-        // SAFETY: the solver is live; every table of the problem but the misaligned one points into `tables`, the
-        // misaligned one is checked and never read; every output points into `outputs` for the problem's counts.
-        let status = unsafe {
-            kahlnws_solver_solve(
-                solver,
-                &raw const problem,
-                outputs.flows.as_mut_ptr(),
-                outputs.potentials.as_mut_ptr(),
-                &raw mut outputs.total_cost,
-                &raw mut outputs.work,
-                &raw mut outputs.refusal,
-            )
+        let mut storage = [Int128::default(); 2];
+        let mut work_storage = [Work::default(); 2];
+        let (flows, potentials) = (outputs.flows.as_mut_ptr(), outputs.potentials.as_mut_ptr());
+        let (total_cost, work, refusal) =
+            (&raw mut outputs.total_cost, &raw mut outputs.work, &raw mut outputs.refusal);
+        let problems = [problem; 2];
+        let misaligned_problem = misaligned(problems.as_ptr());
+        let misaligned_cost = misaligned(storage.as_mut_ptr().cast_const()).cast_mut();
+        let misaligned_work = misaligned(work_storage.as_mut_ptr().cast_const()).cast_mut();
+        let misaligned_refusal = misaligned(refusal.cast_const()).cast_mut();
+        // SAFETY: each call passes the live solver, the depot and the test's outputs, but for the one misaligned
+        // pointer, which is checked and never read or written.
+        let statuses = unsafe {
+            [
+                entry(solver, misaligned_problem, flows, potentials, total_cost, work, refusal),
+                entry(solver, &raw const problem, misaligned(flows).cast_mut(), potentials, total_cost, work, refusal),
+                entry(solver, &raw const problem, flows, misaligned(potentials).cast_mut(), total_cost, work, refusal),
+                entry(solver, &raw const problem, flows, potentials, misaligned_cost, work, refusal),
+                entry(solver, &raw const problem, flows, potentials, total_cost, misaligned_work, refusal),
+                entry(solver, &raw const problem, flows, potentials, total_cost, work, misaligned_refusal),
+                entry(misaligned(solver).cast_mut(), &raw const problem, flows, potentials, total_cost, work, refusal),
+                kahlnws_solver_reserve(misaligned(solver).cast_mut(), 3, 3),
+            ]
         };
-        assert_eq!((status, outputs), (StatusCode::INVALID_ARGUMENT, Outputs::marked(&tables)), "{problem:?}");
+        assert_eq!(statuses, [StatusCode::INVALID_ARGUMENT; 8], "{name}");
+        assert_eq!(outputs, Outputs::marked(&tables));
+        assert_eq!((storage, work_storage), ([Int128::default(); 2], [Work::default(); 2]));
+
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
     }
-
-    let mut outputs = Outputs::marked(&tables);
-    let mut storage = [Int128::default(); 2];
-    let mut work_storage = [Work::default(); 2];
-    let (flows, potentials) = (outputs.flows.as_mut_ptr(), outputs.potentials.as_mut_ptr());
-    let (total_cost, work, refusal) = (&raw mut outputs.total_cost, &raw mut outputs.work, &raw mut outputs.refusal);
-    let problems = [problem; 2];
-    let misaligned_problem = misaligned(problems.as_ptr());
-    let misaligned_cost = misaligned(storage.as_mut_ptr().cast_const()).cast_mut();
-    let misaligned_work = misaligned(work_storage.as_mut_ptr().cast_const()).cast_mut();
-    let misaligned_refusal = misaligned(refusal.cast_const()).cast_mut();
-    // SAFETY: each call passes the live solver, the depot and the test's outputs, but for the one misaligned pointer,
-    // which is checked and never read or written.
-    let statuses = unsafe {
-        [
-            kahlnws_solver_solve(solver, misaligned_problem, flows, potentials, total_cost, work, refusal),
-            kahlnws_solver_solve(
-                solver,
-                &raw const problem,
-                misaligned(flows).cast_mut(),
-                potentials,
-                total_cost,
-                work,
-                refusal,
-            ),
-            kahlnws_solver_solve(
-                solver,
-                &raw const problem,
-                flows,
-                misaligned(potentials).cast_mut(),
-                total_cost,
-                work,
-                refusal,
-            ),
-            kahlnws_solver_solve(solver, &raw const problem, flows, potentials, misaligned_cost, work, refusal),
-            kahlnws_solver_solve(solver, &raw const problem, flows, potentials, total_cost, misaligned_work, refusal),
-            kahlnws_solver_solve(solver, &raw const problem, flows, potentials, total_cost, work, misaligned_refusal),
-            kahlnws_solver_solve(
-                misaligned(solver).cast_mut(),
-                &raw const problem,
-                flows,
-                potentials,
-                total_cost,
-                work,
-                refusal,
-            ),
-            kahlnws_solver_reserve(misaligned(solver).cast_mut(), 3, 3),
-        ]
-    };
-    assert_eq!(statuses, [StatusCode::INVALID_ARGUMENT; 8]);
-    assert_eq!(outputs, Outputs::marked(&tables));
-    assert_eq!((storage, work_storage), ([Int128::default(); 2], [Work::default(); 2]));
-
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
 }
 
 #[test]
 fn test_counts_past_ptrdiff_max_bytes_are_invalid_and_write_nothing() {
-    // The counts are checked before any table is read or the room is made, so tables of three entries serve.
-    let tables = depot();
-    let solver = new_solver();
-    let past = usize::try_from(isize::MAX).expect("isize::MAX should fit a usize") / 8 + 1;
+    for (name, entry) in SOLVE_ENTRIES {
+        // The counts are checked before any table is read or the room is made, so tables of three entries serve.
+        let tables = depot();
+        let solver = new_solver();
+        let past = usize::try_from(isize::MAX).expect("isize::MAX should fit a usize") / 8 + 1;
 
-    for problem in [Problem { arc_count: past, ..tables.problem() }, Problem { node_count: past, ..tables.problem() }] {
-        let mut outputs = Outputs::marked(&tables);
-        // SAFETY: the solver is live; the count past `PTRDIFF_MAX` bytes is checked before any table it counts is
-        // read; the outputs point into `outputs`, and none of them is written.
-        let status = unsafe {
-            kahlnws_solver_solve(
-                solver,
-                &raw const problem,
-                outputs.flows.as_mut_ptr(),
-                outputs.potentials.as_mut_ptr(),
-                &raw mut outputs.total_cost,
-                &raw mut outputs.work,
-                &raw mut outputs.refusal,
-            )
-        };
-        assert_eq!((status, outputs), (StatusCode::INVALID_ARGUMENT, Outputs::marked(&tables)), "{problem:?}");
+        for problem in
+            [Problem { arc_count: past, ..tables.problem() }, Problem { node_count: past, ..tables.problem() }]
+        {
+            let mut outputs = Outputs::marked(&tables);
+            // SAFETY: the solver is live; the count past `PTRDIFF_MAX` bytes is checked before any table it counts is
+            // read; the outputs point into `outputs`, and none of them is written.
+            let status = unsafe {
+                entry(
+                    solver,
+                    &raw const problem,
+                    outputs.flows.as_mut_ptr(),
+                    outputs.potentials.as_mut_ptr(),
+                    &raw mut outputs.total_cost,
+                    &raw mut outputs.work,
+                    &raw mut outputs.refusal,
+                )
+            };
+            assert_eq!(
+                (status, outputs),
+                (StatusCode::INVALID_ARGUMENT, Outputs::marked(&tables)),
+                "{name}, {problem:?}"
+            );
+        }
+
+        // SAFETY: the solver is live and used by nothing else from here on.
+        unsafe { kahlnws_solver_free(solver) };
     }
-
-    // SAFETY: the solver is live and used by nothing else from here on.
-    unsafe { kahlnws_solver_free(solver) };
 }
 
 /// The name `kahlnws_status_name` answers for `status`, as text.

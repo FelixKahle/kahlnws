@@ -1,22 +1,15 @@
 # Benchmarks
 
-For anyone who wants to measure kahlnws: what the benchmark suite solves, how to run it, how to read what it prints,
-how to make a measurement that can be compared with another, and how kahlnws stands beside two LP solvers.
+For anyone who wants to measure kahlnws: what the two benchmark suites solve, how to run them, how to read what they
+print, how to make a measurement that can be compared with another, and how kahlnws stands beside two LP solvers.
 
-## What the suite measures
+## What the suites measure
 
-The suite is `crates/kahlnws/benches/cold.rs`. Each row times one cold solve: one call of `solve_into` on one
-network, by a solver reserved for that network, into a buffer of flows made once. Nothing is allocated inside the
-timing, and nothing is reset between iterations, since every solve starts from the starting basis and keeps nothing
-of the solve before. The work of an iteration is therefore fixed by the network alone, and every sample runs the same
-number of iterations. The throughput is counted in arcs.
+Two suites under `crates/kahlnws/benches/` solve the same networks: `cold.rs` times solves from the starting basis,
+and `warm.rs` a resolve from a kept basis beside a solve of the same network.
 
-Before a row is timed, its solve runs twice: both runs must answer the same flows, potentials and cost, and the answer
-must pass the certificate (the flow within its bounds and meeting every supply, the potentials pricing it optimal, the
-cost as stated). A row whose checks fail stops the suite.
-
-Every network is drawn from seeded generators and is a function of its family and size alone, so every run of the
-suite solves the same networks. A row is named `cold/<family>/<costs>/<size>`:
+Every network is drawn from seeded generators and is a function of its family and size alone, so every run of a
+suite solves the same networks. A row of the cold suite is named `cold/<family>/<costs>/<size>`:
 
 | Family | Sizes | Costs | Size means |
 |---|---|---|---|
@@ -43,12 +36,75 @@ $c$ of arc $a$ becomes $c \cdot K + t_a$, with a tie-break $t_a$ from 1 to 4095 
 an optimum at these costs is also optimal at the tying costs; the tie-breaks separate most twin arcs: they are drawn per
 arc and can repeat. A row at tying costs stands beside the same network at distinct costs, with far fewer ties.
 
-## Running the suite
+### Cold solves
+
+Each row of `cold.rs` times one cold solve: one call of `solve_into` on one network, by a solver reserved for that
+network, into a buffer of flows made once. Nothing is allocated inside the timing, and nothing is reset between
+iterations, since a solve starts from the starting basis and reads nothing of the solve before. The work of an
+iteration is therefore fixed by the network alone, and every sample runs the same number of iterations. The
+throughput is counted in arcs.
+
+Before a row is timed, its solve runs twice: both runs must answer the same flows, potentials and cost, and the answer
+must pass the certificate (the flow within its bounds and meeting every supply, the potentials pricing it optimal, the
+cost as stated). A row whose checks fail stops the suite.
+
+### Solves from a kept basis
+
+`warm.rs` takes each network of the cold suite, changes it, and solves the changed network twice: by a resolve from
+the basis a solve of the network before the change ended on, and by a solve. Each network comes in these changes:
+
+| Change | What changes |
+|---|---|
+| `same` | nothing: the network the kept basis ended on, again |
+| `supplies` | three supply moves, each of one to three units between two nodes of one role |
+| `arcs` | three capacities, each by one or two units, and the costs of three arcs, redrawn |
+| `broad` | the capacity of about four arcs in fifteen and the cost of about as many, each by one or two units |
+| `costs-hundredth` | the costs of a hundredth of the arcs, rounded up, redrawn |
+| `costs-tenth` | the costs of a tenth of the arcs, rounded up, redrawn |
+| `costs-all` | the costs of every arc, redrawn |
+
+`same` is the floor of a resolve: its passes over the arcs and the nodes, and no pivot. `supplies` and `arcs` move a
+few numbers, three of each, the same count on every network, so on the large networks they are small changes by
+construction. A supply move takes an amount from one node and gives it to another of the same role, a supplier's
+supply to another supplier or a demander's demand to another demander, and the giver keeps its role. The grid has one
+supplier and one demander, so its rows have no `supplies` pair. `broad` and the three shares of the costs scale with
+the network. A redrawn cost is the one the arc takes in the family's network with its costs drawn from another
+stream: each arc's cost from the range of its role in the family, and a derived cost, such as the grid's slack arc,
+by its rule; only arcs whose cost the redraw moves are chosen. Every change is made to the family's own network, and
+the row's costs, tying or distinct, are applied after it, so a change of a distinct row moves costs and not only their
+tie-breaks. Every change is drawn from one fixed seed, so every run makes the same changes. A change of costs leaves a
+network's flow in place; moving supplies or capacities may leave none, and a pair whose network has no flow times two
+answers that say so.
+
+Each change gives a pair of rows, `warm/<family>/<costs>/<size>/<change>/resolve` and `.../solve`. Both rows start
+each iteration from the same solver: one that solved the network before the change and kept the basis it ended on,
+cloned outside the timing and its room reserved, so that nothing is allocated inside it. The `resolve` row times one
+`resolve_into` of the changed network by that clone, which starts from the kept basis; the `solve` row one
+`solve_into`, which starts from the star. The problem handed in is made once, outside the timing. So every iteration
+does the same work, and the two rows of a pair solve the same network from the same solver.
+
+Each iteration needs a clone of its own, so the clock is read around each one: a row's time includes one reading of
+the clock, the same in both rows of a pair. Where a row's time is no more than a few readings, as on the smallest
+networks and on the resolves that make no pivot, that addend compresses the ratio of the pair, and the ratio
+understates the difference between the two.
+
+Before a pair is timed, the change must have changed the network, unless it is `same`; each entry runs twice from two
+clones and must answer alike, its work included; an optimal answer must pass the certificate; and the two must answer
+the same outcome and cost. The resolve must try no arc before block search, as a start from the star does wherever a
+solve's first arcs pivot; and since a resolve that cannot start from the kept basis answers exactly a solve's work,
+one whose work differs from the solve's started from it. Where the two works are equal and neither tried an arc
+first, the work cannot tell the starts apart, and the printed line says so. On `same` the resolve must make no pivot,
+since the kept basis is the problem's own end; a network whose kept basis could not serve it would stop the suite
+there. The suite then prints, for each pair, a line with the network's arcs, what the change moved (the supplies and
+the units moved, the capacities and the costs changed), the outcome, and the pivots of each entry.
+
+## Running the suites
 
 From the root of the repository:
 
 ```sh
 cargo bench -p kahlnws --bench cold
+cargo bench -p kahlnws --bench warm
 ```
 
 The benchmarks build with the `bench` profile, which is the release profile: fat link-time optimisation and one code
@@ -57,9 +113,10 @@ matches:
 
 ```sh
 cargo bench -p kahlnws --bench cold -- cold/grid/
+cargo bench -p kahlnws --bench warm -- warm/grid/tying/296/
 ```
 
-Without timing, the suite is a smoke run: every row's checks, then every row once.
+Without timing, the suites are a smoke run: every row's checks, then every row once.
 
 ```sh
 cargo test -p kahlnws --benches
@@ -72,9 +129,13 @@ the middle with the bounds of its confidence interval, and the throughput in arc
 earlier run of the same row is stored, it also prints the change against it, with its own interval, and says whether
 the change is beyond noise. The harness keeps every row's measurements under `target/criterion/`.
 
-The time of a row is the time of one whole solve of that network, its checks and its reservation excluded. Rows of
-different families or sizes are not comparable as times; the throughput in arcs puts them on one scale, though the
-work per arc differs from family to family.
+The time of a row is the time of one whole solve of that network, its checks, its reservation and, in the warm
+suite, its clone excluded. Rows of different families or sizes are not comparable as times; the throughput in arcs
+puts them on one scale, though the work per arc differs from family to family. The two rows of a warm pair compare
+directly: the same network, solved from the same solver, timed alike. A warm row does not compare with a cold row,
+not even the `solve` row of `same` with the cold row of the same network: a cold row repeats one solve on one solver
+and times the handing in of the problem with it, which reads every arc's lower bound, while a warm row times one solve
+on a fresh clone with a reading of the clock around it.
 
 ## A fair measurement
 
