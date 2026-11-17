@@ -13,6 +13,17 @@ that no such flow exists.
 - **No dependency, fully typed.** One wheel serves CPython 3.11 and later. Columns are sequences of `int` or buffers
   such as NumPy arrays; NumPy itself is never needed.
 
+It offers two types, one contract each:
+
+- **The solver**, `NetworkSimplex`, is a function: a problem in, an answer out. It keeps its room and nothing else, so
+  its answer is a function of the problem alone. A caller who solves in a loop keeps one solver and has the flows
+  written into a buffer of its own with `solve_into`.
+- **A network**, `Network`, is a state: it holds one problem and a basis of it. Each change applies at once, and each
+  setter answers the number it replaced, so it can be set back; a load hands it new numbers on the same arcs; and its
+  solve starts from the basis it holds, so after a few changed numbers it often makes far fewer pivots than a solve from
+  nothing kept. A network reads back the problem it holds, column by column or number by number, and copies itself, or
+  into another network within its room, raising `MemoryError` where the memory for a copy is refused.
+
 ## Installing
 
 ```sh
@@ -32,19 +43,15 @@ assert answer.outcome is not None
 assert answer.outcome.flows == [2, 2, 2] and answer.outcome.total_cost == 14
 ```
 
-A caller who solves in a loop keeps one solver and has the flows written into a buffer of its own with `solve_into`.
-Where only the numbers change, on the same arcs, `resolve` and `resolve_into` start from the basis the last solve ended
-on and often make far fewer pivots; where that basis cannot serve, they answer exactly what a solve answers.
-
 ## Documentation
 
 - [The Python guide][python-api]: installing, buffers, NumPy and the exceptions.
 - [The problem and the guarantees][problem-and-guarantees]: the linear program, the certificate, the
   ranges and the refusals.
-- [Benchmarks][benchmarks]: the suite, and a comparison with two LP solvers.
-- [The examples][examples]: five scripts on one small transport network.
+- [Benchmarks][benchmarks]: the three suites, and a comparison with two LP solvers.
+- [The examples][examples]: six scripts on one small transport network.
 
-The same solver is offered to Rust, C and C++ from [the repository](https://github.com/FelixKahle/kahlnws).
+The solver and a network are offered to Rust, C and C++ from [the repository](https://github.com/FelixKahle/kahlnws).
 
 ## Licence
 

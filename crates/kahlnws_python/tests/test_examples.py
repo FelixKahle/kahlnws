@@ -53,12 +53,29 @@ def test_reuse_prints_the_hand_worked_optimum_of_each_day() -> None:
     ]
 
 
-def test_resolve_prints_the_optimum_of_each_day_and_fewer_pivots_from_the_kept_basis() -> None:
-    # The costs are those of `reuse`; the example works out each day's pivots by hand, kept and fresh alike.
-    assert run("resolve").splitlines() == [
+def test_network_prints_the_optimum_of_each_day_and_fewer_pivots_from_the_basis_it_kept() -> None:
+    # The costs are those of `reuse`; the pivots are those the network's solve and a fresh solve report, which the
+    # example checks.
+    assert run("network").splitlines() == [
         f"day 1: cost {TRANSPORT_COST}, pivots 6 (a fresh solve: 6)",
         f"day 2: cost {550 - 120}, pivots 1 (a fresh solve: 5)",
         f"day 3: cost {615 - 90}, pivots 1 (a fresh solve: 7)",
+    ]
+
+
+def test_search_prints_what_each_move_came_to_worked_out_by_hand() -> None:
+    # The example works out every cost by hand: a unit warehouse 0 sends saves 1, 6 and 3 at shops 0, 1 and 2 on what
+    # warehouse 1 would pay alone, 585 while the costs are those loaded and 460 once lane 4 costs 7. Move 1 leaves
+    # warehouse 0 10 units for shop 1; move 2 is refused at its second change, and its first is set back; move 3 gives
+    # warehouse 0 five units more, which save 3 each at shop 2; move 4 leaves it 15, all for shop 1.
+    assert run("search").splitlines() == [
+        f"start: cost {TRANSPORT_COST}",
+        f"move 1: cost {585 - 10 - 6 * 10}, set back",
+        "move 2: refused (arc 1 has lower bound 25 above its capacity 20), set back",
+        f"move 3: cost {TRANSPORT_COST - 3 * 5}, kept",
+        f"move 4: cost {585 - 6 * 15}, set back",
+        f"move 5: cost {460 - 3 * 15 - 10}, kept",
+        f"end: cost {460 - 3 * 15 - 10}, the warehouses hold 25 and 25",
     ]
 
 

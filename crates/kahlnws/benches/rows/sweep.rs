@@ -1,7 +1,7 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The rows both benchmark suites sweep: the seeded networks of every family at every size, the supply and the
+//! The rows every benchmark suite sweeps: the seeded networks of every family at every size, the supply and the
 //! assignment shape at tying and at distinct costs, so that a solve with ties stands beside one of the same network
 //! without, and the grid at its own costs from a few arcs to about a quarter of a million. With them, what a row's
 //! measurement shares: the problem a network is handed in as, the throughput in arcs, the group sampled flat, and the
@@ -14,7 +14,7 @@ use kahlnws_testing::{Family, MincostNetwork, OptimalFlow, check_certificate, di
 
 /// The costs a row's network is solved at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Costs {
+enum RowCosts {
     /// The family's own costs: small ones, at which the supply and the assignment shape tie through their twin arcs and
     /// the grid by the few values its costs take.
     Tying,
@@ -28,12 +28,12 @@ pub(crate) struct Row {
     /// The family the network is drawn from.
     pub(crate) family: Family,
     /// The costs it is solved at.
-    costs: Costs,
+    costs: RowCosts,
     /// Its size: the number of demands, or the grid's side.
     pub(crate) size: usize,
 }
 
-impl Costs {
+impl RowCosts {
     /// The costs the rows of `family` are solved at: tying and distinct for the shapes whose twins tie, the family's
     /// own for the grid, whose ties are no twins a tie-break would be argued from.
     const fn of(family: Family) -> &'static [Self] {
@@ -72,7 +72,7 @@ impl Row {
 
     /// The rows of `family`, size by size ascending, then tying before distinct costs.
     fn of_family(family: Family) -> impl Iterator<Item = Self> {
-        let costs = Costs::of(family);
+        let costs = RowCosts::of(family);
 
         family.sizes().iter().flat_map(move |&size| costs.iter().map(move |&costs| Self { family, costs, size }))
     }

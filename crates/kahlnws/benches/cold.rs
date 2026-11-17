@@ -20,12 +20,13 @@
 //! part of it. Under `cargo test -p kahlnws --benches` the suite is a smoke run, which makes every row's checks and
 //! runs the row once, untimed.
 
-mod rows;
+#[path = "rows/sweep.rs"]
+mod sweep;
 
 use criterion::Criterion;
 use kahlnws::{NetworkSimplex, Optimum, Outcome};
 use kahlnws_testing::{MincostNetwork, OptimalFlow};
-use rows::{Row, arcs, assert_certified, flat_group, problem_of};
+use sweep::{Row, arcs, assert_certified, flat_group, problem_of};
 
 /// A cold solve of one network: the network as plain numbers, the solver reserved for it and the buffer its flows are
 /// written to, made once.

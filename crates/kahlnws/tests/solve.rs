@@ -4,17 +4,16 @@
 //! The public surface of the solver: hand-worked problems with their flows, costs and potentials written out, and the
 //! work of several pivot by pivot; every refusal with its values and message, and the order of refusals that meet;
 //! the brute force on tiny networks; the linear-programming oracle on seeded ones; the ends of every range; that the
-//! room a solver keeps never changes the answer of a solve, its work included; and that a resolve answers the outcome
-//! and the cost a solve answers, from the basis the solve before it ended on where that serves and exactly as a solve
-//! where it does not. Every optimal answer is checked by the certificate, and the work of every answer against the
-//! relations its counts keep.
+//! room a solver keeps never changes the answer of a solve, its work included, whatever the solver solved before.
+//! Every optimal answer is checked by the certificate, and the work of every answer against the relations its counts
+//! keep.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use kahlnws::{Answer, NetworkSimplex, Optimum, Outcome, Problem, ProblemError, Solution, Table, Work, cost_bound};
 use kahlnws_testing::{
     Family, MincostNetwork, OptimalFlow, TinyBounds, TinyCosts, assignment_shaped, brute_force_optimum,
-    check_against_brute_force, check_certificate, general, lp_optimum, perturbed, supply_shaped, tiny_networks,
+    check_against_brute_force, check_certificate, general, lp_optimum, supply_shaped, tiny_networks,
 };
 use num_bigint::BigInt;
 use proptest::prelude::*;
@@ -720,130 +719,4 @@ fn test_a_refused_buffer_leaves_the_solver_answering_as_a_fresh_one() {
         let fresh = NetworkSimplex::new().solve(&problem_of(network));
         assert_eq!(solver.solve(&problem_of(network)), fresh, "{name} after the refused buffer");
     }
-}
-
-#[test]
-fn test_a_resolve_of_a_fresh_solver_answers_as_a_solve() {
-    // Nothing is kept: the answer is the solve's, its flows, potentials and work included.
-    for (name, network) in &networks_in_turn() {
-        let fresh = NetworkSimplex::new().solve(&problem_of(network));
-        assert_eq!(NetworkSimplex::new().resolve(&problem_of(network)), fresh, "{name}");
-    }
-}
-
-#[test]
-fn test_the_same_problem_resolved_makes_no_pivot_where_a_solve_makes_some() {
-    // The kept basis is the problem's own end, which the re-flow leaves as it is: the same answer, with no pivot.
-    // The work tells the kept start from the star wherever the solve pivots.
-    let mut pivoting = 0;
-    for (name, network) in &networks_in_turn() {
-        let mut solver = NetworkSimplex::new();
-        let solved = solver.solve(&problem_of(network)).expect("the test's problem should be admitted");
-        pivoting += usize::from(solved.work.pivots > 0);
-
-        let resolved = solver.resolve(&problem_of(network)).expect("the test's problem should be admitted");
-        assert_eq!(resolved, Answer { work: Work::default(), ..solved }, "{name}");
-    }
-
-    assert!(pivoting > 10, "{pivoting} of the test's problems pivot in a solve");
-}
-
-#[test]
-fn test_a_problem_of_other_counts_resolves_as_a_solve() {
-    // Each network after the one before it in turn, whose node or arc count differs: the kept basis cannot serve.
-    let networks = networks_in_turn();
-    let mut solver = NetworkSimplex::new();
-
-    for pair in networks.windows(2) {
-        let [(_, before), (name, network)] = pair else { unreachable!("windows of two") };
-        let counts = |network: &MincostNetwork| (network.node_count(), network.arc_count());
-        assert_ne!(counts(before), counts(network), "{name}: the test's networks in turn differ in their counts");
-
-        let _ = solver.solve(&problem_of(before)).expect("the test's problem should be admitted");
-        let fresh = NetworkSimplex::new().solve(&problem_of(network));
-        assert_eq!(solver.resolve(&problem_of(network)), fresh, "{name} after a basis of other counts");
-    }
-}
-
-/// The networks of a sequence of `length`, each perturbed from the one before by its own seed drawn from `seed`, the
-/// first `network` itself.
-fn perturbed_sequence(network: MincostNetwork, seed: &[u64], length: u64) -> Vec<MincostNetwork> {
-    let mut sequence = vec![network];
-    for step in 1..length {
-        let last = sequence.last().expect("the sequence holds its first network");
-        let next = perturbed(last, &[seed[0], seed[1], seed[2], step]);
-        sequence.push(next);
-    }
-
-    sequence
-}
-
-/// Checks the answer `resolved` of `network` against the answer `solved` of a fresh solver: refused alike, of the same
-/// outcome and the same cost, certified, and of work whose counts keep their relations.
-///
-/// # Panics
-/// Panics if it does not.
-fn assert_resolved_as_solved(
-    network: &MincostNetwork,
-    resolved: &Result<Answer<Solution>, ProblemError>,
-    solved: &Result<Answer<Solution>, ProblemError>,
-    name: &str,
-) {
-    assert_eq!(cost_of(resolved), cost_of(solved), "{name}");
-
-    let Ok(Answer { outcome, work }) = resolved else { return };
-    assert!(work.degenerate_pivots <= work.pivots && work.first_arc_pivots <= work.pivots, "{name}: {work:?}");
-    if let Outcome::Optimal(solution) = outcome {
-        let certified = check_certificate(network, &solution.flows, &solution.potentials, solution.total_cost);
-        assert_eq!(certified, Ok(()), "{name}: the resolve should be certified optimal");
-    }
-}
-
-/// The cost `answer` found, `None` where it is infeasible; or its refusal.
-fn cost_of(answer: &Result<Answer<Solution>, ProblemError>) -> Result<Option<i128>, ProblemError> {
-    answer.clone().map(|answer| answer.outcome.optimal().map(|solution| solution.total_cost))
-}
-
-#[test]
-fn test_sequences_of_perturbed_networks_resolve_as_they_solve() {
-    // Per shape and seed, a sequence of eight networks, each a few numbers moved from the one before, resolved in turn
-    // by one solver: each answer of the cost a fresh solve answers. Every resolve starts from the kept basis, so that
-    // the counts of all resolves, summed, stay below those of the solves.
-    let (mut resolved_pivots, mut solved_pivots, mut outcomes) = (0, 0, [0_usize; 2]);
-
-    for seed in seeds().take(24) {
-        for (shape, network) in seeded_shapes(&seed) {
-            let mut solver = NetworkSimplex::new();
-            let _ = solver.solve(&problem_of(&network)).expect("a seeded network should be admitted");
-
-            for (step, network) in perturbed_sequence(network, &seed, 8).iter().enumerate().skip(1) {
-                let name = format!("{shape} {seed:?}, step {step}");
-                let resolved = solver.resolve(&problem_of(network));
-                let solved = NetworkSimplex::new().solve(&problem_of(network));
-                assert_resolved_as_solved(network, &resolved, &solved, &name);
-
-                let (Ok(resolved), Ok(solved)) = (resolved, solved) else { continue };
-                assert_eq!(resolved.work.first_arc_pivots, 0, "{name}: a kept start tries no first arc");
-                resolved_pivots += resolved.work.pivots;
-                solved_pivots += solved.work.pivots;
-                outcomes[usize::from(resolved.outcome == Outcome::Infeasible)] += 1;
-            }
-        }
-    }
-
-    assert!(outcomes.iter().all(|&count| count > 0), "optimal and infeasible resolves: {outcomes:?}");
-    assert!(resolved_pivots < solved_pivots, "{resolved_pivots} pivots resolving, {solved_pivots} solving");
-}
-
-#[test]
-fn test_the_same_problem_resolved_past_the_limit_answers_as_a_solve() {
-    // Two nodes of no supply, an arc each way of capacity `u64::MAX` at cost −1: the solve ends with one arc carrying
-    // `u64::MAX` out of the tree, so the excesses over that basis add up to `u64::MAX`, past the limit. The kept basis
-    // cannot serve, and the resolve of the same problem is a solve, its work included.
-    let network = MincostNetwork::from_arcs(&[0, 0], &[(0, 1, 0, u64::MAX, -1), (1, 0, 0, u64::MAX, -1)]);
-    let mut solver = NetworkSimplex::new();
-
-    let solved = solver.solve(&problem_of(&network));
-    assert!(solved.as_ref().is_ok_and(|answer| answer.work.pivots > 0), "{solved:?}");
-    assert_eq!(solver.resolve(&problem_of(&network)), solved);
 }

@@ -1,14 +1,15 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The benchmark suite of solves from a kept basis: for every row of the cold suite, its network again or changed,
-//! solved by a resolve from the basis a solve of the row's own network ended on, and by a solve, so that the two stand
-//! side by side on the same network.
+//! The benchmark suite of loads on a kept basis: for every row of the cold suite, its network again or changed, loaded
+//! into a [`Network`] that holds the basis a solve of the row's own network ended on and solved, and solved by a
+//! [`NetworkSimplex`](kahlnws::NetworkSimplex) from the star, so that the two stand side by side on the same network.
 //!
 //! Rows `warm/<family>/<costs>/<size>/<change>/<entry>`: the row of the cold suite, how its network was changed, and
-//! the entry timed, `resolve` or `solve`. The changes:
+//! the entry timed, `load` or `solve`. The changes:
 //!
-//! - `same`: nothing changed, the network the kept basis ended on: what a resolve costs where it makes no pivot.
+//! - `same`: nothing changed, the network the kept basis ended on: what a load and its solve cost where the solve makes
+//!   no pivot.
 //! - `supplies`: three supply moves, each of one to three units from one node to another of the same role, a
 //!   supplier's supply to another supplier or a demander's demand to another demander, the giver keeping its role. The
 //!   grid has one supplier and one demander, so its rows have no `supplies` pair.
@@ -19,54 +20,63 @@
 //!   shares are decades, each ten times the last, from a few arcs of the larger networks to all of them.
 //!
 //! A few is three, the same on every network, so that `supplies` and `arcs` stay a few numbers however large the
-//! network around them; three is the most supply moves the testing crate's perturbation makes, and its units (three
-//! for a supply, two for a capacity) are that perturbation's too. A redrawn cost is the one the arc takes in the
-//! family's network with its costs drawn from another stream: each arc's cost drawn from the range of its role in the
-//! family, a derived cost such as the grid's slack arc given by its rule, and only arcs whose cost the redraw moves are
-//! chosen. Every change is made to the family's own network, and the row's costs, tying or distinct, are applied after
-//! it, as to the row's own network; so a change of a distinct row moves costs, not only their tie-breaks. Every change
-//! is drawn from one fixed seed, so every run of the suite makes the same changes. A change of costs leaves a network's
-//! flow in place; with its supplies or capacities moved a network may have none, and the pair then times two answers
-//! that no flow exists.
+//! network around them; three is the most supply moves the testing crate's perturbation makes, and its units (three for
+//! a supply, two for a capacity) are that perturbation's too. A redrawn cost is the one the arc takes in the family's
+//! network with its costs drawn from another stream: each arc's cost drawn from the range of its role in the family, a
+//! derived cost such as the grid's slack arc given by its rule, and only arcs whose cost the redraw moves are chosen.
+//! Every change is made to the family's own network, and the row's costs, tying or distinct, are applied after it, as
+//! to the row's own network, the distinct costs scaled by the multiplier of the row's own network, which the capacities
+//! give; so a change of a distinct row moves the costs it names, not only their tie-breaks, and no other cost where it
+//! moves a capacity. Every change is drawn from one fixed seed, so every run of the suite makes the same changes. A
+//! change of costs leaves a network's flow in place; with its supplies or capacities moved a network may have none, and
+//! the pair then times two answers that no flow exists.
 //!
-//! Every iteration of a row starts from the same solver: one that solved the row's own network and kept the basis that
-//! solve ended on, cloned in criterion's untimed setup and its room reserved for the changed network, so that nothing
-//! is allocated inside the timing. A row times one [`NetworkSimplex::resolve_into`] or one
-//! [`NetworkSimplex::solve_into`] of the changed network by that clone, into a buffer of flows made once, the problem
-//! handed in made once too; so the work of an iteration is fixed by the two networks alone. Each iteration needs a
-//! clone of its own, so the clock is read around each iteration: a row's time includes that reading, the same addend in
-//! both rows of a pair, which shrinks the ratio of a pair whose times come near it. The throughput is in arcs.
+//! Every iteration of a row starts from the same state: for `load`, a network that loaded the row's own network, solved
+//! it and holds the basis that solve ended on; for `solve`, a solver that solved the row's own network, whose room
+//! holds it. Each is cloned in criterion's untimed setup and its room reserved for the changed network, so that nothing
+//! is allocated inside the timing. A row times one [`Network::load`] of the changed network by that clone, the
+//! [`Network::solve`] after it and every flow of its optimum written into a buffer made once, or one
+//! [`NetworkSimplex::solve_into`](kahlnws::NetworkSimplex::solve_into) of the changed network into that buffer: both
+//! rows write the same flows out and answer the cost; the problem handed in is made once too, so the work of an
+//! iteration is fixed by the two networks alone. Each iteration needs a clone of its own, so the clock is read around
+//! each iteration: a row's time includes that reading, the same addend in both rows of a pair, which shrinks the ratio
+//! of a pair whose times come near it. The throughput is in arcs.
 //!
 //! Before a pair of rows is timed, the change must have changed the network, unless it is `same`. Each entry runs
 //! twice, from two clones: both runs must answer the same outcome, flows, potentials, cost and work, and an optimal
-//! answer must pass the testing crate's certificate. The two entries must answer the same outcome and cost. The resolve
-//! must try no arc before block search, which a start from the star does wherever a solve's first arcs pivot; and since
-//! a resolve that cannot start from the kept basis answers exactly a solve's work, one whose work differs from the
-//! solve's started from it. Where the two works are equal and neither tried an arc first, the work cannot tell the
-//! starts apart, and the suite says so. On `same` the resolve must make no pivot: the kept basis is the problem's own
+//! answer must pass the testing crate's certificate. The two entries must answer the same outcome and cost. A load that
+//! cannot start from the kept basis starts from the star, and its solve answers exactly what a load into a network that
+//! held nothing and its solve answer, the work included; so the load's work must differ from that one's, which proves
+//! it started from the kept basis. On `same` the load's solve must make no pivot: the kept basis is the problem's own
 //! end. A network whose kept basis cannot serve it would stop the suite there; none of the suite's can, since their
-//! supplies and capacities are far below the limit of the excesses.
+//! supplies and capacities are far below the limit of the excesses. So would a load from the kept basis whose work
+//! happened to equal a star load's, which the work could then not tell from a star load; none of the suite's rows
+//! does.
 //!
 //! The suite then prints a line with the network's arcs, what the change moved, and what the checks found, the outcome
 //! and each entry's pivots, such as `checked grid/tying/9/arcs: 235 arcs, moved 0 supplies by 0 units, 3 capacities,
-//! 3 costs; optimal at 89305; pivots: 1 resolving, 249 solving`.
+//! 3 costs; optimal at 89305; pivots: 1 loading, 249 solving`.
 //!
 //! Run with `cargo bench -p kahlnws --bench warm`; append `-- warm/grid/` (or any other prefix of a row's name) to run
 //! part of it. Under `cargo test -p kahlnws --benches` the suite is a smoke run, which makes every pair's checks and
 //! runs each row once, untimed.
 
-mod rows;
+#[path = "rows/row_change.rs"]
+mod row_change;
+#[path = "rows/sweep.rs"]
+mod sweep;
 
 use core::iter;
 
 use criterion::{BatchSize, Bencher, Criterion};
-use kahlnws::{Answer, NetworkSimplex, Optimum, Outcome, Problem, ProblemError, Work};
+use kahlnws::{Answer, Network, NetworkOptimum, Optimum, Outcome, Work};
 use kahlnws_testing::{
     MincostNetwork, OptimalFlow, capacities_moved, costs_taken, perturbation_draws, perturbed, supplies_moved,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::{SplitMix64, Xoshiro256PlusPlus};
-use rows::{Row, arcs, assert_certified, flat_group, problem_of};
+use row_change::{Kept, Moved, at_row_costs, redrawn_costs, total_cost};
+use sweep::{Row, arcs, assert_certified, flat_group, problem_of};
 
 /// The seed every change is drawn from: any value serves, and it is fixed so that every run of the suite makes the
 /// same changes to every network.
@@ -109,36 +119,13 @@ enum Share {
     All,
 }
 
-/// The entry of the solver a row times.
+/// The entry a row times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Entry {
-    /// [`NetworkSimplex::resolve_into`], from the basis the solver kept.
-    Resolve,
-    /// [`NetworkSimplex::solve_into`], which reads no kept basis.
+    /// [`Network::load`], from the basis the network holds, then [`Network::solve`].
+    Load,
+    /// [`NetworkSimplex::solve_into`](kahlnws::NetworkSimplex::solve_into), from the star.
     Solve,
-}
-
-/// What the work of a pair shows of where the resolve started.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Start {
-    /// From the kept basis: its work differs from the solve's, which a start from the star answers exactly.
-    Kept,
-    /// Not told apart: the two works are equal and neither entry tried an arc before block search, as a kept start and
-    /// a start from the star both may.
-    NotToldApart,
-}
-
-/// What a change moved of a network, counted against the network before it. Plain data.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Moved {
-    /// The nodes whose supply changed.
-    supplies: usize,
-    /// The units the supplies moved: half the sum of the changes' magnitudes, so a move of one unit counts one.
-    supply_units: u64,
-    /// The arcs whose capacity changed.
-    capacities: usize,
-    /// The arcs whose cost changed.
-    costs: usize,
 }
 
 /// A row's network changed: at the row's costs, with what the change moved of it.
@@ -150,21 +137,7 @@ struct ChangedNetwork {
     moved: Moved,
 }
 
-/// A solver that solved a row's own network, and the counts of that network.
-///
-/// # Invariant
-/// `solver` ended a solve of a network of `node_count` nodes and `arc_count` arcs and keeps the basis it ended on.
-#[derive(Debug)]
-struct KeptSolver {
-    /// The solver, with the basis it kept.
-    solver: NetworkSimplex,
-    /// The node count of the network it solved.
-    node_count: usize,
-    /// The arc count of the network it solved.
-    arc_count: usize,
-}
-
-/// A pair of rows: a network changed from a row's own, and the solver every iteration starts from.
+/// A pair of rows: a network changed from a row's own, and the states every iteration starts from.
 ///
 /// # Invariant
 /// `kept` solved a network of the nodes and the arcs of `network`, each arc with its tail and its head; `flows` holds
@@ -173,9 +146,9 @@ struct KeptSolver {
 struct WarmStart<'k> {
     /// The changed network, which both entries solve.
     network: MincostNetwork,
-    /// The solver that solved the row's own network.
-    kept: &'k KeptSolver,
-    /// The flow of each arc, written by every solve.
+    /// The network and the solver that solved the row's own network.
+    kept: &'k Kept,
+    /// The flow of each arc, written by every solve of the solver.
     flows: Vec<u64>,
 }
 
@@ -186,12 +159,10 @@ struct CheckedPair {
     arc_count: usize,
     /// The cost both entries answered; `None` where both answered that no flow exists.
     total_cost: Option<i128>,
-    /// The work of the resolve.
-    resolved: Work,
-    /// The work of the solve.
+    /// The work of the load's solve.
+    loaded: Work,
+    /// The work of the solver's solve.
     solved: Work,
-    /// Where the work shows the resolve started.
-    start: Start,
 }
 
 impl Change {
@@ -224,7 +195,8 @@ impl Change {
     /// move a supply between.
     ///
     /// # Panics
-    /// Panics if a change other than `same` leaves the network as it was.
+    /// Panics if a change other than `same` leaves the network as it was, or if at the row's costs it moves other
+    /// numbers than at the family's.
     fn applied(self, row: Row) -> Option<ChangedNetwork> {
         let own = row.family.network(row.size);
         let mut draws = Xoshiro256PlusPlus::seed_from_u64(CHANGE_SEED);
@@ -252,27 +224,34 @@ impl Change {
             row.name()
         );
 
-        Some(ChangedNetwork { network: row.at_costs(changed), moved })
+        let network = at_row_costs(row, &own, changed);
+        assert_eq!(
+            Moved::between(&row.network(), &network),
+            moved,
+            "the change {} of {} should move at the row's costs what it moves at the family's",
+            self.name(),
+            row.name()
+        );
+
+        Some(ChangedNetwork { network, moved })
     }
 
-    /// Checks what the work of a pair through this change shows: the resolve tried no arc before block search, and
-    /// made no pivot where nothing changed; answers where it started.
+    /// Checks that the work of a load through this change proves it started from the kept basis: it differs from
+    /// `from_star`, the work of a load of the same network into a network that held nothing and its solve, which a
+    /// load that cannot start from the kept basis answers exactly; and where nothing changed, the load's solve made no
+    /// pivot.
     ///
     /// # Panics
-    /// Panics if the resolve tried an arc before block search, as only a start from the star does, or made a pivot of
-    /// the network its kept basis ended on, which that basis then could not serve.
-    fn start(self, resolved: Work, solved: Work) -> Start {
+    /// Panics if either does not hold.
+    fn assert_started_from_the_kept_basis(self, loaded: Work, from_star: Work) {
         assert!(
-            resolved.first_arc_pivots == 0,
-            "the resolve should start from the kept basis, which tries no arc first: {resolved:?} against {solved:?}"
+            loaded != from_star,
+            "the load should start from the kept basis, whose work differs from a start from the star: {loaded:?}"
         );
         assert!(
-            self != Self::Same || resolved.pivots == 0,
-            "a resolve of the network the kept basis ended on should make no pivot: {resolved:?}"
+            self != Self::Same || loaded.pivots == 0,
+            "a load of the network the kept basis ended on should make no pivot: {loaded:?} against {from_star:?}"
         );
-
-        // A resolve that cannot start from the kept basis answers exactly what a solve answers, its work included.
-        if resolved == solved { Start::NotToldApart } else { Start::Kept }
     }
 }
 
@@ -287,83 +266,23 @@ impl Share {
     }
 }
 
-impl Moved {
-    /// What changed from `before` to `after`, two networks on the same nodes and arcs.
-    fn between(before: &MincostNetwork, after: &MincostNetwork) -> Self {
-        let supply_changes = before.supplies.iter().zip(&after.supplies).map(|(old, new)| old.abs_diff(*new));
-
-        Self {
-            supplies: changed(&before.supplies, &after.supplies),
-            supply_units: supply_changes.sum::<u64>() / 2,
-            capacities: changed(&before.capacities, &after.capacities),
-            costs: changed(&before.costs, &after.costs),
-        }
-    }
-}
-
 impl Entry {
     /// Both entries, in the order a pair's rows are timed.
-    const BOTH: [Self; 2] = [Self::Resolve, Self::Solve];
+    const BOTH: [Self; 2] = [Self::Load, Self::Solve];
 
     /// The name of this entry in a row's name.
     const fn name(self) -> &'static str {
         match self {
-            Self::Resolve => "resolve",
+            Self::Load => "load",
             Self::Solve => "solve",
         }
-    }
-
-    /// What `solver` answers for `problem` through this entry, each arc's flow written to `flows`.
-    ///
-    /// # Errors
-    /// Returns the first breach of `problem`, as the entry does.
-    ///
-    /// # Panics
-    /// Panics if `flows` holds another number of entries than `problem` has arcs.
-    fn answer<'s>(
-        self,
-        solver: &'s mut NetworkSimplex,
-        problem: &Problem<'_>,
-        flows: &mut [u64],
-    ) -> Result<Answer<Optimum<'s>>, ProblemError> {
-        match self {
-            Self::Resolve => solver.resolve_into(problem, flows),
-            Self::Solve => solver.solve_into(problem, flows),
-        }
-    }
-}
-
-impl KeptSolver {
-    /// A solver that solved `network` and keeps the basis that solve ended on.
-    ///
-    /// # Panics
-    /// Panics if `network` is refused, which the suite's generators rule out.
-    fn new(network: &MincostNetwork) -> Self {
-        let mut solver = NetworkSimplex::new();
-        solver.solve(&problem_of(network)).expect("the row's network should be admitted");
-
-        Self { solver, node_count: network.node_count(), arc_count: network.arc_count() }
-    }
-
-    /// A clone of the solver, its room reserved for the network it solved: what an iteration starts from. It keeps
-    /// the same basis, and neither entry allocates in a solve of a network of the same counts.
-    ///
-    /// # Panics
-    /// Panics if the room cannot be reserved.
-    fn ready(&self) -> NetworkSimplex {
-        // A clone holds each column's room at that column's length, and a solve from the star leaves the room of the
-        // excesses over a kept basis empty: the reservation makes it, and keeps the basis.
-        let mut solver = self.solver.clone();
-        solver.try_reserve(self.node_count, self.arc_count).expect("the room should be reserved");
-
-        solver
     }
 }
 
 impl<'k> WarmStart<'k> {
     /// The pair of `network`, a network on the nodes and arcs of the network `kept` solved, each arc with its tail and
     /// its head.
-    fn new(network: MincostNetwork, kept: &'k KeptSolver) -> Self {
+    fn new(network: MincostNetwork, kept: &'k Kept) -> Self {
         let flows = vec![0; network.arc_count()];
 
         Self { network, kept, flows }
@@ -371,26 +290,29 @@ impl<'k> WarmStart<'k> {
 
     /// Checks what the pair through `change` measures, and answers what it found: each entry answers twice alike, the
     /// certificate proves an optimal answer optimal, the two entries answer the same outcome and cost, and the work
-    /// shows what [`Change::start`] checks of the resolve's start.
+    /// proves the load started from the kept basis, as [`Change::assert_started_from_the_kept_basis`] checks.
     ///
     /// # Panics
     /// Panics if a check fails, with what it found.
     fn check(&mut self, change: Change) -> CheckedPair {
-        let resolved = self.repeated(Entry::Resolve);
+        let loaded = self.repeated(Entry::Load);
         let solved = self.repeated(Entry::Solve);
+        assert_eq!(total_cost(&loaded), total_cost(&solved), "a load and a solve should answer the same outcome");
 
-        assert_eq!(total_cost(&resolved), total_cost(&solved), "a resolve and a solve should answer the same outcome");
+        let mut fresh = Network::new();
+        fresh.load(&problem_of(&self.network)).expect("the network should be admitted");
+        let from_star = fresh.solve().work;
+        change.assert_started_from_the_kept_basis(loaded.work, from_star);
 
         CheckedPair {
             arc_count: self.network.arc_count(),
             total_cost: total_cost(&solved),
-            resolved: resolved.work,
+            loaded: loaded.work,
             solved: solved.work,
-            start: change.start(resolved.work, solved.work),
         }
     }
 
-    /// The answer through `entry` from a clone of the kept solver, which a second clone repeats, its work included.
+    /// The answer through `entry` from a clone of its kept state, which a second clone repeats, its work included.
     ///
     /// # Panics
     /// Panics as [`certified`](Self::certified) does, or if the second answer differs from the first.
@@ -401,33 +323,60 @@ impl<'k> WarmStart<'k> {
         first
     }
 
-    /// The answer through `entry` from a clone of the kept solver, an optimal one proved optimal by the certificate.
+    /// The answer through `entry` from a clone of its kept state, an optimal one proved optimal by the certificate.
     ///
     /// # Panics
     /// Panics if the network is refused, which the suite's generators and changes rule out, or with the first breach
     /// of the certificate.
     fn certified(&mut self, entry: Entry) -> Answer<OptimalFlow> {
         let Self { network, kept, flows } = self;
-        let mut solver = kept.ready();
-        let Answer { outcome, work } =
-            entry.answer(&mut solver, &problem_of(network), flows).expect("the network should be admitted");
-
-        let outcome = match outcome {
-            Outcome::Optimal(Optimum { total_cost, potentials }) => {
-                // The flows are copied out of the buffer, which the next solve overwrites, and the potentials out of
-                // the solver, which lends them.
-                let optimum = OptimalFlow { flows: flows.to_vec(), potentials: potentials.to_vec(), total_cost };
-                assert_certified(network, &optimum);
-                Outcome::Optimal(optimum)
+        let problem = problem_of(network);
+        let answer = match entry {
+            Entry::Load => {
+                let mut held = kept.network.ready();
+                held.load(&problem).expect("the network should be admitted");
+                let Answer { outcome, work } = held.solve();
+                let outcome = match (outcome, held.optimum()) {
+                    (Outcome::Optimal(total_cost), Some(NetworkOptimum { flows, potentials, .. })) => {
+                        Outcome::Optimal(OptimalFlow {
+                            flows: flows.iter().collect(),
+                            potentials: potentials.to_vec(),
+                            total_cost,
+                        })
+                    }
+                    (Outcome::Optimal(_), None) => unreachable!("a solve that found a flow should leave its optimum"),
+                    (Outcome::Infeasible, _) => Outcome::Infeasible,
+                };
+                Answer { outcome, work }
             }
-            Outcome::Infeasible => Outcome::Infeasible,
+            Entry::Solve => {
+                let mut solver = kept.solver.ready();
+                let Answer { outcome, work } =
+                    solver.solve_into(&problem, flows).expect("the network should be admitted");
+                let outcome = match outcome {
+                    // The flows are copied out of the buffer, which the next solve overwrites, and the potentials out
+                    // of the solver, which lends them.
+                    Outcome::Optimal(Optimum { total_cost, potentials }) => Outcome::Optimal(OptimalFlow {
+                        flows: flows.to_vec(),
+                        potentials: potentials.to_vec(),
+                        total_cost,
+                    }),
+                    Outcome::Infeasible => Outcome::Infeasible,
+                };
+                Answer { outcome, work }
+            }
         };
 
-        Answer { outcome, work }
+        if let Outcome::Optimal(optimum) = &answer.outcome {
+            assert_certified(network, optimum);
+        }
+
+        answer
     }
 
-    /// Times `entry`: each iteration one solve of the network through it, by a clone of the kept solver made in the
-    /// untimed setup. The clone is handed back with the work, so that it is dropped outside the timing too.
+    /// Times `entry`: each iteration one load of the network and the solve after it, or one solve of it, by a clone of
+    /// the kept state made in the untimed setup. The clone is handed back with the work, so that it is dropped outside
+    /// the timing too.
     ///
     /// # Panics
     /// Panics if the network is refused, which [`check`](Self::check) rules out.
@@ -435,64 +384,56 @@ impl<'k> WarmStart<'k> {
         let Self { network, kept, flows } = self;
         let problem = problem_of(network);
 
-        bencher.iter_batched(
-            || kept.ready(),
-            |mut solver| {
-                let work = entry.answer(&mut solver, &problem, flows).expect("the network should be admitted").work;
-                (work, solver)
-            },
-            // One clone, made just before its iteration: each solve runs on columns written a moment before, warm in
-            // the cache, as a resolve runs on the solver that just solved. A batch would make many clones first and
-            // solve most of them after the later ones had pushed them out of the cache, more so the larger the
-            // network, so that rows of different sizes would be timed in different states of the cache.
-            BatchSize::PerIteration,
-        );
+        // One clone, made just before its iteration: each solve runs on columns written a moment before, warm in the
+        // cache, as a load runs on the network that just solved. A batch would make many clones first and solve most
+        // of them after the later ones had pushed them out of the cache, more so the larger the network, so that rows
+        // of different sizes would be timed in different states of the cache.
+        match entry {
+            Entry::Load => bencher.iter_batched(
+                || kept.network.ready(),
+                |mut held| {
+                    held.load(&problem).expect("the network should be admitted");
+                    let Answer { work, .. } = held.solve();
+                    // The flows written out of the optimum into the buffer, as the solver's row writes them: the two
+                    // rows of a pair answer the same output.
+                    if let Some(optimum) = held.optimum() {
+                        for (written, flow) in flows.iter_mut().zip(optimum.flows) {
+                            *written = flow;
+                        }
+                    }
+                    (work, held)
+                },
+                BatchSize::PerIteration,
+            ),
+            Entry::Solve => bencher.iter_batched(
+                || kept.solver.ready(),
+                |mut solver| {
+                    let work = solver.solve_into(&problem, flows).expect("the network should be admitted").work;
+                    (work, solver)
+                },
+                BatchSize::PerIteration,
+            ),
+        }
     }
 }
 
 impl CheckedPair {
     /// The line the suite prints for the pair `name`, whose change moved `moved`: the arcs, what moved, the outcome,
-    /// and the pivots of each entry, with a last clause where the work does not tell the starts apart.
+    /// and the pivots of each entry.
     fn line(self, name: &str, moved: Moved) -> String {
-        let Self { arc_count, total_cost, resolved, solved, start } = self;
+        let Self { arc_count, total_cost, loaded, solved } = self;
         let Moved { supplies, supply_units, capacities, costs } = moved;
         let outcome = match total_cost {
             Some(total_cost) => format!("optimal at {total_cost}"),
             None => "infeasible".to_owned(),
         };
-        let start = match start {
-            Start::Kept => "",
-            Start::NotToldApart => "; the work does not tell the start",
-        };
 
         format!(
             "checked {name}: {arc_count} arcs, moved {supplies} supplies by {supply_units} units, {capacities} \
-             capacities, {costs} costs; {outcome}; pivots: {} resolving, {} solving{start}",
-            resolved.pivots, solved.pivots
+             capacities, {costs} costs; {outcome}; pivots: {} loading, {} solving",
+            loaded.pivots, solved.pivots
         )
     }
-}
-
-/// How many entries of `after` differ from the entry at the same place of `before`.
-fn changed<T: PartialEq>(before: &[T], after: &[T]) -> usize {
-    before.iter().zip(after).filter(|(old, new)| old != new).count()
-}
-
-/// The cost of the flow `answer` holds; `None` where no flow exists.
-fn total_cost(answer: &Answer<OptimalFlow>) -> Option<i128> {
-    match &answer.outcome {
-        Outcome::Optimal(optimum) => Some(optimum.total_cost),
-        Outcome::Infeasible => None,
-    }
-}
-
-/// The costs of `row`'s family's network with its costs drawn from a stream of their own: `draws`, the generator of
-/// the change, jumped ahead by `2^128` draws, so that the two never draw the same numbers.
-fn redrawn_costs(row: Row, draws: &Xoshiro256PlusPlus) -> Vec<i64> {
-    let mut costs = draws.clone();
-    costs.jump();
-
-    row.family.network_with_costs(row.size, costs).costs
 }
 
 /// The perturbation of `network` drawn from the suite's seed: the testing crate's `perturbed`, from the first outputs
@@ -517,7 +458,7 @@ fn warm(criterion: &mut Criterion) {
     let mut group = flat_group(criterion, "warm");
 
     for row in Row::all() {
-        let kept = KeptSolver::new(&row.network());
+        let kept = Kept::new(&row.network());
 
         for change in Change::ALL {
             let Some(ChangedNetwork { network, moved }) = change.applied(row) else { continue };

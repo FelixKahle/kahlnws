@@ -6,11 +6,12 @@ what cannot be made, copied or pickled, refused."""
 
 import copy
 import pickle
+from collections.abc import Callable
 
 import pytest
 
 import kahlnws
-from kahlnws import Answer, Breach, Solution, Table, Work
+from kahlnws import Answer, Bounds, Breach, ChangeBreach, Solution, Table, Work
 from networks import DEPOT
 
 # One value of every class that is plain data, every breach among them, each with values that differ from field to
@@ -21,6 +22,7 @@ VALUES: list[object] = [
     Answer(Solution([2, 2, 2], [0, 1, 5], 14), Work(4, 1, 0)),
     Answer(-(2**100), Work(1, 0, 1)),
     Answer(None, Work(1, 0, 0)),
+    Bounds(lower_bound=2, capacity=2**64 - 1),
     Table.HEADS,
     Table.LOWER_BOUNDS,
     Table.CAPACITIES,
@@ -34,6 +36,11 @@ VALUES: list[object] = [
     Breach.CostTotalBeyondRange(2),
     Breach.Unbalanced(-(2**127)),
     Breach.NetSupplyBeyondRange(2**128 - 1),
+    ChangeBreach.LowerAboveCapacity(1, 6, 5),
+    ChangeBreach.CostBeyondBound(2, 2**62, 3),
+    ChangeBreach.CostTotalBeyondRange(4),
+    ChangeBreach.SupplyBeyondRange(2, -(2**63) - 1),
+    ChangeBreach.ExcessBeyondRange(2**64 - 1),
 ]
 
 
@@ -76,6 +83,10 @@ def test_what_cannot_be_made_by_calling_its_class_says_so() -> None:
         Table()
     with pytest.raises(TypeError):
         Breach()
+    with pytest.raises(TypeError):
+        ChangeBreach()
+    with pytest.raises(TypeError):
+        kahlnws.NetworkOptimum()
 
 
 def test_a_problem_error_made_by_hand_has_no_breach_and_one_raised_by_a_solve_pickles_with_its_breach() -> None:
@@ -101,3 +112,29 @@ def test_a_solver_is_neither_copied_nor_pickled() -> None:
 
 def test_a_table_converts_to_its_position() -> None:
     assert [int(table) for table in [Table.HEADS, Table.LOWER_BOUNDS, Table.CAPACITIES, Table.COSTS]] == [0, 1, 2, 3]
+
+
+def test_a_change_error_made_by_hand_has_no_breach_and_one_raised_by_a_change_pickles_with_its_breach() -> None:
+    assert kahlnws.ChangeError("made by hand").breach is None
+
+    with pytest.raises(kahlnws.ChangeError) as raised:
+        DEPOT.loaded().set_lower_bound(0, 4)
+    again = pickle.loads(pickle.dumps(raised.value))
+
+    assert type(again) is kahlnws.ChangeError
+    assert str(again) == "arc 0 has lower bound 4 above its capacity 3"
+    assert again.breach == ChangeBreach.LowerAboveCapacity(arc=0, lower_bound=4, capacity=3)
+
+
+def test_a_network_is_copied_but_not_pickled_and_its_optimum_neither() -> None:
+    network = DEPOT.loaded()
+    network.solve()
+    optimum = network.optimum()
+
+    with pytest.raises(TypeError):
+        pickle.dumps(network)
+    assert type(copy.deepcopy(network)) is kahlnws.Network
+    refusals: list[Callable[[object], object]] = [pickle.dumps, copy.copy, copy.deepcopy]
+    for refused in refusals:
+        with pytest.raises(TypeError):
+            refused(optimum)

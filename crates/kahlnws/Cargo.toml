@@ -6,7 +6,6 @@ name = "kahlnws"
 description = "A primal network simplex for the min-cost flow problem on exact integers"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,22 +13,23 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["min-cost-flow", "network-simplex", "optimization", "graph", "flow"]
 categories = ["algorithms", "mathematics", "science"]
-# `benches/rows.rs` is a module the benchmark suites share, not a target of its own: the bench targets are those
-# listed below.
+# The folder `benches/rows/` holds the modules the benchmark suites share, not targets of their own: `sweep.rs`, the
+# rows every suite sweeps, and `row_change.rs`, what the suites that change a row's network share. Each suite takes
+# the ones it uses by path. The bench targets are those listed below, the files directly in `benches/`.
 autobenches = false
 
 [lints]
 workspace = true
 
 [dependencies]
-# `ProblemError`'s `Display` and `Error`, one message per variant.
+# `ProblemError`'s and `ChangeError`'s `Display` and `Error`, one message per variant.
 thiserror = { workspace = true }
 # Tables keyed by a typed id: each node's net supply by its `NodeId`.
 typed-index-collections = { workspace = true }
 # The conversions of the id newtypes and their `Debug`, which names the type.
 derive_more = { workspace = true }
-# `izip!` for the check pass over the problem's columns, the write-out of the flows and the tree tests' read-out of
-# its columns; `at_most_one` for telling a single supply and demand from none or many in the first pivots.
+# `izip!` for the check pass over the problem's columns and the tree tests' read-out of its columns; `at_most_one`
+# for telling a single supply and demand from none or many in the first pivots.
 itertools = { workspace = true }
 
 [dev-dependencies]
@@ -42,8 +42,8 @@ kahlnws_testing = { workspace = true }
 proptest = { workspace = true }
 # The range proofs and the extreme problems checked in big integers, apart from the arithmetic under test.
 num-bigint = { workspace = true }
-# The seeded generator of the test runs that enter a violating arc drawn at random, and the generators the warm
-# benchmark suite draws its changes from.
+# The seeded generators of the test runs that enter a violating arc drawn at random and of a network's random calls,
+# and those the warm and the changes benchmark suites draw their changes from.
 rand_xoshiro = { workspace = true }
 # The unbiased draw of that arc among the violating ones, and the traits that seed and read the suite's generators.
 rand = { workspace = true }
@@ -77,16 +77,27 @@ test = true
 harness = false
 
 [[example]]
-name = "resolve"
+name = "network"
 test = true
 harness = false
 
-# The benchmark suites, each with its own criterion `main`: `benches/cold.rs`, cold solves of the seeded networks, and
-# `benches/warm.rs`, a resolve from a kept basis beside a solve of the same networks with some numbers changed.
+[[example]]
+name = "search"
+test = true
+harness = false
+
+# The benchmark suites, each with its own criterion `main`: `benches/cold.rs`, cold solves of the seeded networks;
+# `benches/warm.rs`, a load of a network that holds a kept basis and its solve beside a solve of the same networks with
+# some numbers changed; and `benches/changes.rs`, a held network changed by a few numbers and solved, beside a load of
+# the same changed network whole and its solve, and a solve of it.
 [[bench]]
 name = "cold"
 harness = false
 
 [[bench]]
 name = "warm"
+harness = false
+
+[[bench]]
+name = "changes"
 harness = false

@@ -4,11 +4,11 @@
 //! The Python binding of kahlnws: the extension module `kahlnws._kahlnws`, which the Python package `kahlnws`
 //! re-exports, and whose names the stubs `python/kahlnws/_kahlnws.pyi` declare.
 //!
-//! Every Python object a call is handed is read into memory the binding owns before the solve starts: a sequence
-//! entry by entry while the interpreter is attached, a buffer by the interpreter's own copy while its export is held.
-//! The solve then runs with the interpreter released on the binding's copy alone, and an answer is written back to a
-//! caller's buffer by the interpreter's copy again. No reference to memory Python owns is ever formed, so no other
-//! thread, whatever it writes meanwhile, can make the solve read a changing value.
+//! Every Python object a call is handed is read into memory the binding owns before the solve or the load starts: a
+//! sequence entry by entry while the interpreter is attached, a buffer by the interpreter's own copy while its export
+//! is held. The solve or the load then runs with the interpreter released on the binding's copy alone, and an answer
+//! is written back to a caller's buffer by the interpreter's copy again. No reference to memory Python owns is ever
+//! formed, so no other thread, whatever it writes meanwhile, can make the solve or the load read a changing value.
 //!
 //! Docstrings. The Python docstrings of the classes, methods and functions are written once, here, as their doc
 //! comments, in the form a Python reader of `help()` expects (a summary line, `Args:`, `Returns:`, `Raises:`, an
@@ -21,9 +21,13 @@
 
 mod answer;
 mod argument;
+mod bounds;
 mod breach;
+mod change_breach;
 mod column;
+mod integer;
 mod items;
+mod network;
 mod output;
 mod solution;
 mod solver;
@@ -49,14 +53,17 @@ static ALLOCATOR: kahlnws_testing::CountingAllocator = kahlnws_testing::Counting
 ///
 /// Raises:
 ///     OverflowError: `node_count` is below zero or past the platform's `size_t`.
+///     TypeError: `node_count` is no integer.
 ///
 /// Example:
 ///     >>> kahlnws.cost_bound(1000)
 ///     4611686018427387
 #[pyfunction]
 #[pyo3(signature = (node_count))]
-fn cost_bound(node_count: usize) -> i64 {
-    kahlnws::cost_bound(node_count)
+fn cost_bound(node_count: &Bound<'_, PyAny>) -> PyResult<i64> {
+    let node_count = integer::count(argument::Count::NodeCount, node_count)?;
+
+    Ok(kahlnws::cost_bound(node_count))
 }
 
 /// The extension module of the package `kahlnws`, which re-exports every name it holds.
@@ -70,7 +77,11 @@ mod _kahlnws {
     #[pymodule_export]
     use crate::breach::{Breach, ProblemError, Table};
     #[pymodule_export]
+    use crate::change_breach::{ChangeBreach, ChangeError};
+    #[pymodule_export]
     use crate::cost_bound;
+    #[pymodule_export]
+    use crate::network::{Network, NetworkOptimum};
     #[pymodule_export]
     use crate::solution::Solution;
     #[pymodule_export]
@@ -81,12 +92,15 @@ mod _kahlnws {
     #[expect(non_upper_case_globals, reason = "the name Python gives the version of a package")]
     const __version__: &str = env!("CARGO_PKG_VERSION");
 
-    /// Gives `ProblemError` the attribute `breach` at `None`, so that one made by hand answers it too.
+    /// Gives `ProblemError` and `ChangeError` the attribute `breach` at `None`, so that one made by hand answers it
+    /// too, and adds the class `Bounds`, a named tuple Python makes.
     ///
     /// # Errors
-    /// Passes on what Python raises while the attribute is set.
+    /// Passes on what Python raises while the attributes are set or the class is made.
     #[pymodule_init]
-    fn init(py: Python<'_>) -> PyResult<()> {
-        py.get_type::<ProblemError>().setattr("breach", py.None())
+    fn init(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+        py.get_type::<ProblemError>().setattr("breach", py.None())?;
+        py.get_type::<ChangeError>().setattr("breach", py.None())?;
+        module.add("Bounds", crate::bounds::class(py)?)
     }
 }

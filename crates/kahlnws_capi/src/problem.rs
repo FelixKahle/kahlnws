@@ -1,7 +1,7 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The problem as C gives it: its two counts and a pointer to each of its tables.
+//! The problem as C gives it: its two counts and a pointer to each of its tables; and its tables once lent.
 
 /// One min-cost flow problem as C lays it out: `arc_count` arcs between `node_count` nodes, each table given by a
 /// pointer to its first entry. Arc `a` is entry `a` of every per-arc table and node `v` entry `v` of the supplies.
@@ -41,11 +41,92 @@ pub struct Problem {
     pub supplies: *const i64,
 }
 
+/// The tables of a problem C gave, lent for one call as the library's problem.
+///
+/// # Invariant
+/// Only [`LentProblem::new`] makes one: every per-arc table holds one entry per tail, as one arc count gives them, so
+/// neither a solve nor a load refuses it as `ProblemError::Length`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LentProblem<'a> {
+    /// The problem, its tables borrowed from C.
+    problem: kahlnws::Problem<'a>,
+}
+
+impl<'a> LentProblem<'a> {
+    /// The tables of `problem`, lent.
+    ///
+    /// # Panics
+    /// Panics if a per-arc table of `problem` holds another number of entries than its tails.
+    #[track_caller]
+    pub(crate) fn new(problem: kahlnws::Problem<'a>) -> Self {
+        let arc_count = problem.tails.len();
+        let lower_bounds = problem.lower_bounds.map_or(arc_count, <[u64]>::len);
+        let tables = [problem.heads.len(), lower_bounds, problem.capacities.len(), problem.costs.len()];
+        assert!(
+            tables.iter().all(|&length| length == arc_count),
+            "called `LentProblem::new` with per-arc tables of lengths {tables:?}, which should each be the arc count \
+             {arc_count}"
+        );
+
+        Self { problem }
+    }
+
+    /// The problem, as the library takes it.
+    pub(crate) fn problem(&self) -> &kahlnws::Problem<'a> {
+        &self.problem
+    }
+
+    /// The number of nodes of the problem.
+    pub(crate) fn node_count(&self) -> usize {
+        self.problem.supplies.len()
+    }
+
+    /// The number of arcs of the problem.
+    pub(crate) fn arc_count(&self) -> usize {
+        self.problem.tails.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::{offset_of, size_of};
 
     use super::*;
+
+    /// The depot: node 0 sends 4 units to node 2, directly or through node 1.
+    fn depot() -> kahlnws::Problem<'static> {
+        kahlnws::Problem {
+            tails: &[0, 0, 1],
+            heads: &[2, 1, 2],
+            lower_bounds: None,
+            capacities: &[3, 4, 2],
+            costs: &[5, 1, 1],
+            supplies: &[4, 0, -4],
+        }
+    }
+
+    #[test]
+    fn test_a_lent_problem_answers_its_counts_and_its_tables() {
+        let lent = LentProblem::new(depot());
+
+        assert_eq!((lent.node_count(), lent.arc_count()), (3, 3));
+        assert_eq!(lent.problem().costs, &[5, 1, 1]);
+        assert_eq!(LentProblem::new(kahlnws::Problem { lower_bounds: Some(&[0, 1, 0]), ..depot() }).arc_count(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `LentProblem::new` with per-arc tables of lengths [3, 3, 2, 3], which should \
+                               each be the arc count 3")]
+    fn test_a_problem_with_a_table_of_another_length_is_not_lent() {
+        let _ = LentProblem::new(kahlnws::Problem { capacities: &[3, 4], ..depot() });
+    }
+
+    #[test]
+    #[should_panic(expected = "called `LentProblem::new` with per-arc tables of lengths [3, 2, 3, 3], which should \
+                               each be the arc count 3")]
+    fn test_a_problem_with_lower_bounds_of_another_length_is_not_lent() {
+        let _ = LentProblem::new(kahlnws::Problem { lower_bounds: Some(&[0, 0]), ..depot() });
+    }
 
     #[test]
     fn test_the_layout_c_reads_is_eight_words_in_the_declared_order() {

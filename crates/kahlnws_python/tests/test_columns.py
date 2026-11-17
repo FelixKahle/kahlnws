@@ -5,6 +5,7 @@
 way an argument can be refused, each named by its argument."""
 
 import ctypes
+import re
 import sys
 from array import array
 from collections.abc import Iterator, Sequence
@@ -126,14 +127,16 @@ def test_a_string_is_refused_entry_by_entry() -> None:
         ("costs", [5, 2**63, 1], 1, "9223372036854775808"),
         ("costs", [5, 1, -(2**63) - 1], 2, "-9223372036854775809"),
         ("supplies", [2**100, 0, -4], 0, str(2**100)),
-        ("supplies", [10**5000, 0, -4], 0, "an integer of 16610 bits"),
-        ("costs", [5, -(10**5000), 1], 1, "a negative integer of 16610 bits"),
+        ("supplies", [10**5000, 0, -4], 0, "2**16609 or more"),
+        ("costs", [5, -(10**5000), 1], 1, "-(2**16609 or more)"),
     ],
 )
 def test_an_entry_outside_its_range_is_refused_with_its_position_and_value(
     column: str, entries: list[int], position: int, written: str
 ) -> None:
-    with pytest.raises(OverflowError, match=rf"^{column}\[{position}\] is {written}, outside the range of an? "):
+    with pytest.raises(
+        OverflowError, match=rf"^{column}\[{position}\] is {re.escape(written)}, outside the range of an? "
+    ):
         solve_depot_with(**{column: entries})
 
 
@@ -150,7 +153,9 @@ def test_an_entry_outside_its_range_is_refused_with_its_position_and_value(
 def test_an_item_of_a_buffer_outside_its_range_is_refused_with_its_position_and_value(
     column: str, items: Sequence[int], position: int, written: str
 ) -> None:
-    with pytest.raises(OverflowError, match=rf"^{column}\[{position}\] is {written}, outside the range of an? "):
+    with pytest.raises(
+        OverflowError, match=rf"^{column}\[{position}\] is {re.escape(written)}, outside the range of an? "
+    ):
         solve_depot_with(**{column: items})
 
 

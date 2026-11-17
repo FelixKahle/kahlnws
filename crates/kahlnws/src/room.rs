@@ -1,8 +1,8 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The room a solver keeps from one solve to the next: columns that are rewritten in the room they hold, never shrunk,
-//! and reserved or grown up to a total.
+//! The room a front end keeps from one solve to the next: columns that are rewritten in the room they hold, never
+//! shrunk, and reserved or grown up to a total.
 
 use std::collections::TryReserveError;
 

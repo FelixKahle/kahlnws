@@ -200,9 +200,9 @@ def test_a_read_only_output_is_refused() -> None:
 
 
 def test_an_output_of_another_length_is_refused_with_both_lengths() -> None:
-    with pytest.raises(ValueError, match=r"^flows has length 2, not the arc count 3$"):
+    with pytest.raises(ValueError, match=r"^flows holds 2 entries for a problem of 3 arcs$"):
         solve_depot_into(array("Q", [0, 0]))
-    with pytest.raises(ValueError, match=r"^potentials has length 4, not the node count 3$"):
+    with pytest.raises(ValueError, match=r"^potentials holds 4 entries for a problem of 3 nodes$"):
         solve_depot_into(array("Q", [0, 0, 0]), array("q", [0, 0, 0, 0]))
 
 
@@ -215,7 +215,7 @@ def test_an_output_of_two_dimensions_is_refused() -> None:
 
 def test_an_output_of_the_wrong_length_is_refused_before_a_breach_of_the_problem() -> None:
     # The supplies do not balance, and the flows are one short: the buffer is answered first, as the library does.
-    with pytest.raises(ValueError, match=r"^flows has length 1, not the arc count 2$"):
+    with pytest.raises(ValueError, match=r"^flows holds 1 entries for a problem of 2 arcs$"):
         kahlnws.NetworkSimplex().solve_into(
             tails=[0, 0], heads=[1, 1], capacities=[1, 1], costs=[1, 1], supplies=[1, 0], flows=array("Q", [0])
         )

@@ -18,9 +18,10 @@ use pyo3::conversion::FromPyObjectOwned;
 use pyo3::exceptions::PyTypeError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyInt, PyList, PyMapping, PyMemoryView, PyTuple};
+use pyo3::types::{PyList, PyMapping, PyMemoryView, PyTuple};
 
-use crate::argument::{Argument, ArgumentError, EntryValue, Input, raised_reading, type_name};
+use crate::argument::{Argument, ArgumentError, Input, IntegerValue, raised_reading, type_name};
+use crate::integer::{self, Converted};
 use crate::items::{Items, Width};
 
 /// An integer type a column of a problem is held in, with the items a buffer states where it holds exactly this type.
@@ -248,7 +249,7 @@ impl Staging {
         let staged = &bytemuck::cast_slice::<u64, S>(&self.words)[..shape.count];
         reserve_entries(input, column, shape.count)?;
         convert(staged, column, value).map_err(|OutOfRange { position, value }| {
-            ArgumentError::EntryOutOfRange { input, position, value: EntryValue::Integer(value) }.into()
+            ArgumentError::EntryOutOfRange { input, position, value: IntegerValue::Integer(value) }.into()
         })
     }
 }
@@ -361,46 +362,13 @@ fn convert_entry<'py, T>(input: Input, position: usize, entry: &Bound<'py, PyAny
 where
     T: FromPyObjectOwned<'py>,
 {
-    let py = entry.py();
-    let integer = match entry.cast::<PyInt>() {
-        Ok(integer) => integer.clone(),
-        Err(_) if entry.get_type().hasattr(intern!(py, "__index__"))? => {
-            index_of(entry).map_err(|error| raised_reading(py, error, input))?
+    match integer::convert(entry).map_err(|error| raised_reading(entry.py(), error, input))? {
+        Converted::Within(converted) => Ok(converted),
+        Converted::Outside(value) => Err(ArgumentError::EntryOutOfRange { input, position, value }.into()),
+        Converted::NotAnInteger => {
+            Err(ArgumentError::EntryNotAnInteger { input, position, type_name: type_name(entry)? }.into())
         }
-        Err(_) => return Err(ArgumentError::EntryNotAnInteger { input, position, type_name: type_name(entry)? }.into()),
-    };
-
-    // The value is an `int` now, so the one way its conversion fails is a value outside the range of `T`.
-    match integer.extract::<T>() {
-        Ok(converted) => Ok(converted),
-        Err(_) => Err(ArgumentError::EntryOutOfRange { input, position, value: value_of(&integer)? }.into()),
     }
-}
-
-/// The `int` that `operator.index` makes of `entry`, which calls its `__index__` once.
-///
-/// # Errors
-/// Passes on what `__index__` raises, and the `TypeError` of one that answers no `int`.
-fn index_of<'py>(entry: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyInt>> {
-    let py = entry.py();
-    let index = py.import(intern!(py, "operator"))?.getattr(intern!(py, "index"))?.call1((entry,))?;
-
-    Ok(index.cast_into::<PyInt>()?)
-}
-
-/// The value of `integer`, as a message gives it: in decimal where it fits 128 bits, else by its sign and its bits.
-///
-/// # Errors
-/// Passes on what the comparison or `int.bit_length` raises, which for an `int` is nothing but a `MemoryError`.
-fn value_of(integer: &Bound<'_, PyInt>) -> PyResult<EntryValue> {
-    if let Ok(value) = integer.extract::<i128>() {
-        return Ok(EntryValue::Integer(value));
-    }
-
-    let negative = integer.lt(0)?;
-    let bits = integer.call_method0(intern!(integer.py(), "bit_length"))?.extract::<u64>()?;
-
-    Ok(EntryValue::Long { negative, bits })
 }
 
 #[cfg(test)]
@@ -567,24 +535,10 @@ mod tests {
             assert_eq!(message_of::<pyo3::exceptions::PyOverflowError>(py, &error), (true, message));
 
             let error = convert_entry::<i64>(Input::Costs, 1, &entry("10**5000")?).expect_err("too long to print");
-            assert!(error.value(py).to_string().starts_with("costs[1] is an integer of 16610 bits, outside"));
+            assert!(error.value(py).to_string().starts_with("costs[1] is 2**16609 or more, outside"));
 
             let error = convert_entry::<i64>(Input::Costs, 0, &entry("1.5")?).expect_err("no index");
             assert_eq!(error.value(py).to_string(), "costs[0] is of type float, not an integer");
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_value_of_by_hand() {
-        with_python(|py| {
-            let value =
-                |expression: &str| -> PyResult<EntryValue> { value_of(evaluate(py, expression)?.cast::<PyInt>()?) };
-            assert_eq!(value("2**64")?, EntryValue::Integer(1 << 64));
-            assert_eq!(value("-(2**127)")?, EntryValue::Integer(i128::MIN));
-            assert_eq!(value("2**127")?, EntryValue::Long { negative: false, bits: 128 });
-            assert_eq!(value("-(2**200)")?, EntryValue::Long { negative: true, bits: 201 });
 
             Ok(())
         });

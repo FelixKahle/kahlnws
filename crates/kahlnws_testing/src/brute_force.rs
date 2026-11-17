@@ -32,15 +32,9 @@ pub fn brute_force_optimum(network: &MincostNetwork) -> Option<i128> {
         .shaped()
         .unwrap_or_else(|breach| panic!("called `brute_force_optimum` on a network of broken shape: {breach}"));
 
-    if let Some(arc) = shaped.arc_past_cost_total(i128::MAX.cast_unsigned()) {
-        panic!("called `brute_force_optimum` on costs whose magnitudes at capacity sum past i128::MAX at arc {arc}");
+    if let Err(beyond) = admission(shaped) {
+        panic!("called `brute_force_optimum` on {beyond}");
     }
-
-    let flows = flow_count(shaped);
-    assert!(
-        flows <= BRUTE_FORCE_FLOWS,
-        "called `brute_force_optimum` on a network of {flows} flows, which should be at most {BRUTE_FORCE_FLOWS}"
-    );
 
     let mut odometer = Odometer::new(shaped)?;
     let mut excesses = Vec::with_capacity(shaped.node_count());
@@ -55,6 +49,63 @@ pub fn brute_force_optimum(network: &MincostNetwork) -> Option<i128> {
             return least;
         }
     }
+}
+
+/// Whether [`brute_force_optimum`] tries `network`: its costs' magnitudes at capacity sum to at most `i128::MAX`, and
+/// its arcs of ordered bounds admit at most [`BRUTE_FORCE_FLOWS`] flows together, the product of `capacity − lower + 1`
+/// over them. The one statement of what the brute force admits, which a test that draws past it asks first.
+///
+/// # Panics
+/// Panics if the shape of `network` is broken.
+pub fn brute_force_admits(network: &MincostNetwork) -> bool {
+    let shaped = network
+        .shaped()
+        .unwrap_or_else(|breach| panic!("called `brute_force_admits` on a network of broken shape: {breach}"));
+
+    admission(shaped).is_ok()
+}
+
+/// Why the brute force does not try a network of sound shape, with the values that say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Beyond {
+    /// The magnitudes of the costs at capacity sum past `i128::MAX` at this arc.
+    CostTotal {
+        /// The arc at which the running sum passes.
+        arc: usize,
+    },
+    /// The arcs of ordered bounds admit more flows together than [`BRUTE_FORCE_FLOWS`].
+    Flows {
+        /// The number of flows they admit, `u128::MAX` past it.
+        flows: u128,
+    },
+}
+
+impl core::fmt::Display for Beyond {
+    /// The condition, as it follows "called `brute_force_optimum` on" in a panic.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::CostTotal { arc } => {
+                write!(formatter, "costs whose magnitudes at capacity sum past i128::MAX at arc {arc}")
+            }
+            Self::Flows { flows } => {
+                write!(formatter, "a network of {flows} flows, which should be at most {BRUTE_FORCE_FLOWS}")
+            }
+        }
+    }
+}
+
+/// Whether the brute force tries `network`, and why not where it does not: the one statement of its two conditions.
+///
+/// # Errors
+/// [`Beyond::CostTotal`] where the costs' magnitudes at capacity sum past `i128::MAX`, else [`Beyond::Flows`] where the
+/// arcs of ordered bounds admit more than [`BRUTE_FORCE_FLOWS`] flows.
+fn admission(network: ShapedNetwork<'_>) -> Result<(), Beyond> {
+    if let Some(arc) = network.arc_past_cost_total(i128::MAX.cast_unsigned()) {
+        return Err(Beyond::CostTotal { arc });
+    }
+    let flows = flow_count(network);
+
+    if flows <= BRUTE_FORCE_FLOWS { Ok(()) } else { Err(Beyond::Flows { flows }) }
 }
 
 /// An optimal answer of a min-cost solve as plain numbers: the flows, the potentials that price them optimal, and their
@@ -202,6 +253,48 @@ mod tests {
         network.add_arc(from, to, 0, 1, 3);
 
         network
+    }
+
+    #[test]
+    fn test_the_brute_force_admits_up_to_its_limit_of_flows_by_hand() {
+        // Seven loops of width 2 at one node: `3^7`, the limit. One widened to 3: `4·3^6`, past it. No arc: one flow.
+        let at_the_limit = MincostNetwork::from_arcs(&[0], &[(0, 0, 0, 2, 1); 7]);
+        assert!(brute_force_admits(&at_the_limit));
+        assert_eq!(brute_force_optimum(&at_the_limit), Some(0));
+
+        let mut past = at_the_limit.clone();
+        past.capacities[3] = 3;
+        assert!(!brute_force_admits(&past));
+        assert!(brute_force_admits(&MincostNetwork::from_arcs(&[0, 0], &[])));
+
+        // An arc whose lower bound passes its capacity admits no flow and counts for none.
+        let mut crossed = past.clone();
+        crossed.lower_bounds[3] = 4;
+        assert!(brute_force_admits(&crossed));
+    }
+
+    #[test]
+    fn test_the_admission_names_the_condition_not_met_by_hand() {
+        let dear = (0, 1, u64::MAX - 1, u64::MAX, i64::MAX);
+        let twice = MincostNetwork::from_arcs(&[0, 0], &[dear, dear]);
+        assert_eq!(admission(shaped(&twice)), Err(Beyond::CostTotal { arc: 1 }));
+        let wide = MincostNetwork::from_arcs(&[0], &[(0, 0, 0, 2, 1); 8]);
+        assert_eq!(admission(shaped(&wide)), Err(Beyond::Flows { flows: 3_u128.pow(8) }));
+        assert_eq!(admission(shaped(&MincostNetwork::from_arcs(&[0], &[(0, 0, 0, 2, 1); 7]))), Ok(()));
+        assert_eq!(Beyond::Flows { flows: 6561 }.to_string(), "a network of 6561 flows, which should be at most 2187");
+        assert_eq!(
+            Beyond::CostTotal { arc: 1 }.to_string(),
+            "costs whose magnitudes at capacity sum past i128::MAX at arc 1"
+        );
+    }
+
+    #[test]
+    fn test_the_brute_force_admits_no_costs_whose_magnitudes_at_capacity_pass_i128_max_by_hand() {
+        // Arcs of width 1 at the top of `u64`, costing `i64::MAX`: two flows each, so the count admits them; one costs
+        // `(2^63 − 1)·(2^64 − 1)` at capacity, below `i128::MAX`, and two pass it.
+        let dear = (0, 1, u64::MAX - 1, u64::MAX, i64::MAX);
+        assert!(brute_force_admits(&MincostNetwork::from_arcs(&[0, 0], &[dear])));
+        assert!(!brute_force_admits(&MincostNetwork::from_arcs(&[0, 0], &[dear, dear])));
     }
 
     #[test]

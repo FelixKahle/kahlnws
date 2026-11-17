@@ -1,34 +1,13 @@
 # Copyright 2026 Felix Kahle
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""Small networks the tests solve, held as plain lists, the entries that solve them, and the check of an answer against
+"""Small networks the tests solve, held as plain lists, the calls that solve them, and the check of an answer against
 its network."""
 
 from array import array
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeAlias
 
 import kahlnws
-
-# An entry of the high level, called on a solver with the columns by keyword.
-Solve: TypeAlias = Callable[..., kahlnws.Answer[kahlnws.Solution]]
-
-# An entry of the low level, called on a solver with the columns and the outputs by keyword.
-SolveInto: TypeAlias = Callable[..., kahlnws.Answer[int]]
-
-# The two entries of each level: the one that starts from the problem alone, and the one that starts from the basis the
-# solver kept where it serves. A test of what both entries of a level share runs once for each.
-HIGH_LEVEL: list[Solve] = [kahlnws.NetworkSimplex.solve, kahlnws.NetworkSimplex.resolve]
-LOW_LEVEL: list[SolveInto] = [kahlnws.NetworkSimplex.solve_into, kahlnws.NetworkSimplex.resolve_into]
-
-# The entries of the two levels in pairs, by the problem alone and from the basis kept, for a test of both levels.
-ENTRY_PAIRS: list[tuple[Solve, SolveInto]] = list(zip(HIGH_LEVEL, LOW_LEVEL, strict=True))
-
-
-def named(entry: Callable[..., object]) -> str:
-    """The name of `entry`, which a test run once for each entry is told apart by."""
-    return entry.__name__
 
 
 @dataclass(frozen=True)
@@ -42,12 +21,9 @@ class Network:
     supplies: list[int]
     lower_bounds: list[int] | None = None
 
-    def answer(
-        self, solver: kahlnws.NetworkSimplex, entry: Solve = kahlnws.NetworkSimplex.solve
-    ) -> kahlnws.Answer[kahlnws.Solution]:
-        """What `solver` answers by `entry` for the network handed in as lists."""
-        return entry(
-            solver,
+    def answer(self, solver: kahlnws.NetworkSimplex) -> kahlnws.Answer[kahlnws.Solution]:
+        """What `solver` answers for the network handed in as lists."""
+        return solver.solve(
             tails=self.tails,
             heads=self.heads,
             capacities=self.capacities,
@@ -56,23 +32,18 @@ class Network:
             lower_bounds=self.lower_bounds,
         )
 
-    def solve(
-        self, solver: kahlnws.NetworkSimplex, entry: Solve = kahlnws.NetworkSimplex.solve
-    ) -> kahlnws.Solution | None:
-        """The solution `solver` finds by `entry` for the network handed in as lists; `None` where it is infeasible."""
-        return self.answer(solver, entry).outcome
+    def solve(self, solver: kahlnws.NetworkSimplex) -> kahlnws.Solution | None:
+        """The solution `solver` finds for the network handed in as lists; `None` where it is infeasible."""
+        return self.answer(solver).outcome
 
     def answer_into(
         self,
         solver: kahlnws.NetworkSimplex,
         flows: "array[int]",
         potentials: "array[int] | None" = None,
-        entry: SolveInto = kahlnws.NetworkSimplex.solve_into,
     ) -> kahlnws.Answer[int]:
-        """What `solver` answers by `entry` for the network handed in as lists, written into `flows` and
-        `potentials`."""
-        return entry(
-            solver,
+        """What `solver` answers for the network handed in as lists, written into `flows` and `potentials`."""
+        return solver.solve_into(
             tails=self.tails,
             heads=self.heads,
             capacities=self.capacities,
@@ -82,6 +53,19 @@ class Network:
             lower_bounds=self.lower_bounds,
             potentials=potentials,
         )
+
+    def loaded(self) -> kahlnws.Network:
+        """A network that holds this one's problem, handed in as lists."""
+        network = kahlnws.Network()
+        network.load(
+            tails=self.tails,
+            heads=self.heads,
+            capacities=self.capacities,
+            costs=self.costs,
+            supplies=self.supplies,
+            lower_bounds=self.lower_bounds,
+        )
+        return network
 
     def check(self, flows: list[int], potentials: list[int], total_cost: int) -> None:
         """Asserts that `flows` is a flow of the network of cost `total_cost` and that `potentials` prove it optimal.

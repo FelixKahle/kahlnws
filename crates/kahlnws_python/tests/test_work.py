@@ -1,8 +1,8 @@
 # Copyright 2026 Felix Kahle
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""The answer of both levels and both entries of each: what a solve found beside the work it did, optimal and
-infeasible alike, and the two values `Answer` and `Work` as Python handles them."""
+"""The answer of both levels of the solver and of a network's solve: what a solve found beside the work it did, optimal
+and infeasible alike, and the two values `Answer` and `Work` as Python handles them."""
 
 from array import array
 
@@ -10,55 +10,40 @@ import pytest
 
 import kahlnws
 from kahlnws import Answer, Work
-from networks import CUT, DEPOT, ENTRY_PAIRS, Network, Solve, SolveInto, named
-
-# The entries of the two levels in pairs, each pair called on fresh solvers: a resolve on a solver that never solved
-# answers what a solve answers, its work included.
-PAIRS = pytest.mark.parametrize(("entry", "entry_into"), ENTRY_PAIRS, ids=named)
+from networks import CUT, DEPOT, Network
 
 # Node 0 must send 2 units to node 1 over an arc of capacity 1; an arc back of capacity 5 does not help. One pivot
 # fills the forward arc, and then no arc violates its bound while a root link still carries flow.
 CUT_WITH_A_WAY_BACK = Network(tails=[0, 1], heads=[1, 0], capacities=[1, 5], costs=[1, 1], supplies=[2, -2])
 
 
-def both_levels(
-    network: Network,
-    entry: Solve = kahlnws.NetworkSimplex.solve,
-    entry_into: SolveInto = kahlnws.NetworkSimplex.solve_into,
-) -> tuple[Answer[kahlnws.Solution], Answer[int]]:
-    """What a fresh solver answers for `network` at the high level by `entry` and at the low level by `entry_into`."""
-    high = network.answer(kahlnws.NetworkSimplex(), entry)
-    low = network.answer_into(kahlnws.NetworkSimplex(), array("Q", [0] * len(network.tails)), entry=entry_into)
+def both_levels(network: Network) -> tuple[Answer[kahlnws.Solution], Answer[int]]:
+    """What a fresh solver answers for `network` by `solve` and by `solve_into`."""
+    high = network.answer(kahlnws.NetworkSimplex())
+    low = network.answer_into(kahlnws.NetworkSimplex(), array("Q", [0] * len(network.tails)))
     return high, low
 
 
-@PAIRS
-def test_the_depot_answers_its_solution_and_its_work_by_hand(entry: Solve, entry_into: SolveInto) -> None:
-    high, low = both_levels(DEPOT, entry, entry_into)
+def test_the_depot_answers_its_solution_and_its_work_by_hand() -> None:
+    high, low = both_levels(DEPOT)
 
     assert high.outcome is not None
     assert high.outcome.total_cost == low.outcome == 14
     assert high.work == low.work == Work(pivots=4, degenerate_pivots=1, first_arc_pivots=0)
 
 
-@PAIRS
 @pytest.mark.parametrize("network", [CUT_WITH_A_WAY_BACK, CUT])
-def test_an_infeasible_problem_answers_none_and_its_work_by_hand(
-    network: Network, entry: Solve, entry_into: SolveInto
-) -> None:
-    high, low = both_levels(network, entry, entry_into)
+def test_an_infeasible_problem_answers_none_and_its_work_by_hand(network: Network) -> None:
+    high, low = both_levels(network)
 
     assert high.outcome is None
     assert low.outcome is None
     assert high.work == low.work == Work(1, 0, 0)
 
 
-@PAIRS
-def test_a_problem_of_no_arc_does_no_work(entry: Solve, entry_into: SolveInto) -> None:
+def test_a_problem_of_no_arc_does_no_work() -> None:
     for supplies in [[], [0, 0]]:
-        high, low = both_levels(
-            Network(tails=[], heads=[], capacities=[], costs=[], supplies=supplies), entry, entry_into
-        )
+        high, low = both_levels(Network(tails=[], heads=[], capacities=[], costs=[], supplies=supplies))
 
         assert high.outcome is not None
         assert low.outcome == 0
@@ -116,3 +101,27 @@ def test_an_answer_writes_itself_matches_and_names_its_outcome_s_type() -> None:
             pytest.fail(f"the depot should answer a solution, not {other!r}")
 
     assert repr(Answer[int]) == "kahlnws.Answer[int]"
+
+
+def test_a_network_answers_the_depot_s_optimum_and_its_work_by_hand_and_no_pivot_again() -> None:
+    # A network's first solve starts from the star, as a solver's does, and makes the same four pivots on the depot,
+    # one of them degenerate; it tries no arcs before block search. Nothing changed, its next solve makes none.
+    network = DEPOT.loaded()
+
+    answer = network.solve()
+    assert (answer.outcome, answer.work) == (14, Work(pivots=4, degenerate_pivots=1, first_arc_pivots=0))
+    again = network.solve()
+
+    assert again.work == Work(0, 0, 0)
+    match again:
+        case Answer(int() as total_cost, Work(pivots=pivots)):
+            assert (total_cost, pivots) == (14, 0)
+        case other:
+            pytest.fail(f"the depot should answer a cost, not {other!r}")
+
+
+def test_a_network_of_no_arc_and_one_never_loaded_do_no_work() -> None:
+    for network in [kahlnws.Network(), Network(tails=[], heads=[], capacities=[], costs=[], supplies=[0, 0]).loaded()]:
+        answer = network.solve()
+
+        assert answer == Answer(0, Work(0, 0, 0))

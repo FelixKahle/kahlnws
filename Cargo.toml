@@ -1,8 +1,9 @@
 # Copyright 2026 Felix Kahle
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# kahlnws: a bare primal network simplex for the min-cost flow problem on exact integers. One problem in, borrowed as
-# plain slices, and one optimal flow out, or the answer that no flow exists.
+# kahlnws: a primal network simplex for the min-cost flow problem on exact integers, offered as two types: the
+# solver, one problem in, borrowed as plain slices, and one answer out, an optimal flow or that no flow exists; and a
+# network, which holds a problem through changes and loads of new numbers and solves it as it stands.
 #
 # Four crates under `crates/`, every edge pointing down: `kahlnws`, the library itself, which depends on no other
 # crate of this workspace; `kahlnws_capi`, the C boundary over it, built as a static and a dynamic library with the
@@ -23,14 +24,14 @@ members = ["crates/kahlnws", "crates/kahlnws_capi", "crates/kahlnws_python", "cr
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99.1"
 license = "MIT OR Apache-2.0"
 authors = ["Felix Kahle"]
 repository = "https://github.com/FelixKahle/kahlnws"
 
 [workspace.dependencies]
-# Error enums: `Display` and `source()` derived from one message per variant: the library's `ProblemError`, the
-# testing crate's breaches and the Python binding's `ArgumentError`. No `std` feature: the derive needs none.
+# Error enums: `Display` and `source()` derived from one message per variant: the library's `ProblemError` and
+# `ChangeError`, the testing crate's breaches and the Python binding's `ArgumentError`, `NotBelowCount` and
+# `BalancedByItself`. No `std` feature: the derive needs none.
 thiserror = { version = "2.0.21", default-features = false }
 # The library's tables keyed by a typed id, such as each node's net supply keyed by `NodeId`. `alloc` alone: the
 # growable `TiVec`; neither `std` nor `serde` is wanted.
@@ -45,7 +46,7 @@ itertools = { version = "0.15.0", default-features = false, features = ["use_std
 # Big integers, in which the library's range tests recompute every bound apart from the arithmetic under test. No
 # `std`: the tests only compute, compare and convert.
 num-bigint = { version = "0.5.1", default-features = false }
-# The library, for the C boundary and the Python binding that wrap it.
+# The library, its solver and its network, for the C boundary and the Python binding that wrap it.
 kahlnws = { path = "crates/kahlnws" }
 # The test infrastructure the tests of the library, the C boundary and the Python binding share: the plain networks,
 # their strategies, the counting allocator.
@@ -71,8 +72,8 @@ rand_xoshiro = { version = "0.8.1", default-features = false }
 # draws from them.
 rand = { version = "0.10.3", default-features = false, features = ["unbiased"] }
 # The writer of the C boundary crate's header, run by its build script from the crate's sources: a build-dependency
-# of that crate alone, none of whose code is linked into any library (MPL-2.0, the one licence exception
-# `docs/style.md` names). No default feature: `clap` serves its command line, which the build script does not use.
+# of that crate alone, none of whose code is linked into any library (MPL-2.0, the one licence exception the
+# workspace admits). No default feature: `clap` serves its command line, which the build script does not use.
 cbindgen = { version = "0.29.4", default-features = false }
 # The Python binding's bridge to the interpreter: its classes, methods, functions, module and exception, written with
 # the attribute macros of `macros`, and the buffer protocol. `abi3-py311` builds one extension for every CPython from

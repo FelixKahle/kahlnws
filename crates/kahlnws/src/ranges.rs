@@ -62,6 +62,13 @@ pub const fn cost_bound(node_count: usize) -> i64 {
     bound.cast_signed()
 }
 
+/// Whether `cost` lies within plus or minus `bound`, the [`cost_bound`] of a problem's node count: the one test of a
+/// cost against its bound, which a problem's check, a change of a network and a basis's change of a cost all make.
+pub(crate) const fn within_cost_bound(cost: i64, bound: i64) -> bool {
+    // A bound is never negative, so its negation does not overflow.
+    -bound <= cost && cost <= bound
+}
+
 /// The most a start's excesses may add up to where they are positive, in units of flow: `2^64 − 2`. A node's excess is
 /// its supply net of the lower bounds and of what the arcs out of the starting tree carry; in the star, where they
 /// carry nothing, it is the node's net supply, so the supplies net of the lower bounds keep it too. Within it no root
@@ -70,7 +77,7 @@ pub const fn cost_bound(node_count: usize) -> i64 {
 // root conserves; each total is at most the start's positive excess total `P`, at most this limit: in the star each is
 // `P`, and the re-flow of a kept basis places at most `P` either way (`Reflow::flow_up`). The root conserves, so a
 // pivot raises both totals or neither; a pivot that raises both runs up a root link that points up, at cost zero, and
-// down one that points down, at cost `M`, a cycle of cost at least `M − (n − 1)·C = 1`, which never enters. So no
+// down one that points down, at cost `M`, a cycle of cost at least `M − (n − 1)·C ≥ 1`, which never enters. So no
 // root-link flow passes `P`.
 //
 // A cycle through the root passes two root links. Running along both is the pivot that never enters; running against
@@ -164,6 +171,22 @@ pub(crate) fn root_cost(node_count: usize, largest_cost: u64) -> i64 {
     }
 }
 
+/// The root cost that serves every problem of `node_count` nodes whose costs lie within [`cost_bound`]: the
+/// [`root_cost`] of costs of magnitude `B = cost_bound(node_count)`, `(n − 1)·B + 1`, at most `2^62`.
+///
+/// A basis whose root links cost it is a basis of every such problem, whatever its largest cost: it is at least each
+/// one's own root cost, and every number a solve forms with it stays within `i64`.
+pub(crate) fn widest_root_cost(node_count: usize) -> i64 {
+    // At least the problem's own, since `C ≤ B`, so `M − (n − 1)·C ≥ 1` holds, which is all the star,
+    // `NET_SUPPLY_LIMIT` and the decision whether every supply is routed ask of a root cost. And the argument written
+    // in `cost_bound` holds with `B` where it has `C`: every potential lies within `[−(n − 1)·B, 2(n − 1)·B + 1]` and
+    // every reduced cost and partial sum within `±((2n − 1)·B + 1)`, below `2^63` since `n·B < 2^62`. The same bound
+    // keeps `root_cost` from panicking: `(n − 1)·B + 1 ≤ n·B < 2^62` where `B ≥ 1`. The argument reads no tree and no
+    // cost but the bound, so it holds after any change of a cost within `±B` too, once the potentials are again the
+    // ones the tree implies (`Basis::set_cost`).
+    root_cost(node_count, cost_bound(node_count).unsigned_abs())
+}
+
 /// `total` plus the magnitude of `cost` times `capacity`; `None` past `i128::MAX`. A running total of the arcs that
 /// stays `Some` bounds the cost of every flow within their capacities, and of every partial sum of it, by
 /// `i128::MAX` in magnitude.
@@ -233,6 +256,15 @@ mod tests {
     }
 
     #[test]
+    fn test_within_cost_bound_admits_exactly_the_closed_range_by_hand() {
+        assert!(within_cost_bound(5, 5) && within_cost_bound(-5, 5) && within_cost_bound(0, 0));
+        assert!(!within_cost_bound(6, 5) && !within_cost_bound(-6, 5) && !within_cost_bound(1, 0));
+        let bound = cost_bound(1);
+        assert!(within_cost_bound(-bound, bound) && !within_cost_bound(i64::MIN, bound));
+        assert!(!within_cost_bound(i64::MAX, bound));
+    }
+
+    #[test]
     fn test_root_cost_by_hand() {
         assert_eq!(root_cost(3, 5), 11);
         assert_eq!(root_cost(1, 7), 1, "one node has no path");
@@ -272,6 +304,32 @@ mod tests {
     #[should_panic(expected = "called `root_cost` with 3 nodes and a largest cost of 18446744073709551615")]
     fn test_root_cost_past_u64_panics() {
         let _ = root_cost(3, u64::MAX);
+    }
+
+    #[test]
+    fn test_the_widest_root_cost_by_hand() {
+        // Three nodes: `B = ⌊(2^62 − 1) / 3⌋ = 1537228672809129301`, so `2·B + 1`.
+        assert_eq!(widest_root_cost(3), 3_074_457_345_618_258_603);
+        assert_eq!(widest_root_cost(1), 1, "one node has no path");
+        assert_eq!(widest_root_cost(0), 1, "no node");
+        assert_eq!(widest_root_cost(2), (1 << 62) / 2, "`B = 2^61 − 1`, so `B + 1 = 2^61`");
+    }
+
+    #[test]
+    fn test_the_widest_root_cost_at_every_node_count_against_big_integers() {
+        // `(n − 1)·B + 1` recomputed apart, at most `2^62`, and at least the root cost of any cost within the bound.
+        for node_count in NODE_COUNTS {
+            let bound = BigInt::from(cost_bound(node_count));
+            let expected = (BigInt::from(node_count) - 1) * &bound + 1;
+            let widest = widest_root_cost(node_count);
+
+            assert_eq!(BigInt::from(widest), expected, "{node_count} nodes");
+            assert!(expected <= power_of_two(62), "{node_count} nodes");
+            let most = cost_bound(node_count).unsigned_abs();
+            for largest in [0, 1.min(most), most / 2, most] {
+                assert!(root_cost(node_count, largest) <= widest, "{node_count} nodes, largest cost {largest}");
+            }
+        }
     }
 
     #[test]

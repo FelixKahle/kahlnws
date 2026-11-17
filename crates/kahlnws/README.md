@@ -5,14 +5,21 @@
 
 kahlnws is a primal network simplex for the min-cost flow problem on exact integers. A problem is a set of nodes,
 each with a supply, and arcs between them, each with a lower bound, a capacity and a cost per unit of flow; a solve
-finds a flow of least cost that meets every supply within the bounds, or answers that no such flow exists.
+finds a flow of least cost that meets every supply within the bounds, or answers that no such flow exists. Two types,
+one contract each:
+
+- **The solver**, `NetworkSimplex`, is a function: a problem in, an answer out. It keeps its room and nothing else.
+- **A network**, `Network`, is a state: it holds one problem and a basis of it. It is changed a few numbers at a time
+  or loaded with new numbers on the same arcs, solved from the basis it holds, read and copied.
+
+What both guarantee:
 
 - **Exact.** Every number is an integer and every sum a solve forms is exact; the cost is an `i128`.
 - **Certified.** An optimal answer comes with the potentials that prove it optimal.
-- **No allocation within reserved room.** A solver keeps its room from one solve to the next; a solve into the
-  caller's buffers allocates nothing once the room is reserved.
-- **Solves again.** A solver keeps the basis its last solve ended on, and `resolve` starts from it: the same arcs with
-  some numbers changed often take far fewer pivots, to the same outcome and cost.
+- **No allocation within reserved room.** Once the room is reserved, a solve into the caller's buffers allocates
+  nothing, nor does a network's load, change or solve.
+- **Work that follows the change.** A network's change costs what it reaches, and a load on the same arcs often takes
+  far fewer pivots, to the outcome and the cost the solver answers.
 
 ## Example
 
@@ -52,10 +59,10 @@ fn main() -> Result<(), ProblemError> {
 - [The problem and the guarantees][problem-and-guarantees]: the linear program, the certificate, the
   ranges and the refusals.
 - [How it works][how-it-works]: the algorithm and the layout of its data.
-- [Benchmarks][benchmarks]: the suites, and a comparison with two LP solvers.
-- [The examples][examples]: five programs on one small transport network.
+- [Benchmarks][benchmarks]: the three suites, and a comparison with two LP solvers.
+- [The examples][examples]: six programs on one small transport network.
 
-The same solver is offered to C, C++ and Python from [the repository](https://github.com/FelixKahle/kahlnws).
+The solver and a network are offered to C, C++ and Python from [the repository](https://github.com/FelixKahle/kahlnws).
 
 ## Licence
 

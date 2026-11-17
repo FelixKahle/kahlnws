@@ -40,6 +40,9 @@ renumbered, and every answer is in the same order. `lower_bounds` may be left ou
 | `potentials` (answer) | one per node | `i64` each | `int64_t` each | `int` each |
 | `total_cost` (answer) | one | `i128` | `kahlnws_int128` | `int` |
 
+In C++ each table is a `kahlnws::span` of the type C reads, `lower_bounds` left empty where it is left out, and the
+answer has the types of C, the cost a `kahlnws::int128`.
+
 Every number is an integer, and so is every flow answered. Since the data are integers, an optimal flow in integers
 exists wherever an optimal flow exists at all, and the solve finds one.
 
@@ -218,56 +221,100 @@ from the three and are not stored:
 The counts are exact counts of that solve, not samples or estimates. A refused problem has no work, since no pivot is
 made.
 
-## Solving again
+## A network
 
-A solver keeps the basis its last solve ended on, after an optimal and after an infeasible answer alike: the spanning
-tree of [how it works](how-it-works.md#the-basis) and where each arc out of it stood. A solve never reads it. A
-resolve takes the arguments of a solve, answers the same kinds of answer and refuses the same problems, and starts
-from the kept basis where it serves:
+The solver keeps its room and nothing else: no basis, no problem, no answer outlives a solve. A network is the state:
+it holds one problem and a strongly feasible basis of it. A load hands it a whole problem, each change sets one number
+of it or moves supply between two nodes, and its solve finds the optimum of the problem as it then stands, answers its
+cost, and lends the optimum to be read. [How it works](how-it-works.md#a-network) says how. What each promises:
 
-- a solve of this solver, by any entry, has ended since the solver was made, and since any solve that stopped after
-  it began to write the basis;
-- the problem has the node count and the arc count of that solve, and every arc the tail and the head it had;
-- the supplies net of the lower bounds and of the flows the kept basis puts on its arcs out of the tree add up to at
-  most $2^{64} - 2$ where they are positive, the limit of the last range.
-
-Where it serves, the resolve keeps the tree and where each arc out of it stood, and reads every number of the problem
-anew: supplies, lower bounds, capacities and costs may all differ from the last problem's. Where it does not, the
-resolve is a solve, its answer and its work included. So a resolve has no precondition: any problem, after any call, is
-solved.
-
-What each entry guarantees:
-
-| | Solve | Resolve |
+| | The solver's solve | A network's solve |
 |---|---|---|
-| refusal | the first breach | the same |
-| outcome, optimal or infeasible | the problem's | the same |
+| outcome, optimal or infeasible | the problem's | the problem's as it stands |
 | `total_cost` | the least cost of a flow | the same |
 | `potentials` | prove the flows optimal | prove the flows optimal |
-| flows among tied optima, potentials, work | of the problem alone | of the problem and the solves before it |
-| `first_arc_pivots` | the pivots of the arcs tried first | zero where it starts from the kept basis |
+| flows among tied optima, potentials, work | of the problem alone | of the problem loaded and the calls since |
+| `first_arc_pivots` | the pivots of the arcs tried first | zero: it tries no arcs first |
 
-A resolve is deterministic: the same calls on a new solver answer the same, work included. Where only some numbers
-changed, a resolve often makes far fewer pivots than a solve; the same problem again, where the kept basis serves,
-makes none. [How it works](how-it-works.md#starting-from-the-kept-basis) says how a kept basis is made a basis of the
-new problem.
+Where the solver admits the problem a network holds, the two answer the same outcome and the same cost; the flows among
+tied optima, the potentials and the work may differ, since a network may pivot otherwise than the solver. Two networks
+given the same calls, in the same order, answer alike, their work included.
 
-A solve or a resolve that answers, optimal or infeasible, keeps the basis it ended on. A refused call, and a call turned
-away before its solve begins, such as a Rust call whose flow buffer has the wrong length, keeps the basis kept before
-it. A solve that stops after it began to write the basis, by a panic in Rust, leaves none, and the next resolve is a
-solve; in C, a call that answers `KAHLNWS_STATUS_INTERNAL_ERROR` may leave none.
+### A load
 
-| Language | Solve | Resolve |
+A load refuses what the solver's solve refuses, with the same breach, and a refused load leaves the network as it was,
+its basis and its optimum included. A load that is admitted starts from the basis the network holds where that basis
+serves:
+
+- the network holds a basis: it was loaded, and no call since stopped after it began to write;
+- the problem has the node count and the arc count of the problem held, and every arc the tail and the head it had;
+- the supplies net of the lower bounds and of the flows that basis puts on its arcs out of the tree add up to at most
+  $2^{64} - 2$ where they are positive, the limit of the last range.
+
+Otherwise it starts as the solver does, every arc at its lower bound. Every number of the problem is read anew either
+way, so supplies, lower bounds, capacities and costs may all differ from those held, and the solve after the load
+answers the same outcome and the same cost whichever start it took; the flow among tied optima, the potentials and the
+work may differ. Where only some numbers changed, that solve often makes far fewer pivots than the solver's, and the
+same problem loaded again from the network's optimum makes none. [How it
+works](how-it-works.md#a-load-from-the-basis-held) says how a basis held is made a basis of the new problem.
+
+### A change
+
+A setter answers the number it replaced, and supply only moves in pairs, so the supplies always add up to zero. Setting
+the number answered back, or moving the amount back with the two nodes swapped, makes the problem the earlier one; the
+next solve answers its outcome and its cost, with a flow of that cost, which among tied optima may be another than
+before. Between calls a network holds the problem as it stands and a basis of it, and never the changes that led there.
+
+A change that sets the number already held changes nothing. Every other change ends the optimum the network held,
+also where its flow stays optimal: until a solve finds a flow, no optimum is answered, and none of an earlier state
+can be read. A refused change changes nothing: the network keeps the problem and the optimum it held. A change is
+refused where the number it sets lies outside the ranges below, and names the breach and its values:
+
+| Breach | Refused where | Values |
 |---|---|---|
-| Rust | `solve`, `solve_into` | `resolve`, `resolve_into` |
-| C | `kahlnws_solver_solve` | `kahlnws_solver_resolve` |
-| C++ | `solve`, `solve_into` and their `try_` forms | `resolve`, `resolve_into` and their `try_` forms |
-| Python | `solve`, `solve_into` | `resolve`, `resolve_into` |
+| `LowerAboveCapacity` | a bound set leaves an arc's lower bound above its capacity | the arc, the two bounds |
+| `CostBeyondBound` | a cost set lies beyond $\pm$ `cost_bound(n)` | the arc, its cost, the node count |
+| `CostTotalBeyondRange` | a cost or capacity set takes $\sum \lvert c \rvert u$ past $2^{127} - 1$ | the arc changed |
+| `SupplyBeyondRange` | a supply set or moved leaves the signed 64-bit range | the node, the supply it would have |
+| `ExcessBeyondRange` | the change would leave more than $2^{64} - 2$ units of flow still to be sent | that flow |
+
+A load leaves to be sent what its start does not route, which from no basis held is the whole of the positive supplies
+net of the lower bounds, so a change right after a load of supplies near that limit can be refused; a change adds what
+the arcs could not carry at once; only a solve that finds a flow leaves none. [How it
+works](how-it-works.md#a-link-that-cannot-carry-what-arrives) says where that flow waits. A change set back directly
+after it is never refused but for `ExcessBeyondRange`, and that only where the flow still to be sent before the change
+and twice the flow the change moved add up past $2^{64} - 2$: never for amounts and flows below $2^{62}$. A load is
+refused as a solve is, and keeps what the network held where it is. An arc or a node not below its count is a caller's
+error, and so is a node given as its own balancing node with another supply than it has: a node that balances itself can
+only keep the supply it has, which changes nothing. Either is answered before anything changes: a panic in Rust,
+`KAHLNWS_STATUS_INVALID_ARGUMENT` in C, `error_kind::invalid_argument` in C++ or a thrown `std::invalid_argument`, and
+in Python an `IndexError` for an index not below its count or below zero and a `ValueError` for a node that balances
+itself.
+
+### The ranges a network keeps
+
+A load admits the ranges [a solve admits](#the-ranges-a-solve-admits). After changes, a network's numbers keep all of
+them but the last: every cost within $\pm$ `cost_bound(n)`, every lower bound at most its capacity,
+$\sum \lvert c_{ij} \rvert u_{ij} \le 2^{127} - 1$, the supplies adding up to zero, each within the signed 64-bit
+range, and the counts as loaded. In place of the last range, the flow still to be sent stays within $2^{64} - 2$.
+The supplies net of the lower bounds may come to add up past $2^{64} - 2$ where they are positive, after moves of
+supply and changes of lower bounds, where the arcs carry the difference: a solve and a load refuse such a problem as
+`NetSupplyBeyondRange`, and a network still solves it exactly, since its arithmetic rests on the flow still to be sent.
+Within these ranges every number a network's solve forms fits the type it is held in, as a solve's does.
+
+### What a panic leaves
+
+A change, a solve or a copy that stops after it began to write, by a panic in Rust, which only a defect of the library
+makes, leaves the network half changed. Its changes, its solve and its reads of the problem then panic again, it
+answers no optimum, a copy of it is half changed too, and a load mends it. In C such a call answers
+`KAHLNWS_STATUS_INTERNAL_ERROR`, in C++ `error_kind::internal_error` or a thrown `kahlnws::internal_error`, and in
+Python it raises `PanicException`; [the C guide](c-api.md#a-problem-held), [the C++ guide](cpp-api.md#a-problem-held)
+and [the Python guide](python-api.md#a-problem-held) say what each call then answers.
 
 ## Room and allocation
 
-A solver owns the room it works in: the columns a solve reads and writes. The room is kept from
-one solve to the next, never shrinks, and is freed with the solver. A new solver holds no room.
+A solver owns the room it works in: the columns a solve reads and writes. The room is kept from one solve to the next,
+never shrinks, and is freed with the solver. A new solver holds no room.
 
 The room for a problem is made by a reservation for at least its node and arc counts, or by an earlier solve of a
 problem at least as large that answered, optimal or infeasible. A solve of a problem within the room allocates nothing
@@ -275,20 +322,33 @@ in the library. What each interface allocates beside that:
 
 | Interface | Reservation | Memory refused | Solve that allocates nothing within the room |
 |---|---|---|---|
-| Rust | `try_reserve(nodes, arcs)` | answers a `TryReserveError` | `solve_into`, `resolve_into` |
-| C | `kahlnws_solver_reserve` | answers `KAHLNWS_STATUS_NO_ROOM` | `kahlnws_solver_solve`, `kahlnws_solver_resolve` |
-| Python | `reserve(nodes, arcs)` | raises `MemoryError` | `solve_into`, `resolve_into`, but for the answer and views |
+| Rust | `try_reserve(nodes, arcs)` | answers a `TryReserveError` | `solve_into` |
+| C | `kahlnws_solver_reserve` | answers `KAHLNWS_STATUS_NO_ROOM` | `kahlnws_solver_solve` |
+| C++ | `try_reserve(nodes, arcs)` | answers `error_kind::refused_memory` | `try_solve_into` |
+| Python | `reserve(nodes, arcs)` | raises `MemoryError` | `solve_into`, but for the answer and views |
 
-A resolve that starts from a kept basis reads one more column, a number per node, whose room a solve does not make. A
-reservation makes it, and so does a resolve that started from a kept basis. So in Rust `resolve_into` allocates nothing
-within the room made by `try_reserve`, or by an earlier resolve of a problem no larger that started from a kept basis.
-In C and Python every solve and resolve makes its room by a reservation before it starts.
+In Rust, `solve` allocates the flows and the potentials it answers, and so does `try_solve` in C++. In Python, each call
+makes its answer and a `memoryview` with an export record for each buffer it is handed; `solve` makes lists besides.
 
-In Rust, `solve` and `resolve` allocate the flows and the potentials they answer. In Python, each call makes its answer
-and a `memoryview` with an export record for each buffer it is handed; `solve` and `resolve` make lists besides.
+In Rust, a refused solve leaves the room short of the problem, though it may have grown one column. In C, C++ and
+Python the room is grown to the problem's counts before the problem is checked, so a refused problem may still have
+grown it.
 
-In Rust, a refused solve leaves the room short of the problem, though it may have grown one column. In C and Python the
-room is grown to the problem's counts before the problem is checked, so a refused problem may still have grown it.
+A network owns its room likewise, kept from one load to the next and only growing. The room for a problem is made by
+a reservation for at least its counts, or by an earlier load of a problem at least as large; a load within it
+allocates nothing, and a network's changes, its solve and its reads of the problem never allocate. A copy into a
+network whose room holds the counts of the network copied allocates nothing either, and a copy's changes and solves
+allocate nothing. What each interface allocates beside that:
+
+| Interface | Reservation | Copy | Memory refused |
+|---|---|---|---|
+| Rust | `Network::try_reserve` | `try_clone`, `try_clone_from` | answered by these three; `load` and `clone` abort |
+| C | `kahlnws_network_reserve` | `kahlnws_network_clone`, `kahlnws_network_copy` | `KAHLNWS_STATUS_NO_ROOM`, or null |
+| C++ | `network::try_reserve` | `try_clone`, `try_clone_from` | `error_kind::refused_memory`, also from `try_load` |
+| Python | `Network.reserve` | `copy()`, `copy_from` | raises `MemoryError` |
+
+In C++ the owned reads make the vectors they answer. In Python a call still makes its answer and the lists it
+answers, and a `memoryview` with an export record for each buffer it is handed.
 
 ## Determinism
 
@@ -297,29 +357,37 @@ version of kahlnws. The same problem gives the same answer from a new solver and
 before: a solve reads nothing an earlier call left but the room. Where several flows are optimal, which one is
 answered is not specified beyond that; reordering the arcs may change it, and its cost stays the same.
 
-A resolve reads the basis an earlier solve left as well. Its answer, its work included, is a function of the problem
-and of the calls the solver answered before it, and of the version of kahlnws; its outcome and its cost are the
-problem's alone.
+A network's answer, its work included, is a function of the problem it was loaded with and of the calls made on it
+since, in order, and of the version of kahlnws: two networks given the same calls answer alike. Its outcome and its
+cost are those of the problem as it stands.
 
 ## Threads
 
-The library starts no thread and keeps no global state. A solver serves one call at a time: in Rust a solve takes it
-by `&mut`; in C no two calls on the same solver may run at once, and in Python a second call raises
-`RuntimeError`. A solver may move between threads
-from one call to the next, and distinct solvers may solve at once on distinct threads, also problems that read the
-same tables. The Python package runs a solve with the interpreter released, so other Python threads run meanwhile.
+The library starts no thread and keeps no global state. A solver serves one call at a time: in Rust a solve takes it by
+`&mut`; in C and C++ no two calls on the same solver may run at once, and in Python a second call raises `RuntimeError`.
+A solver may move between threads from one call to the next, and distinct solvers may solve at once on distinct threads,
+also problems that read the same tables. A network likewise serves one call at a time: in Rust its changes and its solve
+take it by `&mut` and its reads by `&`, so an optimum it lends is read beside the reads alone. The Python package runs a
+solve, and a network's load and solve, with the interpreter released, so other Python threads run meanwhile.
 
 ## Names in each language
 
-| Concept | Rust | C | Python |
-|---|---|---|---|
-| solver | `NetworkSimplex` | `kahlnws_solver` | `kahlnws.NetworkSimplex` |
-| problem | `Problem` | `kahlnws_problem` | the keyword arguments of a solve |
-| answer | `Answer<T>` | the status and the outputs | `kahlnws.Answer` |
-| optimum, owned | `Solution` | none | `kahlnws.Solution` |
-| optimum, written | `Optimum` | the outputs on `KAHLNWS_STATUS_OPTIMAL` | the cost, an `int` |
-| infeasible | `Outcome::Infeasible` | `KAHLNWS_STATUS_INFEASIBLE` | `outcome` is `None` |
-| work | `Work` | `kahlnws_work` | `kahlnws.Work` |
-| refusal | `ProblemError` | `KAHLNWS_STATUS_REFUSED` and `kahlnws_refusal` | `kahlnws.ProblemError` |
-| breach | a variant of `ProblemError` | `kahlnws_refusal_kind` | a class of `kahlnws.Breach` |
-| cost bound | `cost_bound` | `kahlnws_cost_bound` | `kahlnws.cost_bound` |
+The C++ names are in the namespace `kahlnws`, and the Python names in the package `kahlnws`.
+
+| Concept | Rust | C | C++ | Python |
+|---|---|---|---|---|
+| solver | `NetworkSimplex` | `kahlnws_solver` | `network_simplex` | `NetworkSimplex` |
+| problem | `Problem` | `kahlnws_problem` | `problem` | the keyword arguments of a solve |
+| answer | `Answer<T>` | the status and the outputs | `answer<T>` | `Answer` |
+| optimum, owned | `Solution` | none | `solution` | `Solution` |
+| optimum, written | `Optimum` | the outputs on `KAHLNWS_STATUS_OPTIMAL` | `optimum` | the cost, an `int` |
+| infeasible | `Outcome::Infeasible` | `KAHLNWS_STATUS_INFEASIBLE` | `is_infeasible()` | `outcome` is `None` |
+| work | `Work` | `kahlnws_work` | `work` | `Work` |
+| refusal | `ProblemError` | `KAHLNWS_STATUS_REFUSED` and `kahlnws_refusal` | `refusal` | `ProblemError` |
+| breach | a variant of `ProblemError` | `kahlnws_refusal_kind` | `refusal_kind` | `Breach.*` |
+| cost bound | `cost_bound` | `kahlnws_cost_bound` | `cost_bound` | `cost_bound` |
+| network | `Network` | `kahlnws_network` | `network` | `Network` |
+| optimum, lent | `NetworkOptimum` | the reads of the optimum held | the same reads | `NetworkOptimum` |
+| refused change | `ChangeError` | `KAHLNWS_STATUS_REFUSED` and `kahlnws_refusal` | `change_refusal` | `ChangeError` |
+| breach of a change | a variant of `ChangeError` | `kahlnws_refusal_kind` | `change_refusal_kind` | `ChangeBreach.*` |
+| bounds of an arc | `Bounds` | two `uint64_t` | `bounds` | `Bounds`, a named tuple |

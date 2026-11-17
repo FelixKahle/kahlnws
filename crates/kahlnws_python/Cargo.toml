@@ -3,10 +3,9 @@
 
 [package]
 name = "kahlnws_python"
-description = "The Python binding of kahlnws: its solver as the extension module of the Python package `kahlnws`"
+description = "The Python binding of kahlnws: its solver and network as the extension module of the package `kahlnws`"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -22,7 +21,7 @@ workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-# The solver the extension calls.
+# The solver and the network the extension calls.
 kahlnws = { workspace = true }
 # The classes, methods, functions, module and exception of the extension, the conversions of Python values, the
 # buffer protocol.
@@ -30,10 +29,11 @@ pyo3 = { workspace = true }
 # The columns and the staging room seen as bytes, which a buffer is copied in as, and the staging room seen as a column
 # of the item type it holds.
 bytemuck = { workspace = true }
-# `ArgumentError`'s `Display`, one message per variant.
+# The `Display` of `ArgumentError`, `NotBelowCount` and `BalancedByItself`, one message per variant.
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# The counting allocator, for the test that a reserved solver's `solve_into` allocates on the Rust heap only the
-# export records of the buffers it is handed.
+# The counting allocator, for the tests that a reserved solver's `solve_into`, and a network's loads, changes, solves,
+# copies and writes into buffers, allocate on the Rust heap nothing beyond the export records of the buffers they are
+# handed.
 kahlnws_testing = { workspace = true }

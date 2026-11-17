@@ -7,20 +7,22 @@
 //! within 120 columns, no Markdown, no headings); Doxygen, where it is installed, builds its reference without a
 //! warning, every parameter and every answer documented; its version macros are the library's version;
 //! `tests/signatures.c`, which takes every entry at its exact type and every constant as a case label, compiles
-//! against it as C99, C11, C17, C++11 and C++17; and the C program `tests/depot.c`, built against it and the static
-//! library, solves its problems.
+//! against it as C99, C11, C17, C++11 and C++17; and the C programs `tests/depot.c` and `tests/network.c`, built
+//! against it and the static library, solve their problems.
 //!
 //! The C++ header, the hand-written `include/kahlnws.hpp`: it is ASCII within 120 columns; it compiles alone as
 //! C++11, 14, 17 and 20, and as C++23 where the compiler has it, with exceptions, with `-fno-exceptions` and with
 //! `KAHLNWS_NO_EXCEPTIONS` defined, with every warning an error, those of conversions, shadowing and C-style casts
 //! among them; an ignored result fails to compile beside the used form, which compiles; and the C++ programs
-//! `tests/network_simplex.cpp` and `tests/int128.cpp`, built against it and the static library in every one of those
-//! standards and modes, and once more in each mode with the address and undefined behaviour sanitizers where the
-//! compiler has them, pass every check they make.
+//! `tests/network_simplex.cpp`, `tests/network.cpp` and `tests/int128.cpp`, built against it and the static library
+//! in every one of those standards and modes, and once more in each mode with the address and undefined behaviour
+//! sanitizers where the compiler has them, pass every check they make.
 //!
 //! The examples under `examples/`, each written in C and in C++: built against the headers and the static library with
-//! every warning an error, the C ones as C99 and the C++ ones as C++11 in every mode, each prints the answers worked
-//! out by hand, and each C++ example prints what its C twin prints, beside what only its throwing form prints.
+//! every warning an error, the C ones as C99 and the C++ ones as C++11 in every mode, each prints exactly the lines
+//! listed for it, its answers worked out by hand, and each C++ example beside them only what its throwing form prints.
+//! The complete programs of the C and the C++ guide, read from the guides themselves, build so too and print exactly
+//! the line each guide says they print.
 //!
 //! The compilers are the system's: `CC` and `CXX` where set, `cc` and `c++` otherwise. The libraries a static library
 //! needs beside it are the ones `rustc --print native-static-libs` names for an empty static library of the `rustc`
@@ -88,12 +90,12 @@ const CPP_STANDARDS: [(&str, Promise); 5] = [
 const STRICT_WARNINGS: [&str; 4] = ["-Wconversion", "-Wsign-conversion", "-Wshadow", "-Wold-style-cast"];
 
 /// The C++ programs under `tests/`, each built from `tests/{name}.cpp`.
-const CPP_PROGRAMS: [&str; 2] = ["network_simplex", "int128"];
+const CPP_PROGRAMS: [&str; 3] = ["network_simplex", "network", "int128"];
 
 /// What the C++ header refuses to compile beside the form it compiles: the case's name, the body refused, the body
 /// allowed, and a piece of the compiler's error that says why. Each body follows [`CPP_SNIPPET_PRELUDE`]. Every other
 /// refusal of the header is shown by a static assertion in `tests/network_simplex.cpp`.
-const FORBIDDEN: [(&str, &str, &str, &str); 2] = [
+const FORBIDDEN: [(&str, &str, &str, &str); 3] = [
     (
         "ignored",
         "solver.try_solve(problem); return 0;",
@@ -101,9 +103,15 @@ const FORBIDDEN: [(&str, &str, &str, &str); 2] = [
         "ignoring return value",
     ),
     (
-        "ignored-resolve",
-        "solver.try_resolve(problem); return 0;",
-        "return solver.try_resolve(problem).has_value() ? 0 : 1;",
+        "ignored-change",
+        "kahlnws::network network; network.try_set_cost(0, 1); return 0;",
+        "kahlnws::network network; return network.try_set_cost(0, 1).has_value() ? 0 : 1;",
+        "ignoring return value",
+    ),
+    (
+        "ignored-network-solve",
+        "kahlnws::network network; network.try_solve(); return 0;",
+        "kahlnws::network network; return network.try_solve().has_value() ? 0 : 1;",
         "ignoring return value",
     ),
 ];
@@ -312,7 +320,19 @@ fn test_the_reference_of_the_c_header_builds_without_a_warning() {
     let entries = [
         "kahlnws_solver_new",
         "kahlnws_solver_solve",
-        "kahlnws_solver_resolve",
+        "kahlnws_network_new",
+        "kahlnws_network_clone",
+        "kahlnws_network_copy",
+        "kahlnws_network_load",
+        "kahlnws_network_set_cost",
+        "kahlnws_network_set_bounds",
+        "kahlnws_network_set_supply",
+        "kahlnws_network_move_supply",
+        "kahlnws_network_solve",
+        "kahlnws_network_flows",
+        "kahlnws_network_potentials",
+        "kahlnws_network_bounds",
+        "kahlnws_network_supplies",
         "kahlnws_refusal_message",
         "kahlnws_cost_bound",
     ];
@@ -400,7 +420,7 @@ fn built_static_library() -> PathBuf {
     // The copy of the library cargo made beside the test lies in its build directory, whose layout cargo keeps to
     // itself; a library asked for by name lies in the target directory, at `<tuple>/<profile folder>/` where the
     // command names the target, which is cargo's documented place for its users. The target directory is the tests'
-    // own: a build of this package alone resolves the features of its dependencies apart from the workspace's test
+    // own: a build of this package alone settles the features of its dependencies apart from the workspace's test
     // build, so in the shared one it would replace the artifacts that build left; and here the command alone chooses
     // the target and the profile, and so the layout. It builds the library alone, never the tests that call it.
     let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("static_library");
@@ -472,13 +492,41 @@ fn compiled(compiler: &OsString, language: Language, standard: &str, name: &str,
 }
 
 #[test]
-fn test_a_status_or_a_solver_ignored_fails_to_compile_and_one_used_compiles() {
-    const TEST: &str = "test_a_status_or_a_solver_ignored_fails_to_compile_and_one_used_compiles";
+fn test_a_status_or_a_handle_ignored_fails_to_compile_and_one_used_compiles() {
+    const TEST: &str = "test_a_status_or_a_handle_ignored_fails_to_compile_and_one_used_compiles";
     let answers = [
         "kahlnws_solver_new()",
         "kahlnws_solver_reserve(0, 1, 1)",
         "kahlnws_solver_solve(0, 0, 0, 0, 0, 0, 0)",
-        "kahlnws_solver_resolve(0, 0, 0, 0, 0, 0, 0)",
+        "kahlnws_network_new()",
+        "kahlnws_network_clone(0)",
+        "kahlnws_network_reserve(0, 1, 1)",
+        "kahlnws_network_load(0, 0, 0)",
+        "kahlnws_network_set_cost(0, 0, 0, 0, 0)",
+        "kahlnws_network_set_capacity(0, 0, 0, 0, 0)",
+        "kahlnws_network_set_lower_bound(0, 0, 0, 0, 0)",
+        "kahlnws_network_set_bounds(0, 0, 0, 0, 0, 0, 0)",
+        "kahlnws_network_set_supply(0, 0, 0, 0, 0, 0)",
+        "kahlnws_network_move_supply(0, 0, 0, 0, 0)",
+        "kahlnws_network_solve(0, 0, 0)",
+        "kahlnws_network_total_cost(0, 0)",
+        "kahlnws_network_flow(0, 0, 0)",
+        "kahlnws_network_flows(0, 0)",
+        "kahlnws_network_potentials(0, 0)",
+        "kahlnws_network_copy(0, 0)",
+        "kahlnws_network_tail(0, 0, 0)",
+        "kahlnws_network_head(0, 0, 0)",
+        "kahlnws_network_cost(0, 0, 0)",
+        "kahlnws_network_lower_bound(0, 0, 0)",
+        "kahlnws_network_capacity(0, 0, 0)",
+        "kahlnws_network_bounds(0, 0, 0, 0)",
+        "kahlnws_network_supply(0, 0, 0)",
+        "kahlnws_network_tails(0, 0)",
+        "kahlnws_network_heads(0, 0)",
+        "kahlnws_network_costs(0, 0)",
+        "kahlnws_network_lower_bounds(0, 0)",
+        "kahlnws_network_capacities(0, 0)",
+        "kahlnws_network_supplies(0, 0)",
     ];
 
     for (language, standard) in [(Language::C, "-std=c99"), (Language::Cpp, "-std=c++17")] {
@@ -503,21 +551,34 @@ fn test_a_status_or_a_solver_ignored_fails_to_compile_and_one_used_compiles() {
 
 #[test]
 fn test_the_depot_is_solved_from_c_through_the_static_library() {
-    const TEST: &str = "test_the_depot_is_solved_from_c_through_the_static_library";
+    run_c_program("test_the_depot_is_solved_from_c_through_the_static_library", "depot");
+}
+
+#[test]
+fn test_the_depot_is_held_by_a_network_from_c_through_the_static_library() {
+    run_c_program("test_the_depot_is_held_by_a_network_from_c_through_the_static_library", "network");
+}
+
+/// Builds the C program `tests/{name}.c` against the header and the static library, as C99 with every warning an
+/// error, and runs it; the test `test` says so and passes where no C compiler or no `rustc` is found.
+///
+/// # Panics
+/// Panics if the compiler refuses the program or warns, or the program fails.
+fn run_c_program(test: &str, name: &str) {
     let Some(compiler) = Language::C.compiler() else {
-        skip(TEST, "no C compiler found");
+        skip(test, "no C compiler found");
         return;
     };
     let Some(libraries) = native_libraries() else {
-        skip(TEST, "no rustc found to name the libraries a static library needs");
+        skip(test, "no rustc found to name the libraries a static library needs");
         return;
     };
 
-    let program = Path::new(env!("CARGO_TARGET_TMPDIR")).join("depot");
+    let program = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     run(Command::new(compiler)
         .args(["-std=c99", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-I"])
         .arg(in_crate("include"))
-        .arg(in_crate("tests/depot.c"))
+        .arg(in_crate(&format!("tests/{name}.c")))
         .arg(static_library())
         .args(libraries)
         .arg("-o")
@@ -719,15 +780,27 @@ struct Example {
 /// each: 615 - 30 - 60 = 525. With every lane cut to 5, each warehouse sends at most 15, below warehouse 1's 30, so no
 /// flow exists.
 ///
-/// The pivots of those three days. A fresh solve starts from the star, every lane empty, and tries warehouse 0's lanes
-/// first, the cheapest into each shop: 6, 5 and 7 pivots. A resolve keeps the tree the day before ended on. Day 1
-/// ends with warehouse 1's lanes and the empty lane from warehouse 0 to shop 2 in the tree, and the lane from
-/// warehouse 0 to shop 1 full out of it. On day 2 that tree carries the optimum, but the lane from warehouse 1 to
-/// shop 1, empty, can carry nothing back up the tree, so shop 1 hangs from the root; the full lane into it from
-/// warehouse 0 then violates and enters, sending nothing: 1 pivot. On day 3 the lane from warehouse 1 to shop 2 cannot
-/// carry the 30 asked for and leaves the tree full, 5 units left on root links; the lane from warehouse 1 to shop 1
-/// enters and sends them round: 1 pivot.
-const EXAMPLES: [Example; 5] = [
+/// The pivots of those three days are the counts the library's solves make, pinned, not worked by hand: 6, 5 and 7 for
+/// a fresh solve, which starts from the star and tries warehouse 0's lanes first, and 6, 1 and 1 for a network held
+/// over the days, which tries no lane first and starts each later day from the basis it kept. Why a later day takes
+/// one: on day 2 the flow re-sent over the kept tree already costs 430, but the lane from warehouse 1 to shop 1,
+/// empty, can carry nothing back, so shop 1 hangs from the root, and the full lane into it from warehouse 0 enters,
+/// sending nothing; on day 3 the lane from warehouse 1 to shop 2 cannot carry what shop 2 needs and leaves the tree
+/// full, 5 units left on root links, which the lane from warehouse 1 to shop 1 enters and sends round.
+///
+/// The potentials of the first day are the library's own, pinned; each lane's reduced cost follows from them by hand,
+/// its cost plus the potential of its warehouse less that of its shop, and the signs of the reduced costs against the
+/// flow prove the cost 465 optimal. The work of that solve is the library's own count, pinned.
+///
+/// The search: the first day held by a network, at 465, then five moves, each kept where its cost is below the best
+/// kept and set back otherwise, by the number each setter answered. While the costs are those loaded, a unit warehouse
+/// 0 sends saves 1, 6 and 3 at shops 0, 1 and 2 on the 585 warehouse 1 would pay alone. Lane 3 off: warehouse 0 serves
+/// shop 0 and has 10 left for shop 1, 515, set back. Lane 1 at cost 4 and lower bound 25: the bound passes its capacity
+/// 20 and is refused, and the cost made before it is set back. Five units of stock moved from warehouse 1 to warehouse
+/// 0, which then sends 20 to shop 1 and 5 to shop 2: 450, kept. Warehouse 0 set to hold 15, all to shop 1: 495, set
+/// back to 25. Lane 4 at cost 7: warehouse 1 alone pays 460, and warehouse 0's 25 units save 3 each on 15 at shop 2
+/// and 1 each on the other 10: 405, kept; the warehouses then hold 25 and 25.
+const EXAMPLES: [Example; 6] = [
     Example {
         name: "transport",
         prints: &[
@@ -743,7 +816,7 @@ const EXAMPLES: [Example; 5] = [
     },
     Example { name: "reuse", prints: &["day 1: cost 465", "day 2: cost 430", "day 3: cost 525"], throws: &[] },
     Example {
-        name: "resolve",
+        name: "network",
         prints: &[
             "day 1: cost 465, pivots 6 (a fresh solve: 6)",
             "day 2: cost 430, pivots 1 (a fresh solve: 5)",
@@ -757,46 +830,78 @@ const EXAMPLES: [Example; 5] = [
         prints: &["no flow exists", "refused: arc 5 enters node 5, not below the node count 5"],
         throws: &["thrown: arc 5 enters node 5, not below the node count 5"],
     },
-    Example { name: "potentials", prints: &["cost: 465", "the optimality conditions hold"], throws: &[] },
+    Example {
+        name: "potentials",
+        prints: &[
+            "cost: 465",
+            "potential of warehouse 0: 3",
+            "potential of warehouse 1: 0",
+            "potential of shop 0: 9",
+            "potential of shop 1: 12",
+            "potential of shop 2: 13",
+            // 8 + 3 - 9, 6 + 3 - 12, 10 + 3 - 13; 9 + 0 - 9, 12 + 0 - 12, 13 + 0 - 13.
+            "reduced cost of warehouse 0 -> shop 0: 2",
+            "reduced cost of warehouse 0 -> shop 1: -3",
+            "reduced cost of warehouse 0 -> shop 2: 0",
+            "reduced cost of warehouse 1 -> shop 0: 0",
+            "reduced cost of warehouse 1 -> shop 1: 0",
+            "reduced cost of warehouse 1 -> shop 2: 0",
+            "the optimality conditions hold",
+            "pivots: 6",
+            "degenerate pivots: 1",
+            "first arc pivots: 2",
+        ],
+        throws: &[],
+    },
+    Example {
+        name: "search",
+        prints: &[
+            "start: cost 465",
+            "move 1: cost 515, set back",
+            "move 2: refused (arc 1 has lower bound 25 above its capacity 20), set back",
+            "move 3: cost 450, kept",
+            "move 4: cost 495, set back",
+            "move 5: cost 405, kept",
+            "end: cost 405, the warehouses hold 25 and 25",
+        ],
+        throws: &[],
+    },
 ];
 
-/// Builds the example `examples/{name}` of `language` with `flags` beside [`WARNINGS`], against the headers and the
-/// static library with `libraries` beside it, into a program whose name ends in `suffix`; runs it, and answers the
-/// lines it printed.
+/// Builds the program `source` with `flags` beside [`WARNINGS`], against the headers and the static library with
+/// `libraries` beside it, into the program `program` under the tests' folder; runs it, and answers the lines it
+/// printed.
 ///
 /// # Panics
-/// Panics if the compiler refuses the example or warns, or the example fails or prints what is not text.
-fn example_lines(
+/// Panics if the compiler refuses the program or warns, or the program fails or prints what is not text.
+fn printed_lines(
     compiler: &OsString,
     libraries: &[String],
-    language: Language,
     flags: &[&str],
-    name: &str,
-    suffix: &str,
+    source: &Path,
+    program: &str,
 ) -> Vec<String> {
-    let executable = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("example-{name}-{suffix}"));
+    let executable = Path::new(env!("CARGO_TARGET_TMPDIR")).join(program);
     run(Command::new(compiler)
         .args(flags)
         .args(WARNINGS)
         .arg("-I")
         .arg(in_crate("include"))
-        .arg(in_crate(&format!("examples/{name}.{}", language.extension())))
+        .arg(source)
         .arg(static_library())
         .args(libraries)
         .arg("-o")
         .arg(&executable));
 
     let output = run(&mut Command::new(&executable));
-    let printed = String::from_utf8(output.stdout).expect("an example should print text");
+    let printed = String::from_utf8(output.stdout).expect("a program should print text");
 
     printed.lines().map(str::to_owned).collect()
 }
 
-/// Whether every line of `expected` is a line of `printed`, in the same order.
-fn prints_in_order(printed: &[String], expected: &[&str]) -> bool {
-    let mut lines = printed.iter();
-
-    expected.iter().all(|wanted| lines.any(|line| line == wanted))
+/// The source of the example `name` in `language`.
+fn example_source(name: &str, language: Language) -> PathBuf {
+    in_crate(&format!("examples/{name}.{}", language.extension()))
 }
 
 #[test]
@@ -812,22 +917,19 @@ fn test_the_c_examples_print_the_answers_worked_out_by_hand() {
     };
 
     for example in EXAMPLES {
-        let printed = example_lines(&compiler, libraries, Language::C, &["-std=c99"], example.name, "c99");
+        let source = example_source(example.name, Language::C);
+        let program = format!("example-{}-c99", example.name);
+        let printed = printed_lines(&compiler, libraries, &["-std=c99"], &source, &program);
 
-        assert!(
-            prints_in_order(&printed, example.prints),
-            "{}.c should print {:?}, not {printed:?}",
-            example.name,
-            example.prints
-        );
+        assert_eq!(printed, example.prints, "{}.c should print exactly the lines listed", example.name);
     }
 }
 
 #[test]
-fn test_the_cpp_examples_print_what_their_c_twins_print_in_every_mode() {
-    const TEST: &str = "test_the_cpp_examples_print_what_their_c_twins_print_in_every_mode";
-    let (Some(c_compiler), Some(cpp_compiler)) = (Language::C.compiler(), Language::Cpp.compiler()) else {
-        skip(TEST, "no C compiler or no C++ compiler found");
+fn test_the_cpp_examples_print_the_answers_worked_out_by_hand_in_every_mode() {
+    const TEST: &str = "test_the_cpp_examples_print_the_answers_worked_out_by_hand_in_every_mode";
+    let Some(compiler) = Language::Cpp.compiler() else {
+        skip(TEST, "no C++ compiler found");
         return;
     };
     let Some(libraries) = native_libraries() else {
@@ -836,23 +938,103 @@ fn test_the_cpp_examples_print_what_their_c_twins_print_in_every_mode() {
     };
 
     for example in EXAMPLES {
-        let c_printed = example_lines(&c_compiler, libraries, Language::C, &["-std=c99"], example.name, "twin-c99");
+        let source = example_source(example.name, Language::Cpp);
 
         for (mode_flags, mode_name) in CPP_MODES {
             let flags = [&["-std=c++11"], &STRICT_WARNINGS[..], mode_flags].concat();
-            let suffix = format!("c++11-{mode_name}");
-            let printed = example_lines(&cpp_compiler, libraries, Language::Cpp, &flags, example.name, &suffix);
+            let program = format!("example-{}-c++11-{mode_name}", example.name);
+            let printed = printed_lines(&compiler, libraries, &flags, &source, &program);
             let (thrown, answered): (Vec<String>, Vec<String>) =
                 printed.into_iter().partition(|line| line.starts_with("thrown: "));
             let throws: &[&str] = if mode_name == "exceptions" { example.throws } else { &[] };
 
-            assert!(prints_in_order(&answered, example.prints), "{}.cpp, {mode_name}: {answered:?}", example.name);
             assert_eq!(
-                answered, c_printed,
-                "{}.cpp, {mode_name}, should print what {}.c prints",
-                example.name, example.name
+                answered, example.prints,
+                "{}.cpp, {mode_name}, should print exactly the lines listed",
+                example.name
             );
             assert_eq!(thrown, throws, "{}.cpp, {mode_name}, should throw exactly {throws:?}", example.name);
+        }
+    }
+}
+
+/// The complete program of a guide, and the one line the guide says it prints.
+#[derive(Clone, Copy, Debug)]
+struct GuideProgram {
+    /// The guide, from the workspace's root.
+    guide: &'static str,
+    /// The language of the program.
+    language: Language,
+    /// The line it prints, which the guide states as "It prints `{line}`".
+    prints: &'static str,
+}
+
+/// The complete programs of the C and the C++ guide: the depot, node 0 sending 4 units to node 2, directly at 5 a unit
+/// for up to 3 units or through node 1 at 2 a unit for up to 2. The two routes cost 5 and 2 a unit, so the cheaper one
+/// takes all it can carry, 2 units at 4, and the direct arc the other 2 at 10: flows 2, 2 and 2 and the cost 14. The 4
+/// pivots are the library's own count, pinned.
+const GUIDE_PROGRAMS: [GuideProgram; 2] = [
+    GuideProgram { guide: "docs/c-api.md", language: Language::C, prints: "flows 2 2 2, cost 14, 4 pivots" },
+    GuideProgram { guide: "docs/cpp-api.md", language: Language::Cpp, prints: "cost 14, 4 pivots" },
+];
+
+/// The heading of the section that holds a guide's complete program, as the program's first code block after it.
+const COMPLETE_PROGRAM: &str = "## A complete program\n";
+
+/// The text of the guide `guide`, read from the workspace's root.
+///
+/// # Panics
+/// Panics if the guide cannot be read.
+fn guide_text(guide: &str) -> String {
+    let path = Path::new(CRATE_DIR).join("../..").join(guide);
+
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("the guide {} should be read: {error}", path.display()))
+}
+
+/// The complete program of `text`, a guide in Markdown: the first code block of `language` in the section
+/// [`COMPLETE_PROGRAM`] heads.
+///
+/// # Panics
+/// Panics if the guide has no such section, or the section no such block.
+fn complete_program(text: &str, language: Language) -> &str {
+    let fence = format!("```{}\n", language.extension());
+    let section = text.split_once(COMPLETE_PROGRAM).expect("the guide should have a complete program").1;
+    let block = section.split_once(fence.as_str()).expect("the section should hold a block of its language").1;
+
+    block.split_once("```").expect("the block should be closed").0
+}
+
+#[test]
+fn test_the_complete_program_of_each_guide_prints_what_the_guide_says() {
+    const TEST: &str = "test_the_complete_program_of_each_guide_prints_what_the_guide_says";
+    let Some(libraries) = native_libraries() else {
+        skip(TEST, "no rustc found to name the libraries a static library needs");
+        return;
+    };
+
+    for GuideProgram { guide, language, prints } in GUIDE_PROGRAMS {
+        let Some(compiler) = language.compiler() else {
+            skip(TEST, &format!("no compiler of {} found", language.name()));
+            continue;
+        };
+        let text = guide_text(guide);
+        assert!(text.contains(&format!("It prints `{prints}`")), "{guide} should say that its program prints {prints}");
+
+        let source = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("guide-program.{}", language.extension()));
+        fs::write(&source, complete_program(&text, language)).expect("the guide's program should be written");
+        let builds: Vec<(Vec<&str>, String)> = match language {
+            Language::C => vec![(vec!["-std=c99"], "guide-program-c99".to_owned())],
+            Language::Cpp => CPP_MODES
+                .into_iter()
+                .map(|(mode_flags, mode_name)| {
+                    ([&["-std=c++11"], &STRICT_WARNINGS[..], mode_flags].concat(), format!("guide-program-{mode_name}"))
+                })
+                .collect(),
+        };
+
+        for (flags, program) in builds {
+            let printed = printed_lines(&compiler, libraries, &flags, &source, &program);
+            assert_eq!(printed, [prints], "the program of {guide}, built as {program}, should print exactly one line");
         }
     }
 }

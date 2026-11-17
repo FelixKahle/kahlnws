@@ -1,17 +1,18 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The solver's own copy of a problem, read from the Python arguments that hold its columns.
+//! The own copy of a problem that a solver or a network keeps, read from the Python arguments that hold its columns.
 
 use std::collections::TryReserveError;
 
 use kahlnws::Problem;
+use pyo3::exceptions::PyMemoryError;
 use pyo3::prelude::*;
 
 use crate::argument::Input;
 use crate::column::Staging;
 
-/// The arguments of a solve that hold the problem, as Python gave them. Plain data.
+/// The arguments of a solve or a load that hold the problem, as Python gave them. Plain data.
 #[derive(Debug)]
 pub(crate) struct Arguments<'py> {
     /// The node each arc leaves.
@@ -28,10 +29,10 @@ pub(crate) struct Arguments<'py> {
     pub(crate) supplies: Bound<'py, PyAny>,
 }
 
-/// The columns of the problem a solver was last handed, each its own copy, and the room a buffer of other items than
-/// its column's is staged in.
+/// The columns of the problem a solver or a network was last handed, each its own copy, and the room a buffer of other
+/// items than its column's is staged in.
 ///
-/// Each column is kept from one solve to the next and only grows; its contents mean nothing between solves.
+/// Each column is kept from one call to the next and only grows; its contents mean nothing between calls.
 #[derive(Debug, Default)]
 pub(crate) struct Tables {
     /// The node each arc leaves, one per arc.
@@ -70,7 +71,7 @@ impl Tables {
     /// Reads the problem `arguments` hold, each column into its own table, and answers it, borrowed from the tables.
     /// The columns are read in the order of the problem's fields, the lower bounds after the heads.
     ///
-    /// The tables' lengths are not compared: a column of another length than the tails is the solve's to refuse.
+    /// The tables' lengths are not compared: a column of another length than the tails is the library's to refuse.
     ///
     /// # Errors
     /// Returns the error of the first column that cannot be read, as [`Staging::read`] gives it.
@@ -98,9 +99,15 @@ impl Tables {
 ///
 /// # Errors
 /// Returns the `TryReserveError` of a refused reservation.
-fn reserve_column<T>(column: &mut Vec<T>, entries: usize) -> Result<(), TryReserveError> {
+pub(crate) fn reserve_column<T>(column: &mut Vec<T>, entries: usize) -> Result<(), TryReserveError> {
     column.clear();
     column.try_reserve(entries)
+}
+
+/// The `MemoryError` of the room for `node_count` nodes and `arc_count` arcs, refused: the room of the tables, or of
+/// the solver or the network that holds them, which a problem of those counts needs.
+pub(crate) fn no_room(node_count: usize, arc_count: usize) -> PyErr {
+    PyMemoryError::new_err(format!("the room for {node_count} nodes and {arc_count} arcs was refused"))
 }
 
 #[cfg(test)]
@@ -131,5 +138,15 @@ mod tests {
 
         assert!(column.is_empty());
         assert!(column.capacity() >= 10);
+    }
+
+    #[test]
+    fn test_no_room_names_both_counts() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = no_room(3, 7);
+            assert!(error.is_instance_of::<PyMemoryError>(py));
+            assert_eq!(error.value(py).to_string(), "the room for 3 nodes and 7 arcs was refused");
+        });
     }
 }

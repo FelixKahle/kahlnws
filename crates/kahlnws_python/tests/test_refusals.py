@@ -2,15 +2,16 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 """Every breach a solve refuses a problem for, raised as `ProblemError` with the library's message and the breach's
-values, through both levels and both entries of each."""
+values, through both levels and both entries of each, and by a network's load; and the breaches of a change, as plain
+data."""
 
 from array import array
 
 import pytest
 
 import kahlnws
-from kahlnws import Breach, Table
-from networks import HIGH_LEVEL, LOW_LEVEL, Network, Solve, SolveInto, named
+from kahlnws import Breach, ChangeBreach, Table
+from networks import Network
 
 # The bound of a cost on four nodes: `(2**62 - 1) // 4`.
 BOUND = kahlnws.cost_bound(4)
@@ -85,13 +86,10 @@ REFUSALS = [
 ]
 
 
-@pytest.mark.parametrize("entry", HIGH_LEVEL, ids=named)
 @pytest.mark.parametrize(("network", "breach", "message"), REFUSALS)
-def test_each_breach_is_raised_with_its_message_and_values(
-    network: Network, breach: Breach, message: str, entry: Solve
-) -> None:
+def test_each_breach_is_raised_with_its_message_and_values(network: Network, breach: Breach, message: str) -> None:
     with pytest.raises(kahlnws.ProblemError) as raised:
-        network.solve(kahlnws.NetworkSimplex(), entry)
+        network.solve(kahlnws.NetworkSimplex())
 
     assert str(raised.value) == message
     assert raised.value.args == (message,)
@@ -100,15 +98,12 @@ def test_each_breach_is_raised_with_its_message_and_values(
     assert isinstance(raised.value, ValueError)
 
 
-@pytest.mark.parametrize("entry", LOW_LEVEL, ids=named)
 @pytest.mark.parametrize(("network", "breach", "message"), REFUSALS)
-def test_each_breach_is_raised_alike_by_the_low_level(
-    network: Network, breach: Breach, message: str, entry: SolveInto
-) -> None:
+def test_each_breach_is_raised_alike_by_the_low_level(network: Network, breach: Breach, message: str) -> None:
     flows = array("Q", [0] * len(network.tails))
 
     with pytest.raises(kahlnws.ProblemError, match=f"^{message}$") as raised:
-        network.answer_into(kahlnws.NetworkSimplex(), flows, entry=entry)
+        network.answer_into(kahlnws.NetworkSimplex(), flows)
 
     assert raised.value.breach == breach
     assert flows.tolist() == [0] * len(network.tails)
@@ -162,3 +157,41 @@ def test_breaches_and_tables_write_themselves_as_python_makes_them() -> None:
     ]
     assert Table.HEADS == Table.HEADS != Table.COSTS
     assert len({Table.HEADS, Table.HEADS, Table.COSTS}) == 2
+
+
+@pytest.mark.parametrize(("network", "breach", "message"), REFUSALS)
+def test_each_breach_is_raised_alike_by_a_network_s_load_which_keeps_what_the_network_held(
+    network: Network, breach: Breach, message: str
+) -> None:
+    held = BASE.loaded()
+
+    with pytest.raises(kahlnws.ProblemError, match=f"^{message}$") as raised:
+        held.load(
+            tails=network.tails,
+            heads=network.heads,
+            capacities=network.capacities,
+            costs=network.costs,
+            supplies=network.supplies,
+            lower_bounds=network.lower_bounds,
+        )
+
+    assert raised.value.breach == breach
+    assert (held.node_count, held.arc_count) == (4, 3)
+    held.solve()
+    optimum = held.optimum()
+    assert optimum is not None
+    assert (optimum.total_cost, optimum.flows) == (3, [1, 1, 1]), "the base, one unit down its chain"
+
+
+def test_breaches_of_a_change_are_plain_data_compared_hashed_and_written_by_value() -> None:
+    assert ChangeBreach.ExcessBeyondRange(3) == ChangeBreach.ExcessBeyondRange(total=3)
+    assert ChangeBreach.ExcessBeyondRange(3) != ChangeBreach.ExcessBeyondRange(4)
+    lower: object = ChangeBreach.LowerAboveCapacity(1, 6, 5)
+    assert lower != Breach.LowerAboveCapacity(1, 6, 5), "a change's breach is not a problem's, whatever its values"
+    assert len({ChangeBreach.SupplyBeyondRange(1, 2), ChangeBreach.SupplyBeyondRange(node=1, supply=2)}) == 1
+    assert isinstance(lower, ChangeBreach)
+    assert ChangeBreach.CostBeyondBound.__match_args__ == ("arc", "cost", "node_count")
+    assert repr(ChangeBreach.SupplyBeyondRange(node=2, supply=-(2**63) - 1)) == (
+        "ChangeBreach.SupplyBeyondRange(node=2, supply=-9223372036854775809)"
+    )
+    assert repr(ChangeBreach.CostTotalBeyondRange(arc=4)) == "ChangeBreach.CostTotalBeyondRange(arc=4)"

@@ -45,6 +45,99 @@ impl From<Slot> for usize {
     }
 }
 
+/// The dealing of the arcs of a problem of `m` arcs and `n` nodes to their slots, in closed form: the slot of any one
+/// arc, read at once.
+///
+/// It is the dealing [`DealtSlotsIter`] walks, the stride `s = ⌈m / n⌉`, at least one: with `m = q·s + r`, the
+/// first `r` runs of slots, `0, s, 2s, …` from each residue, hold `q + 1` slots and the others `q`, and the arcs fill
+/// the runs in turn.
+///
+/// # Invariant
+/// `stride` is the stride of `arc_count` arcs and `node_count` nodes, at least one; `quotient` is `arc_count / stride`
+/// and `remainder` is `arc_count % stride`; `arc_count` is at most [`INDEX_LIMIT`]. So [`slot_of`](Self::slot_of)
+/// answers a slot for every arc below `arc_count` and for no other, and every slot it answers is below `arc_count`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotOrder {
+    /// The number of arcs, `m`, the number of slots.
+    arc_count: usize,
+    /// The number of nodes, `n`.
+    node_count: usize,
+    /// The stride, `s`, at least one.
+    stride: usize,
+    /// The slots of a short run, `q = ⌊m / s⌋`.
+    quotient: usize,
+    /// The runs of `q + 1` slots, `r = m mod s`.
+    remainder: usize,
+}
+
+impl SlotOrder {
+    /// The dealing of the arcs of a problem of `arc_count` arcs and `node_count` nodes.
+    ///
+    /// # Panics
+    /// Panics if `arc_count` passes [`INDEX_LIMIT`].
+    pub(crate) const fn new(arc_count: usize, node_count: usize) -> Self {
+        assert!(arc_count <= INDEX_LIMIT, "called `SlotOrder::new` with an arc count past the index limit");
+
+        let stride = stride(arc_count, node_count);
+
+        Self { arc_count, node_count, stride, quotient: arc_count / stride, remainder: arc_count % stride }
+    }
+
+    /// The number of arcs, `m`, the number of slots.
+    pub(crate) const fn arc_count(&self) -> usize {
+        self.arc_count
+    }
+
+    /// The number of nodes, `n`.
+    pub(crate) const fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    /// The slot `arc` is dealt to, below the arc count, where `arc` is below it; `None` past it. It is the slot
+    /// [`DealtSlotsIter`] yields for the arc, at the cost of two divisions.
+    pub(crate) fn slot_of(&self, arc: usize) -> Option<Slot> {
+        (arc < self.arc_count).then(|| {
+            debug_assert!(arc < self.arc_count, "the arc should be below the arc count");
+            // SAFETY: `arc` is below the arc count, as just compared: the precondition of `slot_of_unchecked`.
+            unsafe { self.slot_of_unchecked(arc) }
+        })
+    }
+
+    /// The slot `arc` is dealt to, as [`slot_of`](Self::slot_of) answers it where it answers one, without the
+    /// comparison with the arc count.
+    ///
+    /// # Safety
+    /// `arc` is below the arc count: an arc for which `slot_of` answers `Some`. Past it, the slot answered may lie
+    /// past the arc count, which every caller indexes a column of `m` slots with.
+    pub(crate) unsafe fn slot_of_unchecked(&self, arc: usize) -> Slot {
+        debug_assert!(
+            arc < self.arc_count,
+            "called `SlotOrder::slot_of_unchecked` with arc {arc}, which should be below the arc count {}",
+            self.arc_count
+        );
+
+        // The first `r` runs hold `q + 1` slots each, `r·(q + 1)` arcs in all; the arcs past them fill runs of `q`.
+        // Where `q` is zero every arc lies in the long runs, since then `r = m`, so the second branch never divides by
+        // zero. Run `j` at place `k` is the slot `j + k·s`: below `m`, since the run holds exactly the slots of its
+        // residue below `m`.
+        let long = self.quotient + 1;
+        let (run, place) = match arc.checked_sub(self.remainder * long) {
+            None => (arc / long, arc % long),
+            Some(past) => (self.remainder + past / self.quotient, past % self.quotient),
+        };
+        let slot = run + place * self.stride;
+
+        // `slot < m ≤ INDEX_LIMIT = u32::MAX` (`SlotOrder`), so the narrowing is exact.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the slot is below the arc count, at most u32::MAX by the invariant `new` establishes"
+        )]
+        let raw = slot as u32;
+
+        Slot(raw)
+    }
+}
+
 /// For each arc `0..m` in ascending order, the slot it is dealt to.
 ///
 /// The arcs are dealt with the stride `s = ⌈m / n⌉`, at least one: arc 0 goes to slot 0, the next arcs to
@@ -119,7 +212,7 @@ impl FusedIterator for DealtSlotsIter {}
 
 /// The stride the arcs of a problem of `arc_count` arcs and `node_count` nodes are dealt with: `⌈arc_count /
 /// node_count⌉`, at least one, a problem of no node taken as one of a single node.
-fn stride(arc_count: usize, node_count: usize) -> usize {
+const fn stride(arc_count: usize, node_count: usize) -> usize {
     // The block search prices blocks of consecutive slots and enters the best arc of the first block that holds a
     // violation, so a block should sample the whole network, not one corner of it. Problems come with their arcs
     // grouped by node, `m / n` of them a node on average. With a stride of at least that mean, rounded up,
@@ -128,7 +221,12 @@ fn stride(arc_count: usize, node_count: usize) -> usize {
     // potentials it reads over more of the tree. The rule takes the problem's own counts and no other constant. No
     // more arcs than nodes gives the stride one, and a single node the stride `m`, one slot to each residue: both keep
     // the arcs' order.
-    arc_count.div_ceil(node_count.max(1)).max(1)
+    //
+    // Written with `if` for the two floors of one, since `Ord::max` is no `const fn`.
+    let nodes = if node_count == 0 { 1 } else { node_count };
+    let stride = arc_count.div_ceil(nodes);
+
+    if stride == 0 { 1 } else { stride }
 }
 
 #[cfg(test)]
@@ -266,7 +364,108 @@ pub(crate) mod tests {
         let _ = Slot::from(INDEX_LIMIT + 1);
     }
 
+    /// The slot `order` deals each of its arcs to, in arc order, as numbers.
+    fn slots_of(order: &SlotOrder) -> Vec<usize> {
+        (0..order.arc_count()).map(|arc| order.slot_of(arc).map_or(usize::MAX, usize::from)).collect()
+    }
+
+    #[test]
+    fn test_the_closed_form_deals_ten_arcs_on_four_nodes_three_apart_by_hand() {
+        // The stride is ⌈10 / 4⌉ = 3 and `10 = 3·3 + 1`: one run of four slots, 0, 3, 6, 9, then two of three.
+        let order = SlotOrder::new(10, 4);
+        assert_eq!(order, SlotOrder { arc_count: 10, node_count: 4, stride: 3, quotient: 3, remainder: 1 });
+        assert_eq!(slots_of(&order), [0, 3, 6, 9, 1, 4, 7, 2, 5, 8]);
+        assert_eq!((order.arc_count(), order.node_count()), (10, 4));
+    }
+
+    #[test]
+    fn test_the_closed_form_past_the_long_runs_by_hand() {
+        // Seven arcs on two nodes: the stride is 4 and `7 = 1·4 + 3`, three runs of two slots and one of one. Arc 6
+        // lies past the long runs' six arcs, in run `3 + 0 / 1` at place `0 mod 1`: slot 3.
+        let order = SlotOrder::new(7, 2);
+        assert_eq!((order.quotient, order.remainder), (1, 3));
+        assert_eq!(slots_of(&order), [0, 4, 1, 5, 2, 6, 3]);
+
+        // Four arcs on three nodes: the stride is 2 and `4 = 2·2 + 0`, no long run at all.
+        assert_eq!(slots_of(&SlotOrder::new(4, 3)), [0, 2, 1, 3]);
+        // One node: the stride is the arc count, five runs of one slot, every arc at its own index.
+        assert_eq!(slots_of(&SlotOrder::new(5, 1)), [0, 1, 2, 3, 4]);
+        // Fewer arcs than nodes: the stride is one, a single run in the arcs' order.
+        assert_eq!(slots_of(&SlotOrder::new(3, 5)), [0, 1, 2]);
+    }
+
+    #[test]
+    fn test_the_closed_form_answers_no_slot_past_the_arcs_by_hand() {
+        const EMPTY: SlotOrder = SlotOrder::new(0, 0);
+        assert_eq!(EMPTY, SlotOrder { arc_count: 0, node_count: 0, stride: 1, quotient: 0, remainder: 0 });
+        assert_eq!(EMPTY.slot_of(0), None);
+
+        let order = SlotOrder::new(10, 4);
+        assert_eq!((order.slot_of(10), order.slot_of(usize::MAX)), (None, None));
+        assert_eq!(order.slot_of(9).map(usize::from), Some(8));
+    }
+
+    #[test]
+    fn test_the_closed_form_accepts_the_index_limit() {
+        // One node: the stride is the arc count, so every arc keeps its index as its slot, the last one included.
+        let order = SlotOrder::new(INDEX_LIMIT, 1);
+
+        assert_eq!(order.slot_of(INDEX_LIMIT - 1).map(usize::from), Some(INDEX_LIMIT - 1));
+        assert_eq!(order.slot_of(INDEX_LIMIT), None);
+    }
+
+    // An arc count past `u32::MAX` exists only where a `usize` has 64 bits.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "called `SlotOrder::new` with an arc count past the index limit")]
+    fn test_the_closed_form_refuses_arcs_past_the_index_limit() {
+        let _ = SlotOrder::new(INDEX_LIMIT + 1, 1);
+    }
+
+    #[test]
+    fn test_the_closed_form_is_the_dealing_walked_for_every_small_count() {
+        // Every arc of every pair of counts below 61 arcs and 41 nodes: 75,030 arcs.
+        let mut arcs = 0;
+        for arc_count in 0..61 {
+            for node_count in 0..41 {
+                let order = SlotOrder::new(arc_count, node_count);
+                assert_eq!(slots_of(&order), dealt(arc_count, node_count), "{arc_count} arcs, {node_count} nodes");
+                assert_eq!(order.slot_of(arc_count), None);
+                arcs += arc_count;
+            }
+        }
+
+        assert_eq!(arcs, 75_030);
+    }
+
     proptest! {
+        #[test]
+        fn test_slot_of_and_its_unchecked_twin_agree_below_the_arcs_and_slot_of_refuses_past_them(
+            arc_count in 0_usize..3000,
+            node_count in 0_usize..400,
+            past in 0_usize..4,
+        ) {
+            let order = SlotOrder::new(arc_count, node_count);
+            for arc in 0..arc_count {
+                debug_assert!(arc < order.arc_count(), "the arc should be below the arc count");
+                // SAFETY: `arc` is below the arc count.
+                let unchecked = unsafe { order.slot_of_unchecked(arc) };
+                prop_assert_eq!(order.slot_of(arc), Some(unchecked));
+            }
+
+            for arc in [arc_count + past, usize::MAX - past] {
+                prop_assert_eq!(order.slot_of(arc), None);
+            }
+        }
+
+        #[test]
+        fn test_the_closed_form_is_the_dealing_walked(arc_count in 0_usize..3000, node_count in 0_usize..400) {
+            let order = SlotOrder::new(arc_count, node_count);
+
+            prop_assert_eq!(slots_of(&order), dealt(arc_count, node_count));
+            prop_assert_eq!(order.slot_of(arc_count), None);
+        }
+
         #[test]
         fn test_the_dealing_is_the_bijection_the_rule_writes(arc_count in 0_usize..300, node_count in 0_usize..80) {
             let slots = dealt(arc_count, node_count);

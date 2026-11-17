@@ -3,22 +3,23 @@
 
 //! Why a solve refused a problem, in Python's terms: the exception `ProblemError` and the breach it carries.
 
-use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyTuple, PyType};
+use pyo3::{BoundObject, create_exception};
 
 create_exception!(
     kahlnws,
     ProblemError,
     PyValueError,
-    "A problem no solve admits, raised by `NetworkSimplex.solve`, `solve_into`, `resolve` and `resolve_into`.
+    "A problem no solve admits, raised by `NetworkSimplex.solve` and `solve_into`, and by `Network.load`.
 
 The problem has a table of the wrong length, too many nodes or arcs, an arc whose numbers lie outside the range
 a solve admits, or supplies that do not balance. A problem with several breaches is refused with the first, in the
 order of the classes of `Breach`, where those about one arc are taken arc by arc: the lowest arc with any of them,
-and its first. A refused solve answers no work, keeps the basis the solver kept, and may still have grown the
-solver's room.
+and its first. A refused solve answers no work, and may still have grown the solver's room; a refused load leaves
+the network as it was, and may still have grown its room. A change of a network is refused by `ChangeError`
+instead.
 
 Attributes:
     breach: The breach as a `Breach`, whose class names the kind and whose attributes hold the values; `None` on a
@@ -257,12 +258,19 @@ impl From<kahlnws::ProblemError> for Breach {
 /// The exception that tells Python a solve refused its problem for `breach`: a [`ProblemError`] whose message is the
 /// breach's text, and whose attribute `breach` holds the breach as a [`Breach`].
 pub(crate) fn refusal(py: Python<'_>, breach: kahlnws::ProblemError) -> PyErr {
-    let exception = ProblemError::new_err(breach.to_string());
-    let attached =
-        Breach::from(breach).into_pyobject(py).and_then(|breach| exception.value(py).setattr("breach", breach));
+    with_breach(py, ProblemError::new_err(breach.to_string()), Breach::from(breach))
+}
 
-    // Making a small object or setting an attribute of a fresh exception fails only where memory runs out; then that
-    // failure is raised in its place.
+/// `exception` with its attribute `breach` set to `breach`, the value that says why a call was refused.
+///
+/// Making a small object or setting an attribute of a fresh exception fails only where memory runs out; then that
+/// failure is answered in its place.
+pub(crate) fn with_breach<'py, B: IntoPyObject<'py>>(py: Python<'py>, exception: PyErr, breach: B) -> PyErr {
+    let attached = breach
+        .into_pyobject(py)
+        .map_err(Into::into)
+        .and_then(|breach| exception.value(py).setattr("breach", breach.into_any().into_bound()));
+
     match attached {
         Ok(()) => exception,
         Err(failure) => failure,

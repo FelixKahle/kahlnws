@@ -6,6 +6,7 @@ it never imports NumPy."""
 
 import ast
 import doctest
+import importlib.util
 import inspect
 import subprocess
 import sys
@@ -23,7 +24,12 @@ PACKAGE = Path(kahlnws.__file__).parent
 def test_the_package_exports_its_names_and_the_version_of_the_workspace() -> None:
     assert sorted(kahlnws.__all__) == [
         "Answer",
+        "Bounds",
         "Breach",
+        "ChangeBreach",
+        "ChangeError",
+        "Network",
+        "NetworkOptimum",
         "NetworkSimplex",
         "ProblemError",
         "Solution",
@@ -35,9 +41,13 @@ def test_the_package_exports_its_names_and_the_version_of_the_workspace() -> Non
     assert kahlnws.__version__ == "0.1.0"
     assert all(getattr(kahlnws, name) is getattr(_kahlnws, name) for name in kahlnws.__all__)
     assert issubclass(kahlnws.ProblemError, ValueError)
-    assert [kahlnws.NetworkSimplex.__module__, kahlnws.Solution.__module__, kahlnws.ProblemError.__module__] == [
-        "kahlnws"
-    ] * 3
+    assert issubclass(kahlnws.ChangeError, ValueError)
+    assert not issubclass(kahlnws.ChangeError, kahlnws.ProblemError), "a change is refused apart from a problem"
+    classes = [kahlnws.NetworkSimplex, kahlnws.Network, kahlnws.NetworkOptimum, kahlnws.Solution, kahlnws.Bounds]
+    exceptions = [kahlnws.ProblemError, kahlnws.ChangeError]
+    assert [owner.__module__ for owner in [*classes, *exceptions]] == ["kahlnws"] * 7
+    assert issubclass(kahlnws.Bounds, tuple)
+    assert kahlnws.Bounds._fields == ("lower_bound", "capacity")
 
 
 def test_cost_bound_by_hand() -> None:
@@ -46,11 +56,11 @@ def test_cost_bound_by_hand() -> None:
     assert kahlnws.cost_bound(1000) == 4_611_686_018_427_387
     assert kahlnws.cost_bound(2**64 - 1) == 0
 
-    with pytest.raises(OverflowError):
+    with pytest.raises(OverflowError, match=rf"^node_count -1 is outside the range of a count, from 0 to {2**64 - 1}$"):
         kahlnws.cost_bound(-1)
-    with pytest.raises(OverflowError):
+    with pytest.raises(OverflowError, match=rf"^node_count {2**64} is outside the range of a count, from 0 to "):
         kahlnws.cost_bound(2**64)
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=r"^node_count is of type float, not an integer$"):
         kahlnws.cost_bound(1.0)  # type: ignore[arg-type]  # a float is refused, which the test shows
 
 
@@ -62,8 +72,12 @@ def test_a_reservation_refused_raises_memory_error_and_keeps_the_solver_usable()
         solver.reserve(2**64 - 1, 0)
     with pytest.raises(MemoryError, match=r"^the room for 0 nodes and 18446744073709551615 arcs was refused$"):
         solver.reserve(0, 2**64 - 1)
-    with pytest.raises(OverflowError):
+    with pytest.raises(OverflowError, match=r"^node_count -1 is outside the range of a count, from 0 to "):
         solver.reserve(-1, 0)
+    with pytest.raises(OverflowError, match=rf"^arc_count {2**64} is outside the range of a count, from 0 to "):
+        solver.reserve(0, 2**64)
+    with pytest.raises(TypeError, match=r"^arc_count is of type float, not an integer$"):
+        solver.reserve(0, 1.5)  # type: ignore[arg-type]  # a float is refused, which the test shows
 
     solution = solver.solve(
         tails=[0, 0, 1], heads=[2, 1, 2], capacities=[3, 4, 2], costs=[5, 1, 1], supplies=[4, 0, -4]
@@ -116,15 +130,25 @@ def test_the_stubs_declare_every_name_with_the_docstring_the_module_gives_it() -
     declared = {name for name in pairs if "." not in name}
     assert declared == {name for name in kahlnws.__all__ if name != "__version__"}
     assert words(ast.get_docstring(stubs)) == words(_kahlnws.__doc__)
-    entries = ["solve", "solve_into", "resolve", "resolve_into"]
+    entries = ["solve", "solve_into"]
     assert all(f"NetworkSimplex.{entry}" in pairs for entry in entries)
+    calls = ["reserve", "load", "node_count", "arc_count", "set_cost", "set_capacity", "set_lower_bound", "set_bounds"]
+    calls += ["set_supply", "move_supply", "solve", "optimum", "copy", "copy_from", "tail", "head", "cost", "bounds"]
+    calls += ["supply", "lower_bound", "capacity"]
+    columns = ["tails", "heads", "lower_bounds", "capacities", "costs", "supplies"]
+    calls += [*columns, *(f"{column}_into" for column in columns)]
+    assert all(f"Network.{call}" in pairs for call in calls)
+    reads = ["total_cost", "flow", "flows", "flows_into", "potentials", "potentials_into"]
+    assert all(f"NetworkOptimum.{read}" in pairs for read in reads)
     assert "Breach.NetSupplyBeyondRange.total" in pairs
+    assert "ChangeBreach.ExcessBeyondRange.total" in pairs
     assert (PACKAGE / "py.typed").is_file()
 
 
 def test_the_package_never_imports_numpy() -> None:
     # A fresh interpreter, in which importing NumPy fails: the package imports, reads every kind of plain column and
-    # buffer, solves and resolves at both levels, raises, and NumPy is not among the modules loaded.
+    # buffer, solves at both levels, holds a network, changes and solves it and writes its optimum, raises,
+    # and NumPy is not among the modules loaded.
     program = """
 import sys
 from array import array
@@ -145,14 +169,27 @@ answer = solver.solve(**depot, costs=memoryview(array("q", [5, 1, 1])))
 solution = answer.outcome
 flows = array("Q", [0, 0, 0])
 cost = solver.solve_into(**depot, costs=[5, 1, 1], flows=flows).outcome
-again = solver.resolve(**depot, costs=(5, 1, 1)).work.pivots
-fewer = solver.resolve_into(**depot | {"supplies": [3, 0, -3]}, costs=[5, 1, 1], flows=flows).outcome
+fewer = solver.solve_into(**depot | {"supplies": [3, 0, -3]}, costs=[5, 1, 1], flows=flows).outcome
+network = kahlnws.Network()
+network.load(**depot, costs=array("q", [5, 1, 1]))
+network.move_supply(2, 0, 1)
+cost_held = network.solve().outcome
+held = network.optimum()
+potentials = array("q", [0, 0, 0])
+held.potentials_into(potentials)
+read = (cost_held, held.total_cost, held.flows, potentials.tolist())
+try:
+    network.set_lower_bound(0, 4)
+except kahlnws.ChangeError as error:
+    change = error.breach
 try:
     solver.solve(tails=[0], heads=[5], capacities=[1], costs=[1], supplies=[1, -1])
 except kahlnws.ProblemError as error:
     breach = error.breach
-assert (solution.flows, cost, again, fewer, flows.tolist()) == ([2, 2, 2], 14, 0, 9, [1, 2, 2])
+assert (solution.flows, cost, fewer, flows.tolist()) == ([2, 2, 2], 14, 9, [1, 2, 2])
 assert breach == kahlnws.Breach.HeadOutsideNodes(arc=0, head=5, node_count=2)
+assert read == (19, 19, [3, 2, 2], [0, 1, 5])
+assert change == kahlnws.ChangeBreach.LowerAboveCapacity(arc=0, lower_bound=4, capacity=3)
 assert not any(name == "numpy" or name.startswith("numpy.") for name in sys.modules), "numpy was imported"
 print("solved without numpy")
 """
@@ -169,4 +206,28 @@ def test_the_example_of_the_workspace_s_and_of_the_package_s_readme_runs(folders
 
     assert len(examples) == 1
     finished = subprocess.run([sys.executable, "-c", examples[0].split("```")[0]], capture_output=True, check=False)
+    assert finished.returncode == 0, finished.stderr
+
+
+# The Python guide of the workspace, whose every example is promised to run as shown.
+GUIDE = Path(__file__).parents[3] / "docs" / "python-api.md"
+
+# The examples of the guide, in the order they stand: the text of each block of Python code.
+GUIDE_EXAMPLES = [block.split("```")[0] for block in GUIDE.read_text().split("```python\n")[1:]]
+
+
+def test_the_guide_holds_its_examples() -> None:
+    # The page's eight examples: the solver's owned answer, its buffers as NumPy arrays and as `array.array`, three of
+    # a network, the refusals and the threads.
+    assert len(GUIDE_EXAMPLES) == 8
+    assert sum("import numpy" in example for example in GUIDE_EXAMPLES) == 1
+
+
+@pytest.mark.parametrize("example", GUIDE_EXAMPLES, ids=[f"example {number}" for number in range(1, 9)])
+def test_every_example_of_the_guide_runs_as_shown(example: str) -> None:
+    if "import numpy" in example and importlib.util.find_spec("numpy") is None:
+        pytest.skip("the example needs NumPy")
+
+    finished = subprocess.run([sys.executable, "-c", example], capture_output=True, text=True, check=False)
+
     assert finished.returncode == 0, finished.stderr
