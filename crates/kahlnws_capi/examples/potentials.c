@@ -60,12 +60,10 @@ int main(void) {
         fprintf(stderr, "the solve answered %s\n", kahlnws_status_name(status));
         return 1;
     }
-    // Every cost here is at least zero, so the total is too, and it fits 64 bits exactly where its high half is 0.
-    if (total_cost.high != 0) {
-        fprintf(stderr, "the cost passes 64 bits\n");
-        return 1;
-    }
-    printf("cost: %" PRIu64 "\n", total_cost.low);
+    // The cost in decimal, whatever its size: 41 bytes hold every 128-bit value.
+    char cost[41];
+    kahlnws_int128_format(total_cost, cost, sizeof cost);
+    printf("cost: %s\n", cost);
 
     for (size_t warehouse = 0; warehouse < WAREHOUSE_COUNT; warehouse++) {
         printf("potential of warehouse %zu: %" PRId64 "\n", warehouse, potentials[warehouse]);

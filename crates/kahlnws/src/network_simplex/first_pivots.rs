@@ -29,7 +29,7 @@ use crate::starting_basis::Start;
 ///
 /// The room only grows and holds no answer: every choice rewrites what it reads.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FirstPivots {
+pub(super) struct FirstPivots {
     /// The slots of the arcs the last choice chose, in the order they are tried.
     chosen: Vec<Slot>,
     /// Per node of the last choice among many terminals: the cheapest arc that enters it, `None` where none does.
@@ -172,7 +172,7 @@ struct StackedNode(usize);
 
 impl FirstPivots {
     /// A room that holds nothing yet; it allocates nothing.
-    pub(crate) const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             chosen: Vec::new(),
             cheapest: Vec::new(),
@@ -186,7 +186,7 @@ impl FirstPivots {
     ///
     /// # Errors
     /// Returns the `TryReserveError` of the first refused reservation.
-    pub(crate) fn try_reserve(&mut self, node_count: usize, arc_count: usize) -> Result<(), TryReserveError> {
+    pub(super) fn try_reserve(&mut self, node_count: usize, arc_count: usize) -> Result<(), TryReserveError> {
         let totals = RoomTotals::of(node_count, arc_count);
 
         reserve_total(&mut self.chosen, totals.chosen)?;
@@ -222,7 +222,7 @@ impl FirstPivots {
     /// # Panics
     /// On a target whose `usize` has 32 bits it can panic while it grows a buffer, where the buffer's room passes
     /// `isize::MAX` bytes: the rows take `8·m`.
-    pub(crate) fn choose(&mut self, start: &Start<'_, '_>) {
+    pub(super) fn choose(&mut self, start: &Start<'_, '_>) {
         let problem = start.problem();
         self.grow(problem.node_count(), problem.arc_count());
         self.chosen.clear();
@@ -235,7 +235,7 @@ impl FirstPivots {
     }
 
     /// The slots of the arcs the last choice chose, in the order they are tried.
-    pub(crate) fn chosen(&self) -> &[Slot] {
+    pub(super) fn chosen(&self) -> &[Slot] {
         &self.chosen
     }
 
@@ -519,12 +519,36 @@ mod tests {
     use super::*;
     use crate::basis::BasisRoom;
     use crate::basis::PricedRows;
-    use crate::basis::tests::{CheckedRun, EnteringRule, RunEnd};
-    use crate::pricing::BlockSearch;
+    use crate::basis::{CheckedRun, EnteringRule, RunEnd};
+    use crate::network_simplex::block_search::BlockSearch;
     use crate::problem::Problem;
     use crate::problem::tests::problem_of;
     use crate::slot_order::tests::{arcs_of_slots, slot};
     use crate::starting_basis::NetSupplies;
+
+    impl FirstPivots {
+        /// The room of each of its buffers, in entries, in the order of its fields.
+        fn capacities(&self) -> [usize; 6] {
+            [
+                self.chosen.capacity(),
+                self.cheapest.capacity(),
+                self.rows.starts.capacity(),
+                self.rows.arcs.capacity(),
+                self.search.reached.capacity(),
+                self.search.stack.capacity(),
+            ]
+        }
+    }
+
+    #[test]
+    fn test_grow_makes_the_room_try_reserve_makes() {
+        // 100 nodes and 90 000 arcs: every buffer's total lies above the least room an empty `Vec` makes, 8 one-byte
+        // entries or 4 wider ones, so each total is the room made, and a total that drifts by one shows.
+        let (mut grown, mut reserved) = (FirstPivots::new(), FirstPivots::new());
+        grown.grow(100, 90_000);
+        reserved.try_reserve(100, 90_000).expect("100 nodes and 90 000 arcs should fit");
+        assert_eq!(grown.capacities(), reserved.capacities());
+    }
 
     /// The node at `index`.
     fn node(index: usize) -> NodeId {
@@ -684,10 +708,10 @@ mod tests {
 
         let mut walk = Walk::start(&mut search, rows.sort(problem, 5), node(3));
         assert_eq!((&*walk.reached, &**walk.stack), (&[false, false, false, true][..], &[node(3)][..]));
-        let first = walk.next_node().expect("the demand node is stacked");
+        let first = walk.next_node().expect("the demand node should be stacked");
         assert_eq!(first, StackedNode(3));
         walk.scan(&first, &mut chosen);
-        let second = walk.next_node().expect("node 1 is stacked");
+        let second = walk.next_node().expect("node 1 should be stacked");
         walk.scan(&second, &mut chosen);
         assert_eq!(chosen, [slot(2), slot(0), slot(3)]);
         assert_eq!(walk.next_node(), Some(StackedNode(2)), "the node reached last comes first");

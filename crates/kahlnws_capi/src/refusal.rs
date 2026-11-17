@@ -1,16 +1,24 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Why a solve refused a problem, as plain data C reads without parsing text, and its message as a C string.
+//! Why a solve or a load refused a problem, or a network a change, as plain data C reads without parsing text, and
+//! its message as a C string.
 
 use core::fmt::{self, Write as _};
 use core::mem::MaybeUninit;
 
-use kahlnws::ProblemError;
+use kahlnws::{ChangeError, ProblemError};
 
 use crate::halves::{Int128, UInt128};
+use crate::terminated_text::TerminatedText;
 
 /// Which breach a refusal names, by a number fixed for good: one of the `KAHLNWS_REFUSAL_KIND_` constants.
+///
+/// A problem a solve or a load refuses is refused with a kind from `KAHLNWS_REFUSAL_KIND_TOO_LARGE` to
+/// `KAHLNWS_REFUSAL_KIND_NET_SUPPLY_BEYOND_RANGE`. A change a network refuses is refused with
+/// `KAHLNWS_REFUSAL_KIND_LOWER_ABOVE_CAPACITY`, `KAHLNWS_REFUSAL_KIND_COST_BEYOND_BOUND` or
+/// `KAHLNWS_REFUSAL_KIND_COST_TOTAL_BEYOND_RANGE`, for the reason a problem would be, or with
+/// `KAHLNWS_REFUSAL_KIND_SUPPLY_BEYOND_RANGE` or `KAHLNWS_REFUSAL_KIND_EXCESS_BEYOND_RANGE`, which only a change meets.
 ///
 /// The numbers are part of the binary interface: none is ever changed or given to another breach. A number no
 /// constant has, zero among them, names no breach; a zeroed `kahlnws_refusal` names none. Plain data: a caller may
@@ -27,13 +35,15 @@ impl RefusalKind {
     pub const TAIL_OUTSIDE_NODES: Self = Self(2);
     /// An arc enters a node the problem does not have. Sets `arc`, `node` (its head) and `node_count`.
     pub const HEAD_OUTSIDE_NODES: Self = Self(3);
-    /// An arc's lower bound passes its capacity. Sets `arc`, `lower_bound` and `capacity`.
+    /// An arc's lower bound passes its capacity, in a problem or as a change of a network would set them. Sets `arc`,
+    /// `lower_bound` and `capacity`.
     pub const LOWER_ABOVE_CAPACITY: Self = Self(4);
-    /// An arc's cost lies beyond plus or minus `kahlnws_cost_bound(node_count)`. Sets `arc`, `cost` and
-    /// `node_count`.
+    /// An arc's cost lies beyond plus or minus `kahlnws_cost_bound(node_count)`, in a problem or as a change of a
+    /// network would set it. Sets `arc`, `cost` and `node_count`.
     pub const COST_BEYOND_BOUND: Self = Self(5);
-    /// The magnitudes of the costs times the capacities, added up in arc order, pass `2^127 - 1`. Sets `arc`, the
-    /// arc at which the sum passes.
+    /// The magnitudes of the costs times the capacities pass `2^127 - 1`: added up in arc order in a problem, or with
+    /// the cost or the capacity a change of a network would set. Sets `arc`: in a problem the arc at which the sum
+    /// passes, for a change the arc changed.
     pub const COST_TOTAL_BEYOND_RANGE: Self = Self(6);
     /// The supplies do not add up to zero. Sets `supply_total`.
     pub const UNBALANCED: Self = Self(7);
@@ -41,13 +51,26 @@ impl RefusalKind {
     /// its supply, less the lower bounds of the arcs that leave it, plus those of the arcs that enter it. Sets
     /// `net_supply_total`.
     pub const NET_SUPPLY_BEYOND_RANGE: Self = Self(8);
+    /// A change of a network would leave more flow still to be sent than a network holds between solves: what the
+    /// last load or a solve that found no flow left to be sent, with what changes since moved that the arcs could not
+    /// carry at once, plus this change's amount, adds up past `2^64 - 2`. A load leaves to be sent what its start does
+    /// not route, up to the whole of the positive supplies net of the lower bounds where it starts from no basis, so a
+    /// change right after a load of supplies near that limit can be refused. A solve that finds a flow leaves none. No
+    /// solve of a solver answers it. Sets `excess_total` to that sum.
+    pub const EXCESS_BEYOND_RANGE: Self = Self(9);
+    /// A move of supply of a network would take a node's supply past the range of an `int64_t`: below its least value
+    /// for the node the amount is taken from, above its greatest for the node it is added to. Sets `node`, the node
+    /// the amount is taken from where both would leave the range, and `supply` to the supply it would have.
+    pub const SUPPLY_BEYOND_RANGE: Self = Self(10);
 }
 
-/// Why a solve refused a problem: the breach, by its kind, and the values that make it one.
+/// Why a solve or a load refused a problem, or a network a change: the breach, by its kind, and the values that make it
+/// one.
 ///
 /// A problem with several breaches is refused with the first in the order of the kinds' numbers, where the kinds
 /// about one arc, from `KAHLNWS_REFUSAL_KIND_TAIL_OUTSIDE_NODES` to `KAHLNWS_REFUSAL_KIND_COST_TOTAL_BEYOND_RANGE`,
-/// are taken arc by arc: the lowest arc with any of them, and its first.
+/// are taken arc by arc: the lowest arc with any of them, and its first. Each change of a network says in which order
+/// it refuses.
 ///
 /// Plain data. Each kind sets the fields its constant names; every other field is zero. `kahlnws_refusal_message`
 /// writes the same breach as text.
@@ -58,7 +81,8 @@ pub struct Refusal {
     pub kind: RefusalKind,
     /// The arc the breach is at; zero where the kind sets no arc.
     pub arc: usize,
-    /// The node outside the problem's nodes, the arc's tail or its head; zero where the kind sets no node.
+    /// The node outside the problem's nodes, the arc's tail or its head; for a supply beyond its range, the node whose
+    /// supply would leave it; zero where the kind sets no node.
     pub node: usize,
     /// The problem's number of nodes; zero where the kind does not set it.
     pub node_count: usize,
@@ -70,11 +94,36 @@ pub struct Refusal {
     pub capacity: u64,
     /// The arc's cost, in units of cost; zero where the kind does not set it.
     pub cost: i64,
+    /// The supply the node named by `node` would have, in units of flow; zero where the kind does not set it.
+    pub supply: Int128,
     /// The sum of the supplies, in units of flow; zero where the kind does not set it.
     pub supply_total: Int128,
-    /// The sum of the positive supplies net of the lower bounds, in units of flow; zero where the kind does not set
-    /// it.
+    /// The sum of the positive supplies net of the lower bounds, in units of flow; zero where the kind does not set it.
     pub net_supply_total: UInt128,
+    /// The flow still to be sent and the flow the change moves, added up, in units of flow; zero where the kind does
+    /// not set it.
+    pub excess_total: UInt128,
+}
+
+/// The breach a refusal names, read back from its fields: a problem's, or one that only a change of a network meets.
+///
+/// A refusal of a kind a problem and a change share reads back as the problem's breach, whose message is the change's
+/// word for word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Breach {
+    /// A breach a problem can have.
+    Problem(ProblemError),
+    /// A breach only a change of a network meets.
+    Change(ChangeError),
+}
+
+impl fmt::Display for Breach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Problem(breach) => breach.fmt(formatter),
+            Self::Change(breach) => breach.fmt(formatter),
+        }
+    }
 }
 
 impl Refusal {
@@ -120,8 +169,46 @@ impl Refusal {
         }
     }
 
+    /// The refusal that names the refused change `breach` with its values: by the kind a problem has for the same
+    /// reason, where there is one.
+    pub(crate) fn of_change(breach: ChangeError) -> Self {
+        let zero = Self::default();
+
+        match breach {
+            ChangeError::LowerAboveCapacity { arc, lower_bound, capacity } => {
+                Self::of(ProblemError::LowerAboveCapacity { arc, lower_bound, capacity })
+            }
+            ChangeError::CostBeyondBound { arc, cost, node_count } => {
+                Self::of(ProblemError::CostBeyondBound { arc, cost, node_count })
+            }
+            ChangeError::CostTotalBeyondRange { arc } => Self::of(ProblemError::CostTotalBeyondRange { arc }),
+            ChangeError::ExcessBeyondRange { total } => {
+                Self { kind: RefusalKind::EXCESS_BEYOND_RANGE, excess_total: UInt128::from(total), ..zero }
+            }
+            ChangeError::SupplyBeyondRange { node, supply } => {
+                Self { kind: RefusalKind::SUPPLY_BEYOND_RANGE, node, supply: Int128::from(supply), ..zero }
+            }
+        }
+    }
+
     /// The breach the refusal names, read from the fields its kind sets; `None` where its kind names no breach.
-    pub(crate) fn breach(&self) -> Option<ProblemError> {
+    pub(crate) fn breach(&self) -> Option<Breach> {
+        let Self { kind, node, .. } = *self;
+
+        let change = match kind {
+            RefusalKind::EXCESS_BEYOND_RANGE => ChangeError::ExcessBeyondRange { total: u128::from(self.excess_total) },
+            RefusalKind::SUPPLY_BEYOND_RANGE => {
+                ChangeError::SupplyBeyondRange { node, supply: i128::from(self.supply) }
+            }
+            _ => return self.problem_breach().map(Breach::Problem),
+        };
+
+        Some(Breach::Change(change))
+    }
+
+    /// The breach of a problem the refusal names, read from the fields its kind sets; `None` where its kind names no
+    /// breach of a problem.
+    fn problem_breach(&self) -> Option<ProblemError> {
         let Self { kind, arc, node, node_count, arc_count, lower_bound, capacity, cost, .. } = *self;
 
         Some(match kind {
@@ -156,60 +243,6 @@ impl Refusal {
     }
 }
 
-/// A text written into a C string as it is formatted: as much of it as fits before the string's last byte, cut only
-/// at a character, and the length of the whole.
-///
-/// # Invariant
-/// `written <= end`, and `end` is below the length of `buffer` where `buffer` is not empty and zero where it is:
-/// `buffer[..written]` holds the text kept so far, and `end` is where the kept text must stop, which leaves the byte
-/// for the NUL.
-#[derive(Debug)]
-struct TerminatedText<'b> {
-    /// The C string's bytes, written but never read.
-    buffer: &'b mut [MaybeUninit<u8>],
-    /// The bytes of the text kept, from the start of `buffer`.
-    written: usize,
-    /// The most bytes the kept text may reach: one less than the buffer's, or where a piece was cut short.
-    end: usize,
-    /// The length of the whole text written so far, kept or not, in bytes.
-    length: usize,
-}
-
-impl<'b> TerminatedText<'b> {
-    /// An empty text in `buffer`.
-    fn new(buffer: &'b mut [MaybeUninit<u8>]) -> Self {
-        let end = buffer.len().saturating_sub(1);
-
-        Self { buffer, written: 0, end, length: 0 }
-    }
-
-    /// Ends the text kept with a NUL, where the buffer has a byte, and answers the length of the whole text.
-    fn terminate(self) -> usize {
-        if let Some(terminator) = self.buffer.get_mut(self.written) {
-            terminator.write(0);
-        }
-
-        self.length
-    }
-}
-
-impl fmt::Write for TerminatedText<'_> {
-    fn write_str(&mut self, piece: &str) -> fmt::Result {
-        self.length = self.length.strict_add(piece.len());
-        let kept = piece.floor_char_boundary(self.end - self.written);
-
-        self.buffer[self.written..self.written + kept].write_copy_of_slice(&piece.as_bytes()[..kept]);
-        self.written += kept;
-
-        // A piece cut short ends the text kept: a later piece that fits would not follow on from it.
-        if kept < piece.len() {
-            self.end = self.written;
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use core::mem::{offset_of, size_of};
@@ -217,6 +250,7 @@ mod tests {
     use kahlnws::{Table, cost_bound};
 
     use super::*;
+    use crate::boundary::written_entries;
 
     /// Every breach a problem read from C can have, with values that differ from field to field, and its message.
     fn breaches() -> [(ProblemError, String); 8] {
@@ -287,7 +321,94 @@ mod tests {
     #[test]
     fn test_each_breach_is_read_back_as_itself() {
         for (breach, _) in breaches() {
-            assert_eq!(Refusal::of(breach).breach(), Some(breach));
+            assert_eq!(Refusal::of(breach).breach(), Some(Breach::Problem(breach)));
+        }
+    }
+
+    /// Every breach of a change, with values that differ from field to field, and its message.
+    fn change_breaches() -> [(ChangeError, String); 5] {
+        let bound = cost_bound(4);
+
+        [
+            (
+                ChangeError::LowerAboveCapacity { arc: 1, lower_bound: 6, capacity: 5 },
+                "arc 1 has lower bound 6 above its capacity 5".to_owned(),
+            ),
+            (
+                ChangeError::CostBeyondBound { arc: 2, cost: bound + 1, node_count: 4 },
+                format!("arc 2 has cost {} beyond the bound ±{bound} for the node count 4", bound + 1),
+            ),
+            (
+                ChangeError::CostTotalBeyondRange { arc: 3 },
+                format!("the costs times the capacities, in magnitude, sum past {} at arc 3", i128::MAX),
+            ),
+            (
+                ChangeError::SupplyBeyondRange { node: 2, supply: i128::from(i64::MIN) - 1 },
+                "the supply of node 2 would be -9223372036854775809, outside the range of a signed 64-bit integer"
+                    .to_owned(),
+            ),
+            (
+                ChangeError::ExcessBeyondRange { total: u128::from(u64::MAX) + 7 },
+                "this change would leave 18446744073709551622 units of flow still to be sent, past \
+                 18446744073709551614; a solve that finds a flow leaves none"
+                    .to_owned(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_each_breach_of_a_change_by_hand() {
+        let zero = Refusal::default();
+        let bound = cost_bound(4);
+        let expected = [
+            Refusal { kind: RefusalKind::LOWER_ABOVE_CAPACITY, arc: 1, lower_bound: 6, capacity: 5, ..zero },
+            Refusal { kind: RefusalKind::COST_BEYOND_BOUND, arc: 2, cost: bound + 1, node_count: 4, ..zero },
+            Refusal { kind: RefusalKind::COST_TOTAL_BEYOND_RANGE, arc: 3, ..zero },
+            Refusal {
+                kind: RefusalKind::SUPPLY_BEYOND_RANGE,
+                node: 2,
+                supply: Int128 { low: (1 << 63) - 1, high: -1 },
+                ..zero
+            },
+            Refusal { kind: RefusalKind::EXCESS_BEYOND_RANGE, excess_total: UInt128 { low: 6, high: 1 }, ..zero },
+        ];
+
+        for ((breach, _), refusal) in change_breaches().into_iter().zip(expected) {
+            assert_eq!(Refusal::of_change(breach), refusal, "{breach:?}");
+        }
+    }
+
+    #[test]
+    fn test_the_kinds_of_a_change_have_the_numbers_of_the_binary_interface() {
+        let kinds = change_breaches().map(|(breach, _)| Refusal::of_change(breach).kind);
+
+        assert_eq!(kinds, [4, 5, 6, 10, 9].map(RefusalKind));
+    }
+
+    #[test]
+    fn test_a_breach_only_a_change_meets_is_read_back_as_itself_and_a_shared_one_as_the_problem_s() {
+        let [lower, cost, total, supply, excess] = change_breaches().map(|(breach, _)| breach);
+
+        assert_eq!(Refusal::of_change(supply).breach(), Some(Breach::Change(supply)));
+        assert_eq!(Refusal::of_change(excess).breach(), Some(Breach::Change(excess)));
+        let shared = [
+            (lower, ProblemError::LowerAboveCapacity { arc: 1, lower_bound: 6, capacity: 5 }),
+            (cost, ProblemError::CostBeyondBound { arc: 2, cost: cost_bound(4) + 1, node_count: 4 }),
+            (total, ProblemError::CostTotalBeyondRange { arc: 3 }),
+        ];
+        for (change, problem) in shared {
+            assert_eq!(Refusal::of_change(change).breach(), Some(Breach::Problem(problem)), "{change:?}");
+        }
+    }
+
+    #[test]
+    fn test_the_message_of_a_change_s_refusal_is_the_change_s_text() {
+        for (breach, message) in change_breaches() {
+            let (buffer, length) = message_of(&Refusal::of_change(breach), 200);
+
+            assert_eq!(breach.to_string(), message, "the hand-written message is the library's");
+            assert_eq!(&buffer[..length], message.as_bytes(), "{message}");
+            assert_eq!(buffer[length], 0, "{message}");
         }
     }
 
@@ -298,34 +419,19 @@ mod tests {
         assert_eq!(kinds, [1, 2, 3, 4, 5, 6, 7, 8].map(RefusalKind));
     }
 
-    /// A buffer of `capacity` bytes, every one written as 7, so that a byte a writer leaves is seen.
-    fn marked(capacity: usize) -> Vec<MaybeUninit<u8>> {
-        vec![MaybeUninit::new(7); capacity]
-    }
-
-    /// The bytes of `buffer`, every one of which was written.
-    fn bytes_of(buffer: &[MaybeUninit<u8>]) -> Vec<u8> {
-        buffer
-            .iter()
-            .map(|byte| {
-                // SAFETY: every buffer of these tests starts written by `marked`, and a writer only writes bytes.
-                unsafe { byte.assume_init() }
-            })
-            .collect()
-    }
-
-    /// The bytes `refusal` writes as its message into a buffer of `capacity` bytes that start at 7, and the length
-    /// it answers.
+    /// The bytes `refusal` writes as its message into a buffer of `capacity` bytes that start at 7, so that a byte
+    /// it leaves is seen, and the length it answers.
     fn message_of(refusal: &Refusal, capacity: usize) -> (Vec<u8>, usize) {
-        let mut buffer = marked(capacity);
+        let mut buffer = vec![MaybeUninit::new(7); capacity];
         let length = refusal.write_message(&mut buffer);
 
-        (bytes_of(&buffer), length)
+        // SAFETY: the test made every byte with `MaybeUninit::new`, and a message writes a byte only whole.
+        (unsafe { written_entries(&buffer) }, length)
     }
 
     #[test]
     fn test_a_kind_no_constant_has_names_no_breach_and_writes_an_empty_message() {
-        for number in [0, 9, 1000, u32::MAX] {
+        for number in [0, 11, 1000, u32::MAX] {
             let refusal = Refusal { kind: RefusalKind(number), arc: 3, ..Refusal::default() };
             let mut terminated = vec![0];
             terminated.extend([7; 15]);
@@ -367,47 +473,6 @@ mod tests {
         assert_eq!(buffer.last(), Some(&0));
     }
 
-    /// What a terminated text in a buffer of `capacity` bytes, each starting at 7, holds after `pieces` are written to
-    /// it, and the length it answers.
-    fn terminated(pieces: &[&str], capacity: usize) -> (Vec<u8>, usize) {
-        let mut buffer = marked(capacity);
-        let mut text = TerminatedText::new(&mut buffer);
-        for piece in pieces {
-            text.write_str(piece).expect("a terminated text should take every piece");
-        }
-        let length = text.terminate();
-
-        (bytes_of(&buffer), length)
-    }
-
-    #[test]
-    fn test_a_terminated_text_cuts_at_a_character_and_keeps_a_byte_for_the_nul_by_hand() {
-        // "a±b": `±` is the two bytes 0xC2 0xB1, so a cut after one byte of it falls back to before it.
-        let cases: [(usize, &[u8]); 7] = [
-            (0, b""),
-            (1, b"\0"),
-            (2, b"a\0"),
-            (3, b"a\0\x07"),
-            (4, "a±\0".as_bytes()),
-            (5, "a±b\0".as_bytes()),
-            (6, "a±b\0\x07".as_bytes()),
-        ];
-
-        for (capacity, written) in cases {
-            assert_eq!(terminated(&["a±b"], capacity), (written.to_vec(), 4), "capacity {capacity}");
-        }
-    }
-
-    #[test]
-    fn test_a_terminated_text_of_pieces_keeps_nothing_after_a_piece_cut_short_by_hand() {
-        // "ab" fits a buffer of 4; "±" does not fit the one byte left before the NUL, and "c", which would, must not
-        // follow it.
-        assert_eq!(terminated(&["ab", "±", "c"], 4), (b"ab\0\x07".to_vec(), 5));
-        assert_eq!(terminated(&["ab", "±", "c"], 5), ("ab±\0".as_bytes().to_vec(), 5));
-        assert_eq!(terminated(&["ab", "±", "c"], 6), ("ab±c\0".as_bytes().to_vec(), 5));
-        assert_eq!(terminated(&["ab", "", "c"], 3), (b"ab\0".to_vec(), 3), "an empty piece cuts nothing");
-    }
-
     #[test]
     fn test_a_message_too_long_for_its_buffer_is_cut_and_still_answers_its_whole_length() {
         let breach = ProblemError::CostBeyondBound { arc: 1, cost: -cost_bound(4) - 1, node_count: 4 };
@@ -420,7 +485,8 @@ mod tests {
         assert_eq!(message_of(&Refusal::of(breach), 0), (vec![], message.len()), "no buffer: only the length");
     }
 
-    // The offsets of a 64-bit target, where every field but the kind is 8 or 16 bytes and aligned to 8.
+    // The offsets of a 64-bit target, where every field but the kind is 8 or 16 bytes and aligned to 8: each 128-bit
+    // number takes two 64-bit halves.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_the_layout_c_reads_by_hand() {
@@ -433,11 +499,13 @@ mod tests {
             offset_of!(Refusal, lower_bound),
             offset_of!(Refusal, capacity),
             offset_of!(Refusal, cost),
+            offset_of!(Refusal, supply),
             offset_of!(Refusal, supply_total),
             offset_of!(Refusal, net_supply_total),
+            offset_of!(Refusal, excess_total),
         ];
 
-        assert_eq!(offsets, [0, 8, 16, 24, 32, 40, 48, 56, 64, 80]);
-        assert_eq!(size_of::<Refusal>(), 96);
+        assert_eq!(offsets, [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112]);
+        assert_eq!(size_of::<Refusal>(), 128);
     }
 }

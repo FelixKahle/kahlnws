@@ -1,9 +1,10 @@
 # Copyright 2026 Felix Kahle
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""NumPy arrays in and out, through both levels and both entries of each: the item types read as they are, the ones
-converted, the ones refused. Skipped where NumPy is not installed."""
+"""NumPy arrays in and out, through both levels of the solver and through a network: the item types read as
+they are, the ones converted, the ones refused. Skipped where NumPy is not installed."""
 
+import dataclasses
 from typing import TypeAlias
 
 import pytest
@@ -14,7 +15,7 @@ import numpy
 import numpy.typing
 
 import kahlnws
-from networks import CUT, DEPOT, DEPOT_COST, DEPOT_FLOWS, DEPOT_POTENTIALS, ENTRY_PAIRS, Solve, SolveInto, named
+from networks import CUT, DEPOT, DEPOT_COST, DEPOT_FLOWS, DEPOT_POTENTIALS
 
 # An array of any item type, as the tests hand them in.
 Array: TypeAlias = numpy.typing.NDArray[numpy.generic]
@@ -32,7 +33,9 @@ def depot_arrays(index_type: numpy.typing.DTypeLike, number_type: numpy.typing.D
     ]
 
 
-@pytest.mark.parametrize(
+# The item types of the ends and of the other per-arc columns the depot is handed in as: the exact ones, NumPy's
+# default, and narrower ones of either sign.
+INTEGER_TYPES = pytest.mark.parametrize(
     ("index_type", "number_type"),
     [
         (numpy.uint64, numpy.uint64),
@@ -44,16 +47,16 @@ def depot_arrays(index_type: numpy.typing.DTypeLike, number_type: numpy.typing.D
         (numpy.uint32, numpy.int64),
     ],
 )
-@pytest.mark.parametrize(("entry", "entry_into"), ENTRY_PAIRS, ids=named)
+
+
+@INTEGER_TYPES
 def test_the_depot_from_arrays_of_every_integer_type_through_both_levels(
-    index_type: numpy.typing.DTypeLike, number_type: numpy.typing.DTypeLike, entry: Solve, entry_into: SolveInto
+    index_type: numpy.typing.DTypeLike, number_type: numpy.typing.DTypeLike
 ) -> None:
-    # One solver at both levels: by the second entry, the low level resolves the depot from the basis of its optimum.
     tails, heads, capacities, costs, supplies = depot_arrays(index_type, number_type)
     solver = kahlnws.NetworkSimplex()
 
-    solution = entry(
-        solver,
+    solution = solver.solve(
         tails=tails,
         heads=heads,
         capacities=capacities,
@@ -65,8 +68,7 @@ def test_the_depot_from_arrays_of_every_integer_type_through_both_levels(
     assert (solution.flows, solution.potentials, solution.total_cost) == (DEPOT_FLOWS, DEPOT_POTENTIALS, DEPOT_COST)
 
     flows, potentials = numpy.zeros(3, dtype=numpy.uint64), numpy.zeros(3, dtype=numpy.int64)
-    total_cost = entry_into(
-        solver,
+    total_cost = solver.solve_into(
         tails=tails,
         heads=heads,
         capacities=capacities,
@@ -268,7 +270,7 @@ def test_an_array_whose_memory_is_not_aligned_for_its_items_is_read_and_written(
             r"^potentials holds items of format 'd', not signed 64-bit integers$",
         ),
         (numpy.zeros((3, 1), dtype=numpy.uint64), None, ValueError, r"^flows has 2 dimensions, not 1$"),
-        (numpy.zeros(4, dtype=numpy.uint64), None, ValueError, r"^flows has length 4, not the arc count 3$"),
+        (numpy.zeros(4, dtype=numpy.uint64), None, ValueError, r"^flows holds 4 entries for a problem of 3 arcs$"),
     ],
 )
 def test_output_arrays_that_cannot_take_the_answer_are_refused(
@@ -315,3 +317,68 @@ def test_a_column_whose_copy_cannot_be_held_raises_memory_error_and_ends_nothing
     solution = DEPOT.solve(solver)
     assert solution is not None
     assert solution.flows == DEPOT_FLOWS
+
+
+@INTEGER_TYPES
+def test_a_network_loads_the_depot_from_arrays_of_every_integer_type_and_writes_its_optimum_into_arrays(
+    index_type: numpy.typing.DTypeLike, number_type: numpy.typing.DTypeLike
+) -> None:
+    tails, heads, capacities, costs, supplies = depot_arrays(index_type, number_type)
+    network = kahlnws.Network()
+
+    network.load(
+        tails=tails,
+        heads=heads,
+        capacities=capacities,
+        costs=costs,
+        supplies=supplies,
+        lower_bounds=numpy.zeros(3, dtype=number_type),
+    )
+    assert network.solve().outcome == DEPOT_COST
+    optimum = network.optimum()
+    assert optimum is not None
+    flows, potentials = numpy.zeros(3, dtype=numpy.uint64), numpy.zeros(3, dtype=numpy.int64)
+    optimum.flows_into(flows)
+    optimum.potentials_into(potentials)
+
+    assert optimum.total_cost == DEPOT_COST
+    assert (flows.tolist(), potentials.tolist()) == (DEPOT_FLOWS, DEPOT_POTENTIALS)
+
+
+def test_a_network_s_optimum_writes_strided_arrays_and_refuses_arrays_that_cannot_take_it() -> None:
+    network = DEPOT.loaded()
+    network.solve()
+    held = network.optimum()
+    assert held is not None
+    every_other = numpy.full(6, 7, dtype=numpy.uint64)
+
+    held.flows_into(every_other[::2])
+    assert every_other.tolist() == [2, 7, 2, 7, 2, 7]
+
+    with pytest.raises(TypeError, match=r"^flows holds items of format '.+', not unsigned 64-bit integers$"):
+        held.flows_into(numpy.zeros(3, dtype=numpy.int64))
+    with pytest.raises(ValueError, match=r"^potentials has 2 dimensions, not 1$"):
+        held.potentials_into(numpy.zeros((3, 1), dtype=numpy.int64))
+    read_only = numpy.zeros(3, dtype=numpy.int64)
+    read_only.flags.writeable = False
+    with pytest.raises(ValueError, match=r"^potentials is read-only$"):
+        held.potentials_into(read_only)
+
+
+def test_a_network_writes_the_problem_it_holds_into_arrays_of_the_columns_types() -> None:
+    network = dataclasses.replace(DEPOT, lower_bounds=[1, 0, 0]).loaded()
+    tails, heads = numpy.zeros(3, dtype=numpy.uintp), numpy.zeros(3, dtype=numpy.uintp)
+    lower_bounds, capacities = numpy.zeros(3, dtype=numpy.uint64), numpy.zeros(3, dtype=numpy.uint64)
+    costs, supplies = numpy.zeros(3, dtype=numpy.int64), numpy.zeros(3, dtype=numpy.int64)
+
+    network.tails_into(tails)
+    network.heads_into(heads)
+    network.lower_bounds_into(lower_bounds)
+    network.capacities_into(capacities)
+    network.costs_into(costs)
+    network.supplies_into(supplies)
+
+    written = [column.tolist() for column in [tails, heads, lower_bounds, capacities, costs, supplies]]
+    assert written == [DEPOT.tails, DEPOT.heads, [1, 0, 0], DEPOT.capacities, DEPOT.costs, DEPOT.supplies]
+    with pytest.raises(TypeError, match=r"^tails holds items of format '.+', not unsigned integers as wide as size_t$"):
+        network.tails_into(numpy.zeros(3, dtype=numpy.int64))

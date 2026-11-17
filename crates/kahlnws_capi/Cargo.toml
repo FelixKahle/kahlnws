@@ -3,10 +3,9 @@
 
 [package]
 name = "kahlnws_capi"
-description = "The C interface of kahlnws: its solver behind an opaque handle, its answers as statuses and plain data"
+description = "The C interface of kahlnws: its solver and network as opaque handles, answers as statuses and plain data"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -24,7 +23,7 @@ workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-# The solver the entries call.
+# The solver and the network the entries call.
 kahlnws = { workspace = true }
 
 [build-dependencies]
@@ -32,5 +31,6 @@ kahlnws = { workspace = true }
 cbindgen = { workspace = true }
 
 [dev-dependencies]
-# The counting allocator, for the test that a reserved solver's solve allocates nothing.
+# The counting allocator, for the tests that a reserved solver's solve, and a network's loads within its room, its
+# changes, solves, reads and copies, allocate nothing.
 kahlnws_testing = { workspace = true }

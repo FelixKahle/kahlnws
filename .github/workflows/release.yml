@@ -22,8 +22,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The `rust-version` of the workspace's manifest.
-  RUST_TOOLCHAIN: 1.99.1
+  # The newest stable toolchain: the workspace names no Rust version.
+  RUST_TOOLCHAIN: stable
   # The interpreter the wheels are tested on; one wheel serves every CPython from 3.11 on.
   PYTHON_VERSION: "3.13"
 

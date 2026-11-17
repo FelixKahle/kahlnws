@@ -3,6 +3,9 @@
 
 //! What a starting basis is made from: each node's supply net of the lower bounds, which the star starts from; each
 //! node's excess over a kept basis, which a kept basis starts from; and the root link a node starts on.
+//!
+//! It is shared ground of the two front ends: both gather the net supplies of the star. The excesses over a kept basis
+//! serve the network's load alone, and stay here beside the start because the basis re-flows a kept basis from them.
 
 use core::iter::FusedIterator;
 use core::slice;
@@ -13,10 +16,10 @@ use typed_index_collections::{TiSlice, TiVec};
 
 use crate::problem::{CheckedArc, CheckedArcs, CheckedProblem, NodeId, ProblemError};
 use crate::ranges::NET_SUPPLY_LIMIT;
-use crate::room::{refill, reserve_total};
+use crate::room::{grow_total, refill, reserve_total};
 use crate::tree::Direction;
 
-/// Each node's supply net of the lower bounds, in the room the solver keeps from one solve to the next.
+/// Each node's supply net of the lower bounds, in the room a basis is made in.
 ///
 /// The room only grows; nothing of an earlier problem is read again: [`gather`](Self::gather) rewrites every entry it
 /// lends.
@@ -42,7 +45,7 @@ pub(crate) struct Start<'p, 's> {
     net_supplies: &'s TiSlice<NodeId, i128>,
 }
 
-/// Each node's excess over a kept basis, in the room the solver keeps from one solve to the next: its net supply less
+/// Each node's excess over a kept basis, in the room a network keeps from one start to the next: its net supply less
 /// what the arcs out of the kept tree carry from it, plus what they carry into it.
 ///
 /// The room only grows; nothing of an earlier problem is read again: [`gather`](Self::gather) rewrites every entry it
@@ -92,6 +95,15 @@ impl NetSupplies {
         reserve_total(&mut self.values.raw, node_count)
     }
 
+    /// Makes room for the net supplies of up to `node_count` nodes, as [`try_reserve`](Self::try_reserve) does, growing
+    /// as a `Vec` does where the memory runs out: a gather of such a problem allocates nothing afterwards.
+    ///
+    /// # Panics
+    /// Panics if the room passes `isize::MAX` bytes, as a growing `Vec` does: the net supplies take `16·n`.
+    pub(crate) fn grow(&mut self, node_count: usize) {
+        grow_total(&mut self.values.raw, node_count);
+    }
+
     /// The start of `problem`: each node's supply net of the lower bounds, written to the room these net supplies
     /// hold, with the problem. Without lower bounds it copies the supplies; with them it makes one more pass over the
     /// arcs.
@@ -120,18 +132,14 @@ impl NetSupplies {
         // A net supply is a supply, at most `2^63` in magnitude, moved by at most `m` lower bounds below `2^64`
         // each: within `2^63 + m·2^64 < 2^97` for the at most `2^32` arcs of a checked problem, inside an `i128`.
         for arc in lower_bounds {
-            let (tail, head, lower_bound) = (arc.tail(), arc.head(), i128::from(arc.lower_bound()));
-
+            let (tail, head) = (arc.tail(), arc.head());
             debug_assert!(
                 usize::from(tail) < self.values.len() && usize::from(head) < self.values.len(),
-                "an arc's tail and head should be nodes"
+                "a lower-bounded arc's ends should be nodes of its problem"
             );
-            // SAFETY: both ends are below their problem's node count (`ArcLowerBound`'s invariant, kept by
-            // `CheckedProblem`), and `values` holds one entry per node of that problem since the copy above.
-            unsafe {
-                *self.values.get_unchecked_mut(tail) -= lower_bound;
-                *self.values.get_unchecked_mut(head) += lower_bound;
-            }
+            // SAFETY: an arc's ends are below its problem's node count (`ArcLowerBound`, kept by `CheckedProblem`),
+            // and the values hold one entry per node of that problem since the copy of its supplies above.
+            unsafe { move_along_unchecked(&mut self.values, tail, head, i128::from(arc.lower_bound())) };
         }
     }
 }
@@ -149,6 +157,15 @@ impl Excesses {
     /// Returns the `TryReserveError` of a refused reservation.
     pub(crate) fn try_reserve(&mut self, node_count: usize) -> Result<(), TryReserveError> {
         reserve_total(&mut self.values.raw, node_count)
+    }
+
+    /// Makes room for the excesses of up to `node_count` nodes, as [`try_reserve`](Self::try_reserve) does, growing as
+    /// a `Vec` does where the memory runs out: a gather of such a problem allocates nothing afterwards.
+    ///
+    /// # Panics
+    /// Panics if the room passes `isize::MAX` bytes, as a growing `Vec` does: the excesses take `16·n`.
+    pub(crate) fn grow(&mut self, node_count: usize) {
+        grow_total(&mut self.values.raw, node_count);
     }
 
     /// The start of the problem of `start` from a kept basis whose arcs out of the tree carry `carried` above their
@@ -199,19 +216,14 @@ impl Excesses {
         // An excess is a net supply, at most `2^64` in magnitude (`Start`), moved by at most `m` flows below `2^64`
         // each: within `2^64 + m·2^64 < 2^97` for the at most `2^32` arcs of a checked problem, inside an `i128`.
         for (arc, flow) in arcs.zip(carried) {
-            let (tail, head, flow) = (arc.tail(), arc.head(), i128::from(flow));
-
+            let (tail, head) = (arc.tail(), arc.head());
             debug_assert!(
                 usize::from(tail) < self.values.len() && usize::from(head) < self.values.len(),
-                "an arc's tail and head should be nodes"
+                "an arc's ends should be nodes of its problem"
             );
-            // SAFETY: both ends are below their problem's node count (`CheckedArc`'s invariant, kept by
-            // `CheckedProblem`), and `values` holds one entry per node of that problem since the copy of its net
-            // supplies, one per node (`Start`).
-            unsafe {
-                *self.values.get_unchecked_mut(tail) -= flow;
-                *self.values.get_unchecked_mut(head) += flow;
-            }
+            // SAFETY: an arc's ends are below its problem's node count (`CheckedArc`, kept by `CheckedProblem`), and
+            // the values hold one entry per node of that problem since the copy of its net supplies (`Start`).
+            unsafe { move_along_unchecked(&mut self.values, tail, head, i128::from(flow)) };
             taken += 1;
         }
 
@@ -311,6 +323,43 @@ fn excess_past_u64(excess: i128) -> ! {
     panic!("called `root_link` with excess {excess}, whose magnitude passes u64::MAX")
 }
 
+/// Moves `amount` from the value of `tail` to that of `head`, in `values`, one value per node, as
+/// [`move_along_unchecked`] does: its checked twin, which its tests check it against.
+///
+/// # Panics
+/// Panics if `tail` or `head` is not below `values.len()`.
+#[cfg(test)]
+#[track_caller]
+fn move_along(values: &mut TiSlice<NodeId, i128>, tail: NodeId, head: NodeId, amount: i128) {
+    assert!(
+        usize::from(tail) < values.len() && usize::from(head) < values.len(),
+        "called `move_along` with the tail {tail:?} or the head {head:?} past {} values",
+        values.len()
+    );
+
+    debug_assert!(usize::from(tail) < values.len() && usize::from(head) < values.len(), "as just asserted");
+    // SAFETY: both ends are below the values' length, as just asserted.
+    unsafe { move_along_unchecked(values, tail, head, amount) };
+}
+
+/// Moves `amount` from the value of `tail` to that of `head`, in `values`, one value per node: the one step of the
+/// netting of the lower bounds and of what the arcs out of a kept tree carry.
+///
+/// # Safety
+/// `tail` and `head` are below `values.len()`.
+unsafe fn move_along_unchecked(values: &mut TiSlice<NodeId, i128>, tail: NodeId, head: NodeId, amount: i128) {
+    debug_assert!(
+        usize::from(tail) < values.len() && usize::from(head) < values.len(),
+        "called `move_along_unchecked` with the tail {tail:?} or the head {head:?} past {} values",
+        values.len()
+    );
+    // SAFETY: both ends are below the values' length, the caller's promise.
+    unsafe {
+        *values.get_unchecked_mut(tail) -= amount;
+        *values.get_unchecked_mut(head) += amount;
+    }
+}
+
 /// Whether the positive entries of `values`, one per node, add up to at most [`NET_SUPPLY_LIMIT`]: the limit a start's
 /// values keep, so that no root link carries more than they add up to.
 ///
@@ -343,6 +392,35 @@ mod tests {
     use super::*;
     use crate::problem::Problem;
     use crate::problem::tests::problem_of;
+
+    impl NetSupplies {
+        /// The room of its one column, in entries.
+        pub(crate) fn capacities(&self) -> [usize; 1] {
+            [self.values.capacity()]
+        }
+    }
+
+    impl Excesses {
+        /// The room of its one column, in entries.
+        pub(crate) fn capacities(&self) -> [usize; 1] {
+            [self.values.capacity()]
+        }
+    }
+
+    #[test]
+    fn test_grow_makes_the_room_try_reserve_makes() {
+        // 100 nodes: above the least room an empty `Vec` makes, 4 entries of 16 bytes, so the total is the room made,
+        // and a total that drifts by one shows.
+        let (mut grown, mut reserved) = (NetSupplies::new(), NetSupplies::new());
+        grown.grow(100);
+        reserved.try_reserve(100).expect("100 values should fit");
+        assert_eq!((grown.capacities(), reserved.capacities()), ([100], [100]));
+
+        let (mut grown, mut reserved) = (Excesses::new(), Excesses::new());
+        grown.grow(100);
+        reserved.try_reserve(100).expect("100 values should fit");
+        assert_eq!((grown.capacities(), reserved.capacities()), ([100], [100]));
+    }
 
     /// The checked problem of `problem`, which the test knows to be admitted.
     fn checked<'a>(problem: &Problem<'a>) -> CheckedProblem<'a> {
@@ -447,6 +525,51 @@ mod tests {
     #[should_panic(expected = "called `root_link` with excess 18446744073709551616, whose magnitude passes u64::MAX")]
     fn test_root_link_past_u64_max_panics() {
         let _ = root_link(i128::from(u64::MAX) + 1);
+    }
+
+    #[test]
+    fn test_move_along_takes_from_the_tail_and_gives_to_the_head_by_hand() {
+        let mut values = [5_i128, -2, 0];
+        let along = |values: &mut [i128], tail: usize, head: usize, amount| {
+            move_along(TiSlice::from_mut(values), NodeId::from(tail), NodeId::from(head), amount);
+        };
+        along(&mut values, 0, 2, 3);
+        assert_eq!(values, [2, -2, 3]);
+
+        // A loop takes and gives back; a negative amount runs the other way.
+        along(&mut values, 1, 1, 7);
+        along(&mut values, 2, 1, -1);
+        assert_eq!(values, [2, -3, 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `move_along` with the tail NodeId 0 or the head NodeId 3 past 3 values")]
+    fn test_move_along_past_the_values_panics() {
+        move_along(TiSlice::from_mut(&mut [0_i128; 3]), NodeId::from(0_usize), NodeId::from(3_usize), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn test_move_along_and_its_unchecked_twin_move_alike(
+            (values, tail, head, amount) in proptest::collection::vec(-1000_i128..1000, 1..8)
+                .prop_flat_map(|values| {
+                    let count = values.len();
+                    (Just(values), 0..count, 0..count, -1000_i128..1000)
+                }),
+        ) {
+            let (tail, head) = (NodeId::from(tail), NodeId::from(head));
+            let mut checked = values.clone();
+            move_along(TiSlice::from_mut(&mut checked), tail, head, amount);
+            let mut unchecked = values.clone();
+            debug_assert!(
+                usize::from(tail) < values.len() && usize::from(head) < values.len(),
+                "both ends should be below the values' count"
+            );
+            // SAFETY: both ends were drawn below the values' length.
+            unsafe { move_along_unchecked(TiSlice::from_mut(&mut unchecked), tail, head, amount) };
+            prop_assert_eq!(&checked, &unchecked);
+            prop_assert_eq!(checked.iter().sum::<i128>(), values.iter().sum::<i128>());
+        }
     }
 
     #[test]
@@ -564,6 +687,22 @@ mod tests {
         excesses.try_reserve(2).expect("a smaller reservation should be granted");
         assert!(excesses.values.capacity() >= 9, "room already held is kept");
         assert!(excesses.try_reserve(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn test_excesses_grow_to_room_for_a_gather_and_keep_what_is_held() {
+        let mut excesses = Excesses::new();
+        excesses.grow(4);
+        let (start, room) = (excesses.values.as_ptr(), excesses.values.capacity());
+        assert!(room >= 4);
+
+        let network = three_nodes();
+        let mut net_supplies = NetSupplies::new();
+        let start_of =
+            net_supplies.gather(checked(&problem_of(&network))).expect("the net supplies should be in range");
+        let _ = excesses.gather(&start_of, [0; 4].into_iter()).expect("the excesses should be in range");
+        excesses.grow(2);
+        assert_eq!((excesses.values.as_ptr(), excesses.values.capacity()), (start, room), "the gather grew nothing");
     }
 
     #[test]

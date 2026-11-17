@@ -53,7 +53,7 @@ int main(void) {
         return 1;
     }
     const kahlnws_status reserved = kahlnws_solver_reserve(solver, NODE_COUNT, LANE_COUNT);
-    if (reserved != KAHLNWS_STATUS_RESERVED) {
+    if (reserved != KAHLNWS_STATUS_OK) {
         fprintf(stderr, "the reservation answered %s\n", kahlnws_status_name(reserved));
         kahlnws_solver_free(solver);
         return 1;
@@ -67,15 +67,14 @@ int main(void) {
         kahlnws_int128 total_cost;
         const kahlnws_status status = kahlnws_solver_solve(solver, &problem, flows, NULL, &total_cost, NULL, NULL);
 
-        // Every cost here is at least zero, so the total is too, and it fits 64 bits exactly where its high half is 0.
         if (status != KAHLNWS_STATUS_OPTIMAL) {
             fprintf(stderr, "day %zu: the solve answered %s\n", day + 1, kahlnws_status_name(status));
             exit_code = 1;
-        } else if (total_cost.high != 0) {
-            fprintf(stderr, "day %zu: the cost passes 64 bits\n", day + 1);
-            exit_code = 1;
         } else {
-            printf("day %zu: cost %" PRIu64 "\n", day + 1, total_cost.low);
+            // The cost in decimal, whatever its size: 41 bytes hold every 128-bit value.
+            char cost[41];
+            kahlnws_int128_format(total_cost, cost, sizeof cost);
+            printf("day %zu: cost %s\n", day + 1, cost);
         }
     }
 

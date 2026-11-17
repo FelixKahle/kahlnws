@@ -27,8 +27,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # The `rust-version` of the workspace's manifest.
-  RUST_TOOLCHAIN: 1.99.1
+  # The newest stable toolchain: the workspace names no Rust version.
+  RUST_TOOLCHAIN: stable
   # The interpreter the Python binding is built and tested against.
   PYTHON_VERSION: "3.13"
 

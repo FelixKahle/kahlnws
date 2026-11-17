@@ -7,6 +7,12 @@ A problem is a set of nodes, each with a supply, and arcs between them, each wit
 cost of a unit of flow; the answer is a flow of least cost that meets every supply within the bounds, or the answer
 that no such flow exists. Every number is an integer, and every sum a solve forms is exact.
 
+The package offers two types, one contract each. The solver, `NetworkSimplex`, is a function: a problem in, an answer
+out; it keeps its room and nothing else, so its answer is a function of the problem alone. A network, `Network`, is a
+state that holds one min-cost flow problem and a basis of it, which its changes, loads and solves carry on from: it
+changes one number at a time, each change answering the number it replaced so that setting it back undoes it, loads
+new numbers on the same arcs, and solves from the basis it holds, making the pivots the changes call for.
+
 A depot (node 0) sends 4 units to a customer (node 2), directly or through a hub (node 1). A solve answers what it
 found, the `outcome`, beside the `work` it did:
 
@@ -36,14 +42,19 @@ outcome is then the cost:
 >>> flows.tolist()
 [2, 2, 2]
 
-A solver keeps the basis its last solve ended on. `resolve` and `resolve_into` take the same arguments as `solve` and
-`solve_into` and start from it where it serves the problem, the same arcs with other numbers; where it cannot, they
-answer exactly what a solve answers. With one unit less to send, the kept basis carries the optimum at once:
+A network holds the depot: one more unit for the customer, sent by the depot, goes along the network's tree, and the
+solve after it makes no pivot:
 
->>> answer = solver.resolve_into(tails=[0, 0, 1], heads=[2, 1, 2], capacities=[3, 4, 2], costs=[5, 1, 1],
-...                              supplies=[3, 0, -3], flows=flows)
->>> answer.outcome, answer.work.pivots, flows.tolist()
-(9, 0, [1, 2, 2])
+>>> network = kahlnws.Network()
+>>> network.load(tails=[0, 0, 1], heads=[2, 1, 2], capacities=[3, 4, 2], costs=[5, 1, 1], supplies=[4, 0, -4])
+>>> network.solve().outcome
+14
+>>> network.move_supply(2, 0, 1)
+>>> answer = network.solve()
+>>> answer.outcome, answer.work.pivots
+(19, 0)
+>>> network.optimum().flows
+[3, 2, 2]
 
 A problem no solve admits raises `ProblemError`, a `ValueError` whose attribute `breach` names the breach and holds
 its values:
@@ -53,6 +64,8 @@ its values:
 ... except kahlnws.ProblemError as error:
 ...     print(error.breach)
 Breach.HeadOutsideNodes(arc=0, head=5, node_count=2)
+
+A change no network admits raises `ChangeError` in the same way, its breach a class of `ChangeBreach`.
 
 Every column is copied before the solve, which then runs with the interpreter released. A sequence of `int` (a list,
 a tuple, a range: a length and indexing) is converted entry by entry; a buffer of one dimension (a NumPy array, an
@@ -64,7 +77,12 @@ the package. The package needs the GIL: it has not been tested on free-threaded 
 
 from kahlnws._kahlnws import (
     Answer,
+    Bounds,
     Breach,
+    ChangeBreach,
+    ChangeError,
+    Network,
+    NetworkOptimum,
     NetworkSimplex,
     ProblemError,
     Solution,
@@ -76,7 +94,12 @@ from kahlnws._kahlnws import (
 
 __all__ = [
     "Answer",
+    "Bounds",
     "Breach",
+    "ChangeBreach",
+    "ChangeError",
+    "Network",
+    "NetworkOptimum",
     "NetworkSimplex",
     "ProblemError",
     "Solution",

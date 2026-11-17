@@ -85,7 +85,7 @@ impl<'t> CycleWalk<'t> {
     ///
     /// # Safety
     /// `first` and `second` are below the node count of `tree`: the ends for which
-    /// [`SpanningTree::apex_climb`] answers a climb, as its doc states.
+    /// [`SpanningTree::apex_climb`] answers a climb, as its doc states, and for which `new` answers a walk.
     pub(crate) unsafe fn new_unchecked(tree: &'t mut LentTree<'_>, first: usize, second: usize) -> Self {
         debug_assert!(
             first < tree.node_count() && second < tree.node_count(),
@@ -97,6 +97,21 @@ impl<'t> CycleWalk<'t> {
         let climb = unsafe { tree.tree_mut().apex_climb_unchecked(first, second) };
 
         Self { climb, first_kept: None, second_kept: None }
+    }
+
+    /// The walk [`new_unchecked`](Self::new_unchecked) makes, where `first` and `second` are below the node count of
+    /// `tree`; `None` otherwise. Its checked twin, which the tests compare it with: every caller in the crate holds
+    /// ends a type proves.
+    #[cfg(test)]
+    pub(crate) fn new(tree: &'t mut LentTree<'_>, first: usize, second: usize) -> Option<Self> {
+        let node_count = tree.node_count();
+        if first >= node_count || second >= node_count {
+            return None;
+        }
+
+        debug_assert!(first < node_count && second < node_count, "both ends should be below the node count");
+        // SAFETY: both ends are below the node count of `tree`, as just compared.
+        Some(unsafe { Self::new_unchecked(tree, first, second) })
     }
 
     /// The next node strictly below the apex, on either side; `None` once the two sides have met at the apex, and
@@ -233,12 +248,7 @@ pub(super) mod tests {
     /// # Panics
     /// Panics if `first` or `second` is not below the node count of `tree`.
     pub(crate) fn cycle_walk<'t>(tree: &'t mut LentTree<'_>, first: usize, second: usize) -> CycleWalk<'t> {
-        let node_count = tree.node_count();
-        assert!(first < node_count && second < node_count, "a test's ends should be below the node count");
-
-        debug_assert!(first < node_count && second < node_count, "a test's ends should be below the node count");
-        // SAFETY: both ends are below the node count of `tree`, as asserted just above.
-        unsafe { CycleWalk::new_unchecked(tree, first, second) }
+        CycleWalk::new(tree, first, second).expect("a test's ends should be below the node count")
     }
 
     const FIRST: Side = Side::First;
@@ -421,7 +431,7 @@ pub(super) mod tests {
 
         // Only the second side keeps a node: the first side named leaves nothing.
         let mut walk = cycle_walk(&mut tree, 3, 6);
-        walk.step().expect("6 lies below the apex").keep();
+        walk.step().expect("6 should lie below the apex").keep();
         assert!(!walk.kept(FIRST) && walk.kept(SECOND));
         assert!(walk.into_cycle(Some(FIRST)).into_kept().is_none());
     }
@@ -431,7 +441,7 @@ pub(super) mod tests {
         let mut room = TreeRoom::new();
         let mut tree = plain_tree_of(&mut room, &seven_nodes());
         let mut walk = cycle_walk(&mut tree, 6, 2);
-        walk.step().expect("6 lies below the apex").keep();
+        walk.step().expect("6 should lie below the apex").keep();
 
         let cycle = walk.into_cycle(Some(FIRST));
         assert_eq!(usize::from(cycle.ends.apex()), 7);
@@ -454,6 +464,28 @@ pub(super) mod tests {
     }
 
     proptest! {
+        #[test]
+        fn test_a_walk_and_its_unchecked_twin_agree(
+            model in plain_trees(),
+            ends in (any::<Index>(), any::<Index>()),
+        ) {
+            // The ends range over the hung nodes, the root and one past it, so that the checked form refuses some.
+            let (first, second) = (ends.0.index(model.root() + 2), ends.1.index(model.root() + 2));
+            let mut room = TreeRoom::new();
+            let mut tree = tree_of(&mut room, &model, link_count_of(&model), &vec![0; link_count_of(&model)]);
+            let nodes = tree.node_count();
+
+            let checked = CycleWalk::new(&mut tree, first, second).map(|mut walk| walked(&mut walk, model.root()));
+            if first < nodes && second < nodes {
+                debug_assert!(first < nodes && second < nodes, "both ends should be below the node count");
+                // SAFETY: both ends are below the node count, as the branch just tested.
+                let mut walk = unsafe { CycleWalk::new_unchecked(&mut tree, first, second) };
+                prop_assert_eq!(checked, Some(walked(&mut walk, model.root())));
+            } else {
+                prop_assert!(checked.is_none());
+            }
+        }
+
         #[test]
         fn test_the_walk_its_apex_and_the_sides_agree_with_walks_to_the_root(
             model in plain_trees(),

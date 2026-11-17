@@ -170,7 +170,7 @@ mod tests {
         let mut reached = Vec::new();
 
         for seed in 0..256 {
-            let moved = supplies_moved(&network, 1, 3, &mut rng(seed)).expect("both roles can move");
+            let moved = supplies_moved(&network, 1, 3, &mut rng(seed)).expect("both roles should be able to move");
             assert_eq!(MincostNetwork { supplies: network.supplies.clone(), ..moved.clone() }, network);
             assert!(
                 moved.supplies.iter().zip(&network.supplies).all(|(after, before)| after.signum() == before.signum())

@@ -5,7 +5,7 @@ it can be taken as it is.
 
 ## Building and the gates
 
-[Building, testing and safety](docs/building-and-testing.md) lists what a build needs: Rust 1.99.1, a Python
+[Building, testing and safety](docs/building-and-testing.md) lists what a build needs: a current stable Rust, a Python
 interpreter of at least 3.11, a C and a C++ compiler, and uv for the Python checks. A change is ready when the gates
 pass, run from the root of the repository:
 

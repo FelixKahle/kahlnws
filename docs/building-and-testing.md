@@ -5,8 +5,8 @@ run, which kinds of tests there are, how the `unsafe` code is kept sound, and ho
 
 ## What a build needs
 
-- **Rust 1.99.1**, the `rust-version` of the workspace manifest, with `rustfmt` and `clippy`: every crate, and the
-  gates.
+- **A current stable Rust toolchain**, with `rustfmt` and `clippy`: every crate, and the gates. The workspace names
+  no Rust version.
 - **A Python interpreter of at least 3.11**, `python3` on the path or the one `PYO3_PYTHON` names: the gates build the
   Python crate with the rest of the workspace, and its tests embed the interpreter.
 - **A C and a C++ compiler**, `cc` and `c++` or those `CC` and `CXX` name: the tests of the C and C++ headers.
@@ -68,8 +68,9 @@ Each kind of test checks something the others cannot.
 - **The basis invariant after every pivot.** A test-only check verifies the whole invariant of the basis (the shape of
   its columns, the tree, the potentials, the flows and strong feasibility) after the starting basis and after every
   pivot, on hand-worked networks pivot by pivot and on tiny random networks under four rules for the entering arc;
-  and after a kept basis is made a basis of a second network on the same arcs, on hand-worked changes of one network
-  and on tiny random pairs of networks, whose second answer the brute force checks.
+  after a network's load from the basis it holds, on hand-worked changes of one network and on tiny random pairs of
+  networks, whose second answer the brute force checks; and after every load, change and solve of a network in random
+  sequences of calls.
 - **The tree against a model.** After random exchanges, and after the two walks that make a kept tree a tree of a new
   problem, given random decisions and costs, every column of the threaded tree is compared with a plain model that
   recomputes it from the parent links alone.
@@ -80,24 +81,34 @@ Each kind of test checks something the others cannot.
   and meeting every supply, the potentials pricing it optimal, and the cost as stated.
 - **The ranges.** Problems at both ends of every range, and one past each, are solved or refused, with the bounds
   recomputed in big integers apart from the arithmetic under test.
-- **Solving again.** Sequences of seeded networks, each with a few numbers moved from the one before, are resolved by
-  one solver and answer the outcome and the cost of a fresh solve, with a certificate; where the kept basis cannot
-  serve, as on a new solver, for other counts or past the limit of the excesses, a resolve answers exactly what a
-  solve answers, its work included. The same problem again, where the kept basis serves, makes no pivot.
+- **One solver, many problems.** One solver answers every problem as a fresh one does, its work included, whatever
+  it solved or refused before.
+- **A load from the basis held.** Sequences of seeded networks, each with a few numbers moved from the one before, are
+  loaded into one network and answer the outcome and the cost of a fresh solve, with a certificate; where the basis
+  held cannot serve, for other counts, other ends or past the limit of the excesses, a load answers exactly what a
+  load into a new network answers, its work included. The same problem loaded again makes no pivot, and a refused
+  load keeps the basis.
+- **A network's changes.** Hand-worked networks are loaded, changed by every setter and by moves of supply, solved
+  and set back, with each change's refusals at the ends of their ranges; random sequences of changes are solved and
+  checked against a solve of the problem as it stands; tiny networks are checked against the brute force and seeded ones
+  against the solver and the linear-programming oracle, by outcome, cost and certificate; two networks given the same
+  calls answer alike, their work included; and a copy changes apart from its source.
 - **Allocation.** A counting allocator shows that a solve into the caller's buffer allocates nothing after a
-  reservation, nor from the second solve on for a problem no larger than the first; that a resolve into it allocates
-  nothing after a reservation, from a kept basis or from the star, nor after a resolve that started from a kept
-  basis; and that the C library's reserved solve and resolve allocate nothing.
+  reservation, nor from the second solve on for a problem no larger than the first; that a network's load, from the
+  basis it holds or from the star, its changes, solve, reads and copies into a network with room allocate nothing
+  after a reservation, nor its loads after a first load of a problem no smaller; and that the C library's reserved
+  solve and its network's calls allocate nothing.
 - **The C and C++ programs.** The header is compiled as C99, C11, C17, C++11 and C++17 with every warning an error,
-  and a C program and two C++ programs are built against the static library and run; the C++ header is compiled in
+  and two C programs and three C++ programs are built against the static library and run; the C++ header is compiled in
   every standard from C++11 on.
 - **The Python checks.** The package's tests run with and without NumPy, beside a strict type check and a check of
   the stubs against the built module.
 - **The examples.** Every example in the Rust documentation, the README's and the Rust guide's included, runs as a
   doctest. The example programs of the crate `kahlnws` run as tests, each asserting its optimum worked out by hand,
-  the Python package's tests run its example scripts and compare what they print, and the tests of the C boundary
-  build the C and the C++ example programs, the C++ ones with and without exceptions, run them and compare what
-  they print.
+  the Python package's tests run its example scripts and every example of the Python guide and compare every line
+  the scripts print, and the tests of the C boundary build the C and the C++ example programs and the complete
+  programs of the C and the C++ guide, the C++ ones with and without exceptions, run them and compare every line they
+  print.
 
 Every test is named `test_`, and every test can fail: none compares the code with itself.
 
@@ -127,45 +138,73 @@ workspace.
 
 ## Miri
 
-Miri runs the tests in an interpreter that reports undefined behaviour. It needs a nightly toolchain. The library's
-tests run module by module, and the public tests file by file, each a command of its own:
+Miri runs the tests in an interpreter that reports undefined behaviour: an out-of-bounds read or write, a read of
+memory that holds no value, a reference that breaks the aliasing rules. Here it checks the `unsafe` code of the library
+and of the C interface, whose bounds the tests otherwise only assert. It needs a nightly toolchain with the Miri
+component; the tests run with debug assertions on, as in every test build.
+
+The library's tests run module by module, the public tests and the C interface's tests file by file, each a command
+of its own:
 
 ```sh
 rustup toolchain install nightly --component miri
 export MIRIFLAGS=-Zmiri-disable-isolation PROPTEST_CASES=2
-cargo +nightly miri test -p kahlnws --lib tree:: -- \
+cargo +nightly miri test -p kahlnws --lib tree:: -- --test-threads=1 \
     --skip test_every_exchange_reachable_from_the_star_keeps_every_column \
-    --skip test_the_random_exchanges_reach_every_kind_of_exchange
-cargo +nightly miri test -p kahlnws --lib basis::
-cargo +nightly miri test -p kahlnws --lib solver::
-cargo +nightly miri test -p kahlnws --test allocation
-cargo +nightly miri test -p kahlnws --test solve -- \
+    --skip test_the_random_exchanges_reach_every_kind_of_exchange \
+    --skip test_the_random_walks_reach_every_kind_of_cut_and_turn
+cargo +nightly miri test -p kahlnws --lib basis:: -- --test-threads=1 \
+    --skip test_the_random_routes_reach_every_way_a_route_goes
+cargo +nightly miri test -p kahlnws --lib network_simplex:: -- --test-threads=1
+cargo +nightly miri test -p kahlnws --lib network:: -- --test-threads=1 \
+    --skip test_the_random_calls_reach_every_kind_of_change
+cargo +nightly miri test -p kahlnws --lib block_scan:: -- --test-threads=1
+cargo +nightly miri test -p kahlnws --lib problem:: -- --test-threads=1
+cargo +nightly miri test -p kahlnws --lib ranges:: -- --test-threads=1
+cargo +nightly miri test -p kahlnws --lib slot_order:: -- --test-threads=1
+cargo +nightly miri test -p kahlnws --lib outcome:: -- --test-threads=1
+cargo +nightly miri test -p kahlnws --lib room:: -- --test-threads=1
+cargo +nightly miri test -p kahlnws --test allocation -- --test-threads=1
+cargo +nightly miri test -p kahlnws --test network -- --test-threads=1 \
+    --skip test_the_seeded_shapes_against_a_solve_and_the_oracle
+cargo +nightly miri test -p kahlnws --test solve -- --test-threads=1 \
     --skip test_the_seeded_shapes_against_the_oracle \
     --skip test_the_benchmark_networks_of_a_few_thousand_arcs_against_the_oracle \
     --skip test_one_solver_answers_every_problem_as_a_fresh_one \
-    --skip test_a_refused_buffer_leaves_the_solver_answering_as_a_fresh_one \
-    --skip test_a_resolve_of_a_fresh_solver_answers_as_a_solve \
-    --skip test_the_same_problem_resolved_makes_no_pivot_where_a_solve_makes_some \
-    --skip test_a_problem_of_other_counts_resolves_as_a_solve
-cargo +nightly miri test -p kahlnws_testing counting_allocator -- --skip test_a_request_the_system_refuses_counts_too
+    --skip test_a_refused_buffer_leaves_the_solver_answering_as_a_fresh_one
+cargo +nightly miri test -p kahlnws_capi --lib -- --test-threads=1
+cargo +nightly miri test -p kahlnws_capi --test entries -- --test-threads=1
+cargo +nightly miri test -p kahlnws_capi --test allocation -- --test-threads=1
+cargo +nightly miri test -p kahlnws_capi --test header_text -- --test-threads=1
+cargo +nightly miri test -p kahlnws_testing --lib counting_allocator:: -- --test-threads=1 \
+    --skip test_a_request_the_system_refuses_counts_too
 ```
 
-A test filter matches every test whose path contains it, so `basis::` runs the tests of `starting_basis` too. The
-library's other modules run the same way, each by its name after `--lib`. `MIRIFLAGS=-Zmiri-disable-isolation` lets
-the property tests read the working directory, where proptest keeps the failures it persists; Miri's isolation refuses
-that read. `PROPTEST_CASES` cuts the property tests that take the default number of cases. The tests left out cannot
-run under Miri, for these reasons:
+The library's filters together cover every module of `--lib`. A filter matches every test whose path contains it, so
+`basis::` runs the tests of `starting_basis` too, and `problem::` runs those of `network::held_problem`, which
+`network::` runs as well. `MIRIFLAGS=-Zmiri-disable-isolation` lets the property tests read the working directory,
+where proptest keeps the failures it persists; Miri's isolation refuses that read. `PROPTEST_CASES=2` sets the number
+of cases of every property test. `--test-threads=1` runs the tests one after another: Miri interleaves the threads of
+tests run side by side, which makes each of them many times slower.
 
-- the seven public tests that reach the linear-programming oracle, directly or through the networks they solve in turn:
-  the oracle is foreign code, which Miri cannot call;
-- the allocator test that asks for $2^{62}$ bytes: Miri cannot refuse an allocation;
-- the exhaustive exchange test and the exchange coverage run: each runs too long in an interpreter; the same exchange
-  code runs in the random exchange tests.
+The tests left out cannot run under Miri, for these reasons:
 
-The longest test that stays in, the sequences of perturbed networks resolved in turn, takes a few minutes under Miri.
+- the public tests that reach the linear-programming oracle, directly or through the networks they choose by it: the
+  oracle is foreign code, which Miri cannot call;
+- the allocator test that asks for $2^{62}$ bytes: Miri stops with resource exhaustion where the system refuses;
+- the exhaustive exchange test and the coverage runs of the random exchanges, the random walks, the random routes and
+  the random calls of a network: each runs for more than ten minutes in an interpreter, and the code each reaches runs
+  in the property tests of the same exchanges, walks, routes and calls;
+- the tests of the C interface that build and run C and C++ programs and check the header (`--test header`): they
+  start compilers and run foreign code.
 
-Run so, with debug assertions on, the commands above for the tree, the basis with the starting basis, the solver, and
-the two files of public tests run 221 tests, and Miri reports no undefined behaviour in any of them; they reach every
-`unsafe` block of the solve from a kept basis. The library's other modules (the problem, the ranges, the arc order, the
-pricing, the first pivots, the answer and the room) and the counting allocator were last run under Miri before the
-solve from a kept basis was added, and it reported no undefined behaviour in them then.
+The doctests and the example programs are not run under Miri.
+
+The commands take about forty minutes when four run at a time, each with its own `--target-dir`. The public network
+tests alone take that long, the longest of them, the coverage run of the changes and solves of a network, about
+fifteen minutes.
+
+On 17 November 2026, with `rustc 1.102.0-nightly (3ef0c22cd 2026-11-11)` and its Miri, the commands above ran 816
+tests: 504 of the library's own, 124 of its public tests, 181 of the C interface and 7 of the counting allocator. Miri
+reported no undefined behaviour in any of them. They reach every `unsafe` block of the library and of the C interface's
+Rust code, and the four `unsafe` blocks of the counting allocator.

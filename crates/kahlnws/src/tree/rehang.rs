@@ -1,14 +1,46 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The exchange of a leaving link for an entering one: the subtree the leaving link cuts off is hung from the entering
-//! arc's other end, in four steps that each leave one more part of the tree right, and its potentials are shifted.
+//! The move of a subtree under another node, in four steps that each leave one more part of the tree right, with its
+//! potentials shifted; and the two moves made of it: the exchange of a leaving link for an entering one, the subtree
+//! the leaving link cuts off hung from the entering arc's other end; and the cut of a node from its parent, its
+//! subtree hung from the root by the node's own root link.
 
 use super::cycle::Cycle;
-use super::spanning_tree::{Direction, HungNode, Link, Side, SpanningTree, TreeNode};
+use super::spanning_tree::{CutEnds, Direction, HungNode, Link, Side, SpanningTree, TreeNode};
 
-/// The exchange of the link of a cycle's kept node for an entering one, in the tree the cycle held: its nodes, with
-/// what its steps read of the tree before the move, while it was whole.
+/// The exchange of the link of a cycle's kept node for an entering one, in the tree the cycle held: the move of the
+/// subtree that link cuts off, with the side of the cycle the node was found on.
+///
+/// # Invariant
+/// Only [`Exchange::of`] makes one, from a cycle whose walk kept a node, and its move holds that cycle's borrow of the
+/// tree, as the cycle found it: the move's `cut` is the kept node and `side` its side; its `enter` is the end of that
+/// side, in the subtree of `cut`, and its `attach` the other end, outside it; its `join` is the apex. So the move
+/// keeps the invariant of [`SubtreeMove`].
+#[derive(Debug)]
+pub(crate) struct Exchange<'t> {
+    /// The move of the subtree the leaving link cuts off.
+    movement: SubtreeMove<'t>,
+    /// The side of the cycle the move's `cut` was found on, whose end the moved subtree holds.
+    side: Side,
+}
+
+/// The cut of a hung node from the hung node it hangs from: the move of its subtree under the root, by the node's own
+/// root link, in the tree its ends held.
+///
+/// # Invariant
+/// Only [`Cut::of`] makes one, from the ends of a cut, a node whose parent is not the root, and its move holds their
+/// borrow of the tree: the move's `cut` and `enter` are that node, and its `attach` and `join` are the root, which lies
+/// outside the node's subtree and is the deepest common ancestor of the node and itself. So the move keeps the
+/// invariant of [`SubtreeMove`].
+#[derive(Debug)]
+pub(super) struct Cut<'t> {
+    /// The move of the node's subtree under the root.
+    movement: SubtreeMove<'t>,
+}
+
+/// The move of the subtree of a hung node under another node of the tree it holds, by an entering link: its nodes,
+/// with what its steps read of the tree before the move, while it was whole.
 ///
 /// Let `S` be the subtree of `cut`. The move hangs `S` from `attach` by the entering link, with `enter` as its new top.
 /// Along the stem, the path from `enter` up to `cut`, the parent relation is reversed, each stem node hanging by the
@@ -17,25 +49,23 @@ use super::spanning_tree::{Direction, HungNode, Link, Side, SpanningTree, TreeNo
 /// `cut`'s old parent up to `join`, and above `join` only the ancestors whose run ended where `S` left or arrived.
 ///
 /// # Invariant
-/// Only [`Exchange::of`] makes one, from a cycle whose walk kept a node, and it holds that cycle's borrow of the tree,
-/// as the cycle found it: `cut` is the kept node and `side` its side; `enter` is the end of that side and `attach` the
-/// other end, which lies outside `S`; `join` is the apex. So the stem, from `enter` up to `cut`, lies in `S`, strictly
-/// below the apex: no stem node is the root. After step one of the move, each stem node above `enter` has as its
-/// parent the stem node that was below it, and `enter` has `attach`. `old_parent`, `before_cut`, `old_last` and
-/// `moved_size` were read from the tree before any step of the move.
+/// Only [`SubtreeMove::new`] makes one, which [`Exchange::of`] and [`Cut::of`] alone call. `cut` is a hung node of
+/// `tree`, `S` its subtree; `enter` is a node of `S`; `attach` is a tree node outside `S`; `join` is the deepest common
+/// ancestor of `enter` and `attach`, so the stem from `enter` up to `cut` lies in `S`, strictly below `join`, and holds
+/// no root. After step one of the move, each stem node above `enter` has as its parent the stem node that was below it,
+/// and `enter` has `attach`. `old_parent`, `before_cut`, `old_last` and `moved_size` were read from the tree before any
+/// step of the move.
 #[derive(Debug)]
-pub(crate) struct Exchange<'t> {
+struct SubtreeMove<'t> {
     /// The tree.
     tree: SpanningTree<'t>,
-    /// The side of the cycle `cut` was found on, whose end `S` holds.
-    side: Side,
     /// The top of `S` after the move.
     enter: HungNode,
     /// The new parent of `enter`.
     attach: TreeNode,
     /// The top of `S` before the move.
     cut: HungNode,
-    /// The apex of the cycle, the deepest common ancestor of `enter` and `attach`.
+    /// The deepest common ancestor of `enter` and `attach`: in an exchange, the apex of its cycle.
     join: TreeNode,
     /// `cut`'s parent before the move.
     old_parent: TreeNode,
@@ -62,19 +92,14 @@ impl<'t> Exchange<'t> {
     pub(crate) fn of(cycle: Cycle<'t>) -> Option<Self> {
         let kept = cycle.into_kept()?;
         let (side, enter, attach, cut, join) = (kept.side(), kept.enter(), kept.attach(), kept.cut(), kept.join());
-        let mut tree = kept.into_tree();
+        let movement = SubtreeMove::new(kept.into_tree(), enter, attach, cut, join);
 
-        let columns = tree.columns_mut();
-        let top = cut.node();
-        let (old_parent, before_cut) = (columns.parent(top), columns.reverse_thread(top));
-        let (old_last, moved_size) = (columns.last_successor(top), columns.subtree_size(top));
-
-        Some(Self { tree, side, enter, attach, cut, join, old_parent, before_cut, old_last, moved_size })
+        Some(Self { movement, side })
     }
 
     /// The link that leaves, for as long as this exchange is borrowed.
     pub(crate) fn leaving_link(&self) -> Link<'_> {
-        self.tree.hanging(self.cut).link
+        self.movement.tree.hanging(self.movement.cut).link
     }
 
     /// The side of the cycle whose end the moved subtree holds.
@@ -94,20 +119,84 @@ impl<'t> Exchange<'t> {
     ///
     /// # Safety
     /// `entering` is below the tree's link count: a raw link for which [`SpanningTree::link`] answers a link, as its
-    /// doc states.
+    /// doc states, and for which `apply` applies the exchange.
     pub(crate) unsafe fn apply_unchecked(self, entering: usize, direction: Direction, shift: i64) {
+        let tree = &self.movement.tree;
         debug_assert!(
-            entering < self.tree.link_count(),
+            entering < tree.link_count(),
             "called `Exchange::apply_unchecked` with link {entering}, which should be below the link count {}",
-            self.tree.link_count()
+            tree.link_count()
         );
         // SAFETY: the link is below the tree's link count, as the caller promises (`Exchange::apply_unchecked`).
-        let entering = unsafe { self.tree.link_unchecked(entering) };
+        let entering = unsafe { tree.link_unchecked(entering) };
 
-        self.move_subtree(entering, direction, shift);
+        self.movement.move_subtree(entering, direction, shift);
     }
 
-    /// The move of [`apply_unchecked`](Self::apply_unchecked), by the entering link `entering`, in its five steps.
+    /// Applies the exchange by the link `entering`, as [`apply_unchecked`](Self::apply_unchecked) does: its checked
+    /// twin, which the tests compare it with; every caller in the crate holds a link a type proves.
+    ///
+    /// # Panics
+    /// Panics if `entering` is not below the tree's link count, before any change.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn apply(self, entering: usize, direction: Direction, shift: i64) {
+        let link_count = self.movement.tree.link_count();
+        assert!(
+            entering < link_count,
+            "called `Exchange::apply` with link {entering}, which should be below the link count {link_count}"
+        );
+
+        debug_assert!(entering < link_count, "the link should be below the link count, as just asserted");
+        // SAFETY: the link is below the tree's link count, as just asserted.
+        unsafe { self.apply_unchecked(entering, direction, shift) };
+    }
+}
+
+impl<'t> Cut<'t> {
+    /// The cut of the node of `ends` from its parent, in the tree they hold.
+    pub(super) fn of(ends: CutEnds<'t>) -> Self {
+        let node = ends.node();
+        let tree = ends.into_tree();
+        let root = tree.root();
+
+        Self { movement: SubtreeMove::new(tree, node, root, node, root) }
+    }
+
+    /// Hangs the node from the root by its own root link, running `direction` seen from the node, with its subtree,
+    /// and adds `shift` to the potential of every node of that subtree, wrapping. The tree keeps its invariant.
+    ///
+    /// Afterwards the subtree's nodes hang as before, and its run in the thread, in its old order, follows the root.
+    /// No potential outside the subtree changes. It touches the nodes of the subtree and the path from the node's old
+    /// parent up to the root, and allocates nothing.
+    pub(super) fn apply(self, direction: Direction, shift: i64) {
+        // With `enter` the cut node the stem is that node alone: step one splices its run after the root, which it did
+        // not follow, its parent being a hung node; step two writes its hanging alone; step three finds the root's run
+        // ending elsewhere than at the root, which holds the node's old parent besides it, so the walk from the root
+        // writes nothing and the walk from the old parent ends the runs that ended with the subtree just before it;
+        // step four, the root being the join, makes no gain and takes the subtree's size from the old parent and each
+        // ancestor below the root.
+        let entering = self.movement.tree.root_link(self.movement.cut);
+
+        self.movement.move_subtree(entering, direction, shift);
+    }
+}
+
+impl<'t> SubtreeMove<'t> {
+    /// The move of the subtree of `cut` in `tree` under `attach`, with `enter` as its new top, `join` the deepest
+    /// common ancestor of `enter` and `attach`: the four nodes with what the steps read of the tree while it is whole,
+    /// `cut`'s parent, the node before it in the thread, the last node of its subtree and the subtree's size.
+    fn new(mut tree: SpanningTree<'t>, enter: HungNode, attach: TreeNode, cut: HungNode, join: TreeNode) -> Self {
+        let columns = tree.columns_mut();
+        let top = cut.node();
+        let (old_parent, before_cut) = (columns.parent(top), columns.reverse_thread(top));
+        let (old_last, moved_size) = (columns.last_successor(top), columns.subtree_size(top));
+
+        Self { tree, enter, attach, cut, join, old_parent, before_cut, old_last, moved_size }
+    }
+
+    /// Hangs `S` from `attach` by `entering`, which runs `direction` seen from `enter`, and adds `shift` to the
+    /// potential of every node of `S`, wrapping, in its five steps. The tree keeps its invariant.
     fn move_subtree(mut self, entering: Link<'_>, direction: Direction, shift: i64) {
         let end = if self.enter == self.cut { self.move_block() } else { self.rethread_stem() };
         self.reverse_stem(end, entering, direction);
@@ -224,7 +313,7 @@ impl<'t> Exchange<'t> {
             let parent = columns.parent(node.node());
             debug_assert!(columns.hung(parent).is_some(), "the walk down the stem should never meet the root");
             // SAFETY: after step one each stem node above `enter` has as its parent the stem node that was below it,
-            // and no stem node is the root (`Exchange`).
+            // and no stem node is the root (`SubtreeMove`).
             let below = unsafe { columns.hung_unchecked(parent) };
             columns.hang_by_turned_link_of(node, below);
 
@@ -296,7 +385,7 @@ impl<'t> Exchange<'t> {
         let (join, moved_size, node_count) = (self.join, self.moved_size, self.tree.node_count());
         let mut columns = self.tree.columns_mut();
 
-        // `join` is an ancestor of `attach` and of `cut`'s old parent (`Exchange`), so the walk meets it, having
+        // `join` is an ancestor of `attach` and of `cut`'s old parent (`SubtreeMove`), so the walk meets it, having
         // passed only hung nodes strictly below it and outside `S`: at most `n − 1`, as a path of the other `n − 1`
         // nodes under the root reaches.
         let mut node = from;
@@ -319,11 +408,7 @@ impl<'t> Exchange<'t> {
         let mut columns = self.tree.columns_mut();
 
         // After steps one and two, `S` is the run of `moved_size` nodes the thread makes from `enter`.
-        let mut node = enter;
-        for _ in 0..moved_size {
-            columns.shift_potential(node, shift);
-            node = columns.thread(node);
-        }
+        columns.shift_run(enter, moved_size, shift);
     }
 }
 
@@ -385,7 +470,7 @@ pub(super) mod tests {
     /// The nodes of `moving` as plain numbers: `enter`, `attach`, `cut`, `join`, `cut`'s old parent, the node before
     /// it in the thread, and the last node of `S`.
     fn nodes_of(moving: &Exchange<'_>) -> [usize; 7] {
-        let Exchange { enter, attach, cut, join, old_parent, before_cut, old_last, .. } = *moving;
+        let SubtreeMove { enter, attach, cut, join, old_parent, before_cut, old_last, .. } = moving.movement;
 
         [enter.node(), attach, cut.node(), join, old_parent, before_cut, old_last].map(usize::from)
     }
@@ -424,18 +509,13 @@ pub(super) mod tests {
         Exchange::of(walk.into_cycle(Some(side))).expect("the walk should find the leaving node on its side")
     }
 
-    /// Applies `exchange` by the entering link `entering`, running `direction`, with the shift `shift`: the one place
-    /// the tests apply an exchange from a raw link.
-    ///
-    /// # Panics
-    /// Panics if `entering` is not below the tree's link count.
-    fn apply_exchange(exchange: Exchange<'_>, entering: usize, direction: Direction, shift: i64) {
-        let link_count = exchange.tree.link_count();
-        assert!(entering < link_count, "a test's entering link should be below the link count {link_count}");
-
-        debug_assert!(entering < link_count, "a test's entering link should be below the link count");
-        // SAFETY: the link is below the tree's link count, as asserted just above.
-        unsafe { exchange.apply_unchecked(entering, direction, shift) };
+    /// Which of the two forms of an exchange's application a run calls.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::tree) enum Form {
+        /// The checked form, [`Exchange::apply`].
+        Checked,
+        /// The unchecked form, [`Exchange::apply_unchecked`], on the run's own proof that the link is below the count.
+        Unchecked,
     }
 
     /// The model of `parents` under its last node, node `v` hanging up by link `v`.
@@ -453,14 +533,14 @@ pub(super) mod tests {
         let mut tree = plain_tree_of(&mut room, &model);
         let before = columns_of(&tree);
         assert_eq!(before.threads, [1, 2, 3, 4, 5, 6, 7, 0], "the thread runs 7, 0, 1, …, 6");
-        let entering = tree.link(13).expect("link 13 lies below the link count");
+        let entering = tree.link(13).expect("link 13 should lie below the link count");
 
         // An arc between 3 and 6 enters and the link of 1 leaves: `S` is 1, 2, 3, hung from 6 by the arc at 3.
         let mut moving = exchange_keeping(&mut tree, [3, 6], Side::First, 1);
         assert_eq!((usize::from(moving.leaving_link()), moving.side()), (1, Side::First), "the link of 1, not 3");
-        assert_eq!((nodes_of(&moving), moving.moved_size), ([3, 6, 1, 7, 0, 0, 3], 3));
+        assert_eq!((nodes_of(&moving), moving.movement.moved_size), ([3, 6, 1, 7, 0, 0, 3], 3));
 
-        let end = moving.rethread_stem();
+        let end = moving.movement.rethread_stem();
         assert_eq!(usize::from(end), 1);
         let mut expected = PlainColumns {
             parents: vec![7, 2, 3, 6, 0, 7, 5, 7],
@@ -468,25 +548,25 @@ pub(super) mod tests {
             reverse_threads: vec![7, 2, 3, 6, 0, 4, 5, 1],
             ..before.clone()
         };
-        assert_eq!(columns_of(&moving.tree), expected, "the thread runs 7, 0, 4, 5, 6, 3, 2, 1");
+        assert_eq!(columns_of(&moving.movement.tree), expected, "the thread runs 7, 0, 4, 5, 6, 3, 2, 1");
 
-        moving.reverse_stem(end, entering, up);
+        moving.movement.reverse_stem(end, entering, up);
         expected.hangings[1] = (2, up);
         expected.hangings[2] = (3, down);
         expected.hangings[3] = (13, up);
         expected.subtree_sizes[1..4].copy_from_slice(&[1, 2, 3]);
         expected.last_successors[1..4].copy_from_slice(&[1, 1, 1]);
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.repair_last_successors(end);
+        moving.movement.repair_last_successors(end);
         expected.last_successors = vec![4, 1, 1, 1, 4, 1, 1, 1];
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.repair_subtree_sizes();
+        moving.movement.repair_subtree_sizes();
         expected.subtree_sizes = vec![2, 1, 2, 3, 1, 5, 4, 8];
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.shift_potentials(5);
+        moving.movement.shift_potentials(5);
         expected.potentials = vec![0, 5, 5, 5, 0, 0, 0, 0];
         assert_eq!(columns_of(&tree), expected);
         assert_eq!(model.exchanged(3, 6, 1, (13, up)).check(&expected, None), Ok(()));
@@ -498,13 +578,13 @@ pub(super) mod tests {
         let mut room = TreeRoom::new();
         let mut tree = plain_tree_of(&mut room, &model);
         let before = columns_of(&tree);
-        let entering = tree.link(12).expect("link 12 lies below the link count");
+        let entering = tree.link(12).expect("link 12 should lie below the link count");
 
         // An arc between 4 and 2 enters and the link of 4 itself leaves: 4 moves between 2 and 3 in the thread.
         let mut moving = exchange_keeping(&mut tree, [4, 2], Side::First, 4);
         assert_eq!(nodes_of(&moving), [4, 2, 4, 0, 0, 3, 4]);
 
-        let end = moving.move_block();
+        let end = moving.movement.move_block();
         assert_eq!(usize::from(end), 4);
         let mut expected = PlainColumns {
             parents: vec![7, 0, 1, 2, 2, 7, 5, 7],
@@ -512,21 +592,21 @@ pub(super) mod tests {
             reverse_threads: vec![7, 0, 1, 4, 2, 3, 5, 6],
             ..before.clone()
         };
-        assert_eq!(columns_of(&moving.tree), expected, "the thread runs 7, 0, 1, 2, 4, 3, 5, 6");
+        assert_eq!(columns_of(&moving.movement.tree), expected, "the thread runs 7, 0, 1, 2, 4, 3, 5, 6");
 
-        moving.reverse_stem(end, entering, Direction::Down);
+        moving.movement.reverse_stem(end, entering, Direction::Down);
         expected.hangings[4] = (12, Direction::Down);
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.repair_last_successors(end);
+        moving.movement.repair_last_successors(end);
         expected.last_successors = vec![3, 3, 3, 3, 4, 6, 6, 6];
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.repair_subtree_sizes();
+        moving.movement.repair_subtree_sizes();
         expected.subtree_sizes = vec![5, 4, 3, 1, 1, 2, 1, 8];
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.shift_potentials(-2);
+        moving.movement.shift_potentials(-2);
         expected.potentials[4] = -2;
         assert_eq!(columns_of(&tree), expected);
         assert_eq!(model.exchanged(4, 2, 4, (12, Direction::Down)).check(&expected, None), Ok(()));
@@ -537,23 +617,23 @@ pub(super) mod tests {
         let mut room = TreeRoom::new();
         let mut tree = plain_tree_of(&mut room, &seven_nodes());
         let before = columns_of(&tree);
-        let entering = tree.link(11).expect("link 11 lies below the link count");
+        let entering = tree.link(11).expect("link 11 should lie below the link count");
 
         // An arc between 4 and 3 enters and the link of 4 leaves: 4 follows 3 in the thread already.
         let mut moving = exchange_keeping(&mut tree, [4, 3], Side::First, 4);
         assert_eq!(nodes_of(&moving), [4, 3, 4, 0, 0, 3, 4]);
 
-        let end = moving.move_block();
+        let end = moving.movement.move_block();
         let mut expected = PlainColumns { parents: vec![7, 0, 1, 2, 3, 7, 5, 7], ..before.clone() };
-        assert_eq!((usize::from(end), columns_of(&moving.tree)), (4, expected.clone()));
+        assert_eq!((usize::from(end), columns_of(&moving.movement.tree)), (4, expected.clone()));
 
-        moving.reverse_stem(end, entering, Direction::Up);
-        moving.repair_last_successors(end);
+        moving.movement.reverse_stem(end, entering, Direction::Up);
+        moving.movement.repair_last_successors(end);
         expected.hangings[4] = (11, Direction::Up);
         expected.last_successors = vec![4, 4, 4, 4, 4, 6, 6, 6];
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.repair_subtree_sizes();
+        moving.movement.repair_subtree_sizes();
         expected.subtree_sizes = vec![5, 4, 3, 2, 1, 2, 1, 8];
         assert_eq!(columns_of(&tree), expected);
     }
@@ -566,13 +646,13 @@ pub(super) mod tests {
         let mut room = TreeRoom::new();
         let mut tree = plain_tree_of(&mut room, &model);
         let before = columns_of(&tree);
-        let entering = tree.link(9).expect("link 9 lies below the link count");
+        let entering = tree.link(9).expect("link 9 should lie below the link count");
 
         // An arc between 2 and 4 enters, the link of 3 leaves, found on the second side: 4 under 2, 3 under 4.
         let mut moving = exchange_keeping(&mut tree, [2, 4], Side::Second, 3);
         assert_eq!(nodes_of(&moving), [4, 2, 3, 0, 0, 2, 4]);
 
-        let end = moving.rethread_stem();
+        let end = moving.movement.rethread_stem();
         assert_eq!(usize::from(end), 3);
         let mut expected = PlainColumns {
             parents: vec![5, 0, 1, 4, 2, 5],
@@ -580,21 +660,21 @@ pub(super) mod tests {
             reverse_threads: vec![5, 0, 1, 4, 2, 3],
             ..before.clone()
         };
-        assert_eq!(columns_of(&moving.tree), expected, "the thread runs 5, 0, 1, 2, 4, 3");
+        assert_eq!(columns_of(&moving.movement.tree), expected, "the thread runs 5, 0, 1, 2, 4, 3");
 
-        moving.reverse_stem(end, entering, Direction::Down);
+        moving.movement.reverse_stem(end, entering, Direction::Down);
         expected.hangings[3] = (4, Direction::Down);
         expected.hangings[4] = (9, Direction::Down);
         expected.subtree_sizes = vec![5, 2, 1, 1, 2, 6];
         expected.last_successors = vec![4, 2, 2, 3, 3, 4];
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
         // The old side's walk passes the apex and ends at the root, its own parent.
-        moving.repair_last_successors(end);
+        moving.movement.repair_last_successors(end);
         expected.last_successors = vec![3; 6];
-        assert_eq!(columns_of(&moving.tree), expected);
+        assert_eq!(columns_of(&moving.movement.tree), expected);
 
-        moving.repair_subtree_sizes();
+        moving.movement.repair_subtree_sizes();
         expected.subtree_sizes = vec![5, 4, 3, 1, 2, 6];
         assert_eq!(columns_of(&tree), expected);
         assert_eq!(model.exchanged(4, 2, 3, (9, Direction::Down)).check(&expected, None), Ok(()));
@@ -608,17 +688,17 @@ pub(super) mod tests {
         let model = hung_up(vec![5, 0, 1, 0, 5, 5]);
         let mut room = TreeRoom::new();
         let mut tree = plain_tree_of(&mut room, &model);
-        let entering = tree.link(8).expect("link 8 lies below the link count");
+        let entering = tree.link(8).expect("link 8 should lie below the link count");
 
         let mut moving = exchange_keeping(&mut tree, [2, 3], Side::First, 1);
         assert_eq!(nodes_of(&moving), [2, 3, 1, 0, 0, 0, 2]);
-        let end = moving.rethread_stem();
+        let end = moving.movement.rethread_stem();
         assert_eq!(usize::from(end), 1);
-        assert_eq!(columns_of(&moving.tree).threads, [3, 4, 1, 2, 5, 0], "the thread runs 5, 0, 3, 2, 1, 4");
+        assert_eq!(columns_of(&moving.movement.tree).threads, [3, 4, 1, 2, 5, 0], "the thread runs 5, 0, 3, 2, 1, 4");
 
-        moving.reverse_stem(end, entering, Direction::Up);
-        moving.repair_last_successors(end);
-        moving.repair_subtree_sizes();
+        moving.movement.reverse_stem(end, entering, Direction::Up);
+        moving.movement.repair_last_successors(end);
+        moving.movement.repair_subtree_sizes();
         let columns = columns_of(&tree);
         assert_eq!(columns.last_successors, [1, 1, 1, 1, 4, 4]);
         assert_eq!(columns.subtree_sizes, [4, 1, 2, 3, 1, 6]);
@@ -632,20 +712,40 @@ pub(super) mod tests {
         let model = hung_up(vec![4, 0, 0, 1, 4]);
         let mut room = TreeRoom::new();
         let mut tree = plain_tree_of(&mut room, &model);
-        let entering = tree.link(7).expect("link 7 lies below the link count");
+        let entering = tree.link(7).expect("link 7 should lie below the link count");
 
         let mut moving = exchange_keeping(&mut tree, [3, 2], Side::First, 3);
         assert_eq!(nodes_of(&moving), [3, 2, 3, 0, 1, 1, 3]);
-        let end = moving.move_block();
-        moving.reverse_stem(end, entering, Direction::Up);
-        moving.repair_last_successors(end);
+        let end = moving.movement.move_block();
+        moving.movement.reverse_stem(end, entering, Direction::Up);
+        moving.movement.repair_last_successors(end);
 
         // The new side's walk ends 2, 0 and the root at 3; the old side's walk ends 1 at itself and stops at 0, whose
         // run, ending at 3 again, is no longer its old run.
-        assert_eq!(columns_of(&moving.tree).last_successors, [3, 1, 3, 3, 3]);
-        moving.repair_subtree_sizes();
+        assert_eq!(columns_of(&moving.movement.tree).last_successors, [3, 1, 3, 3, 3]);
+        moving.movement.repair_subtree_sizes();
         let exchanged = model.exchanged(3, 2, 3, (7, Direction::Up));
         assert_eq!(exchanged.check(&columns_of(&tree), None), Ok(()));
+    }
+
+    #[test]
+    fn test_an_exchange_by_a_link_past_the_link_count_is_refused_before_any_change() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let model = hung_up(vec![6, 0, 1, 2, 3, 4, 6]);
+        let mut room = TreeRoom::new();
+        let mut tree = plain_tree_of(&mut room, &model);
+        let (link_count, before) = (tree.link_count(), columns_of(&tree));
+
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            exchange_keeping(&mut tree, [0, 5], Side::Second, 1).apply(link_count, Direction::Down, 0);
+        }));
+        let message = unwound.expect_err("an exchange by a link past the link count should be refused");
+        let expected = format!(
+            "called `Exchange::apply` with link {link_count}, which should be below the link count {link_count}"
+        );
+        assert_eq!(message.downcast_ref::<String>(), Some(&expected));
+        assert_eq!(columns_of(&tree), before, "the refusal should come before any change");
     }
 
     #[test]
@@ -656,7 +756,7 @@ pub(super) mod tests {
         let mut room = TreeRoom::new();
         let mut tree = plain_tree_of(&mut room, &model);
 
-        apply_exchange(exchange_keeping(&mut tree, [0, 5], Side::Second, 1), 11, Direction::Down, 0);
+        exchange_keeping(&mut tree, [0, 5], Side::Second, 1).apply(11, Direction::Down, 0);
 
         let columns = columns_of(&tree);
         assert_eq!(columns.parents, [6, 2, 3, 4, 5, 0, 6]);
@@ -676,13 +776,63 @@ pub(super) mod tests {
 
         // Arc 0 runs from 1 to 3 and enters; the root link of 1 leaves: 1 hangs from 3, and its potential falls from
         // 10 to `0 − 7`, which makes the arc tight.
-        apply_exchange(exchange_keeping(&mut tree, [1, 3], Side::First, 1), 0, up, -17);
+        exchange_keeping(&mut tree, [1, 3], Side::First, 1).apply(0, up, -17);
 
         let columns = columns_of(&tree);
         assert_eq!(columns.threads, [2, 4, 3, 1, 0], "the thread runs 4, 0, 2, 3, 1");
         assert_eq!(columns.potentials, [0, -7, 0, 0, 0]);
         let model = PlainTree::star(&directions, 2).exchanged(1, 3, 1, (0, up));
         assert_eq!(model.check(&columns, Some(&costs)), Ok(()));
+    }
+
+    #[test]
+    fn test_each_step_of_a_cut_by_hand() {
+        // Seven nodes, the thread 7, 0, 1, …, 6. Node 1, under node 0, is cut by its root link 8 pointing down: the
+        // move with `enter = cut = 1`, `attach = join = 7`, the root. Node 0 precedes it in the thread, its subtree 1,
+        // 2, 3 ends at 3.
+        let model = seven_nodes();
+        let mut room = TreeRoom::new();
+        let mut tree = plain_tree_of(&mut room, &model);
+        let before = columns_of(&tree);
+        let node = tree.tree_mut().columns_mut().hung(tree_node(1)).expect("node 1 should be a hung node");
+        let mut cut = Cut::of(tree.tree_mut().cut_ends(node).expect("node 1 should hang from node 0, not the root"));
+        let SubtreeMove { enter, attach, cut: top, join, old_parent, before_cut, old_last, moved_size, .. } =
+            cut.movement;
+        let nodes = [enter.node(), attach, top.node(), join, old_parent, before_cut, old_last].map(usize::from);
+        assert_eq!((nodes, moved_size), ([1, 7, 1, 7, 0, 0, 3], 3));
+
+        // Step one splices 1, 2, 3 out from after node 0 and in after the root: 7, 1, 2, 3, 0, 4, 5, 6.
+        let end = cut.movement.move_block();
+        assert_eq!(usize::from(end), 3);
+        let mut expected = PlainColumns {
+            parents: vec![7, 7, 1, 2, 0, 7, 5, 7],
+            threads: vec![4, 2, 3, 0, 5, 6, 7, 1],
+            reverse_threads: vec![3, 7, 1, 2, 0, 4, 5, 6],
+            ..before.clone()
+        };
+        assert_eq!(columns_of(&cut.movement.tree), expected);
+
+        // Step two writes the hanging of node 1 alone; its run and its size are what they were.
+        let entering = cut.movement.tree.root_link(cut.movement.cut);
+        cut.movement.reverse_stem(end, entering, Direction::Down);
+        expected.hangings[1] = (8, Direction::Down);
+        assert_eq!(columns_of(&cut.movement.tree), expected);
+
+        // Step three: the root's run ends at 6, not at the root, so the walk from it writes nothing; node 0's run ends
+        // at 4, not at 3, so the walk from it stops at once.
+        cut.movement.repair_last_successors(end);
+        assert_eq!(columns_of(&cut.movement.tree), expected);
+
+        // Step four: the root is the join, so nothing gains; node 0 loses the three nodes.
+        cut.movement.repair_subtree_sizes();
+        expected.subtree_sizes = vec![2, 3, 2, 1, 1, 2, 1, 8];
+        assert_eq!(columns_of(&cut.movement.tree), expected);
+
+        // Step five: the run of three nodes from node 1 rises by 9.
+        cut.movement.shift_potentials(9);
+        expected.potentials = vec![0, 9, 9, 9, 0, 0, 0, 0];
+        assert_eq!(columns_of(&tree), expected);
+        assert_eq!(model.hung_from_root(1, Direction::Down, 14).check(&expected, None), Ok(()));
     }
 
     #[test]
@@ -761,7 +911,7 @@ pub(super) mod tests {
         /// Whether the moved subtree held the thread's last node.
         holds_last: bool,
         /// Whether the apex was the root.
-        apex_at_root: bool,
+        pub(in crate::tree) apex_at_root: bool,
     }
 
     /// A loaded tree with its model and the cost of each link, which exchange after exchange on that one tree keep
@@ -806,7 +956,7 @@ pub(super) mod tests {
         ///
         /// # Errors
         /// Returns the model's message where a column differs.
-        fn exchange(&mut self, pick: ExchangePick) -> Result<Option<Kind>, String> {
+        fn exchange(&mut self, pick: ExchangePick, form: Form) -> Result<Option<Kind>, String> {
             let columns = columns_of(&self.tree);
             let root = self.model.root();
             let thread_last = columns.reverse_threads[root];
@@ -846,7 +996,17 @@ pub(super) mod tests {
                 Side::First => [enter, attach],
                 Side::Second => [attach, enter],
             };
-            apply_exchange(exchange_keeping(&mut self.tree, ends, pick.side, cut), link, pick.direction, shift);
+            let exchange = exchange_keeping(&mut self.tree, ends, pick.side, cut);
+            match form {
+                Form::Checked => exchange.apply(link, pick.direction, shift),
+                Form::Unchecked => {
+                    assert!(link < self.costs.len(), "a pick's link should be below the link count");
+                    debug_assert!(link < self.costs.len(), "a pick's link should be below the link count");
+                    // SAFETY: the costs hold one entry per link of the tree, and `link` is below their count, as just
+                    // asserted.
+                    unsafe { exchange.apply_unchecked(link, pick.direction, shift) };
+                }
+            }
             self.model = self.model.exchanged(enter, attach, cut, (link, pick.direction));
 
             self.model.check(&columns_of(&self.tree), Some(&self.costs)).map(|()| Some(kind))
@@ -901,8 +1061,9 @@ pub(super) mod tests {
     ) -> Result<Vec<Kind>, TestCaseError> {
         let mut kinds = Vec::with_capacity(picks.len());
         for (number, &pick) in picks.iter().enumerate() {
-            let kind =
-                run.exchange(pick).map_err(|breach| TestCaseError::fail(format!("exchange {number}: {breach}")))?;
+            let kind = run
+                .exchange(pick, Form::Checked)
+                .map_err(|breach| TestCaseError::fail(format!("exchange {number}: {breach}")))?;
             kinds.extend(kind);
         }
 
@@ -923,6 +1084,22 @@ pub(super) mod tests {
             prop_assert_eq!(run.model.check(&columns_of(&run.tree), Some(&run.costs)), Ok(()));
 
             run_exchanges(&mut run, &picks)?;
+        }
+
+        #[test]
+        fn test_an_exchange_and_its_unchecked_twin_agree_in_every_column(
+            (model, costs) in shaped_trees(),
+            picks in vec(exchange_picks(), EXCHANGES),
+        ) {
+            // Two runs of one tree, each exchange applied by the checked form in one and the unchecked in the other.
+            let (mut checked_room, mut unchecked_room) = (TreeRoom::new(), TreeRoom::new());
+            let mut checked = ExchangeRun::shaped(&mut checked_room, model.clone(), costs.clone());
+            let mut unchecked = ExchangeRun::shaped(&mut unchecked_room, model, costs);
+            for &pick in &picks {
+                let kinds = (checked.exchange(pick, Form::Checked), unchecked.exchange(pick, Form::Unchecked));
+                prop_assert!(kinds.0.is_ok() && kinds.1.is_ok(), "{:?}", kinds);
+                prop_assert_eq!(columns_of(&checked.tree), columns_of(&unchecked.tree));
+            }
         }
 
         #[test]
@@ -1076,7 +1253,7 @@ pub(super) mod tests {
                             // Every state starts many exchanges and an exchange has no undo, so each one starts from
                             // its state written into the room again.
                             let mut tree = load(&mut room, &state, link_count);
-                            apply_exchange(exchange_keeping(&mut tree, ends, side, cut), entering.0, direction, 1);
+                            exchange_keeping(&mut tree, ends, side, cut).apply(entering.0, direction, 1);
                             let after = columns_of(&tree);
                             let checked = check_from_parents(&state, &after, [enter, attach, cut], entering, 1);
                             checked.unwrap_or_else(|column| panic!("{column} after {enter}, {attach}, {cut}"));

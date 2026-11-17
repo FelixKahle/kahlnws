@@ -3,7 +3,8 @@
 
 //! The one place pointers from C are read or written: each is checked in every build for null, for its alignment
 //! and for a count of entries whose bytes pass `isize::MAX`, and only then turned into a reference or a slice for
-//! the length the call states; and the solver's heap block is made and freed here.
+//! the length the call states; and the heap block of a solver or of a network, the handle C holds, is made and freed
+//! here.
 //!
 //! No check can prove what a C pointer points to, so every helper that reads one is an `unsafe fn` whose `# Safety`
 //! states what C must guarantee. An output is lent as `MaybeUninit` storage: it is written and never read, so C need
@@ -16,76 +17,107 @@ use core::slice;
 use std::alloc::{self, Layout};
 
 use crate::halves::Int128;
-use crate::problem::Problem;
+use crate::problem::{LentProblem, Problem};
 use crate::refusal::Refusal;
-use crate::solver::{Call, Solver};
+use crate::solver::Call;
 use crate::status::PointerFault;
 use crate::work::Work;
 
-/// The layout of the heap block of one solver: the block [`solver_handle`] allocates and [`free_solver`] frees as a
-/// `Box<Solver>`, whose layout it is.
-const SOLVER_LAYOUT: Layout = Layout::new::<Solver>();
+/// `value` in a heap block of its own, as the pointer C holds: a handle, which [`handle_mut`] and [`handle_ref`] lend
+/// and [`free_handle`] frees; null where the memory for the block is refused, `value` then dropped.
+pub(crate) fn handle<T>(value: T) -> *mut T {
+    // The global allocator may be asked only for a block of at least one byte.
+    const { assert!(size_of::<T>() > 0, "a handle should take at least one byte") };
+    let layout = Layout::new::<T>();
 
-// The global allocator may be asked only for a block of at least one byte.
-const _: () = assert!(SOLVER_LAYOUT.size() > 0, "a solver should take at least one byte");
-
-/// A new solver that holds no room, in a heap block of its own, as the pointer C holds; null where the memory for the
-/// block is refused. [`free_solver`] frees it.
-pub(crate) fn solver_handle() -> *mut Solver {
-    // SAFETY: the layout has a size of at least one byte, as the assertion beside `SOLVER_LAYOUT` checks.
-    let block = unsafe { alloc::alloc(SOLVER_LAYOUT) }.cast::<Solver>();
+    // SAFETY: the layout has a size of at least one byte, as the assertion above checks.
+    let block = unsafe { alloc::alloc(layout) }.cast::<T>();
     if block.is_null() {
         return ptr::null_mut();
     }
 
-    // SAFETY: `block` is not null and was just allocated with the layout of one solver, so it is valid for writing
-    // one, aligned, and nothing else holds it.
-    unsafe { block.write(Solver::new()) };
+    // SAFETY: `block` is not null and was just allocated with the layout of one `T`, so it is valid for writing one,
+    // aligned, and nothing else holds it.
+    unsafe { block.write(value) };
 
     block
 }
 
-/// Frees the solver `solver` points to, with its room; nothing where `solver` is null or not aligned for a solver,
-/// which no pointer `kahlnws_solver_new` answered is.
+/// Frees the value `handle` points to, with all it holds; nothing where `handle` is null or not aligned for a `T`,
+/// which no pointer [`handle`] answered is.
 ///
 /// # Safety
-/// `solver` is null, or a pointer `kahlnws_solver_new` answered that no call of `kahlnws_solver_free` has freed since
-/// and that no other call uses meanwhile.
-pub(crate) unsafe fn free_solver(solver: *mut Solver) {
-    if checked(solver.cast_const(), 1).is_err() {
+/// `handle` is null, or a pointer [`handle`] answered for a `T` that no call has freed since and that no other call
+/// uses meanwhile.
+pub(crate) unsafe fn free_handle<T>(handle: *mut T) {
+    if checked(handle.cast_const(), 1).is_err() {
         return;
     }
 
-    // SAFETY: C guarantees `solver` came from `solver_handle`, a block allocated with the layout of one solver and
-    // holding one, which is the layout a `Box<Solver>` frees; not freed since and not in use.
-    drop(unsafe { Box::from_raw(solver) });
+    // SAFETY: C guarantees `handle` came from `handle`, a block allocated with the layout of one `T` and holding one,
+    // which is the layout a `Box<T>` frees; not freed since and not in use.
+    drop(unsafe { Box::from_raw(handle) });
 }
 
-/// The solver `solver` points to, lent for the call.
+/// The value `handle` points to, lent for the call to change.
 ///
 /// # Errors
-/// Returns [`PointerFault::Null`] where `solver` is null, and [`PointerFault::Invalid`] where it is not aligned for
-/// a solver.
+/// Returns [`PointerFault::Null`] where `handle` is null, and [`PointerFault::Invalid`] where it is not aligned for
+/// a `T`.
 ///
 /// # Safety
-/// `solver` is null, or a pointer `kahlnws_solver_new` answered that no call of `kahlnws_solver_free` has freed since
-/// and that no other call uses meanwhile.
-pub(crate) unsafe fn solver_mut<'a>(solver: *mut Solver) -> Result<&'a mut Solver, PointerFault> {
-    checked(solver.cast_const(), 1)?;
+/// `handle` is null, or a pointer [`handle`] answered for a `T` that no call has freed since and that no other call
+/// uses meanwhile.
+pub(crate) unsafe fn handle_mut<'a, T>(handle: *mut T) -> Result<&'a mut T, PointerFault> {
+    checked(handle.cast_const(), 1)?;
 
-    // SAFETY: `solver` is aligned and not null, and C guarantees it is a live solver of `solver_handle` that nothing
-    // else uses.
-    Ok(unsafe { &mut *solver })
+    // SAFETY: `handle` is aligned and not null, and C guarantees it is a live value of `handle` that nothing else
+    // uses.
+    Ok(unsafe { &mut *handle })
 }
 
-/// The call of `kahlnws_solver_solve` or `kahlnws_solver_resolve` with these pointers: the problem `problem` points
-/// to, its tables lent, and the outputs, each lent as storage to be written for the length the problem's counts
-/// state; the outputs C passes as null are not wanted.
+/// The value `handle` points to, lent for the call to read.
 ///
 /// # Errors
-/// Returns [`PointerFault::Null`] where `problem` is null, or `flows` or a table of the problem other than its lower
-/// bounds is null while its count is above zero; [`PointerFault::Invalid`] where a pointer that is read or written is
-/// not aligned for its type, or its count's bytes pass `isize::MAX`.
+/// As [`handle_mut`].
+///
+/// # Safety
+/// `handle` is null, or a pointer [`handle`] answered for a `T` that no call has freed since and that no call that
+/// changes it uses meanwhile.
+pub(crate) unsafe fn handle_ref<'a, T>(handle: *const T) -> Result<&'a T, PointerFault> {
+    // SAFETY: C guarantees `handle` is null or a live value of `handle` that nothing changes meanwhile, so it is
+    // initialised.
+    unsafe { value_ref(handle) }
+}
+
+/// The tables of the problem `problem` points to, lent for the call.
+///
+/// # Errors
+/// Returns [`PointerFault::Null`] where `problem` is null, or a table of it other than its lower bounds is null while
+/// its count is above zero; [`PointerFault::Invalid`] where a pointer that is read is not aligned for its type, or its
+/// count's bytes pass `isize::MAX`.
+///
+/// # Safety
+/// `problem` is null or points to a `kahlnws_problem` whose every pointer points to what its doc states, which
+/// nothing writes during the call.
+pub(crate) unsafe fn lent_problem<'a>(problem: *const Problem) -> Result<LentProblem<'a>, PointerFault> {
+    // SAFETY: C guarantees `problem` is null or points to a `kahlnws_problem` that nothing writes meanwhile.
+    let problem = unsafe { value_ref(problem) }?;
+    // SAFETY: C guarantees each table of the problem points to the entries its count states, or is null with a count
+    // of zero, or is the lower bounds and null, and that nothing writes them meanwhile.
+    let tables = unsafe { tables_of(problem) }?;
+
+    Ok(LentProblem::new(tables))
+}
+
+/// The call of `kahlnws_solver_solve` with these pointers: the problem `problem` points to, its tables lent, and the
+/// outputs, each lent as storage to be written for the length the problem's counts state; the outputs C passes as null
+/// are not wanted.
+///
+/// # Errors
+/// As [`lent_problem`] for `problem`; besides, [`PointerFault::Null`] where `flows` is null while the arc count is
+/// above zero, and [`PointerFault::Invalid`] where an output is not aligned for its type, or its count's bytes pass
+/// `isize::MAX`.
 ///
 /// # Safety
 /// `problem` is null or points to a `kahlnws_problem` whose every pointer points to what its doc states, which
@@ -101,12 +133,10 @@ pub(crate) unsafe fn call<'a>(
     work: *mut Work,
     refusal: *mut Refusal,
 ) -> Result<Call<'a>, PointerFault> {
-    // SAFETY: C guarantees `problem` is null or points to a `kahlnws_problem` that nothing writes meanwhile.
-    let problem = unsafe { value_ref(problem) }?;
-    let (node_count, arc_count) = (problem.node_count, problem.arc_count);
-    // SAFETY: C guarantees each table of the problem points to the entries its count states, or is null with a count
-    // of zero, or is the lower bounds and null, and that nothing writes them meanwhile.
-    let tables = unsafe { tables_of(problem) }?;
+    // SAFETY: C guarantees `problem` is null or points to a `kahlnws_problem` whose tables point to what its doc
+    // states, which nothing writes meanwhile.
+    let problem = unsafe { lent_problem(problem) }?;
+    let (node_count, arc_count) = (problem.node_count(), problem.arc_count());
 
     // SAFETY: C guarantees `flows` points to writable storage for `arc_count` entries of its own.
     let flows = unsafe { output_table(flows, arc_count) }?;
@@ -119,7 +149,7 @@ pub(crate) unsafe fn call<'a>(
     // SAFETY: C guarantees `refusal` is null or points to writable storage for one value of its own.
     let refusal = unsafe { optional_output(refusal) }?;
 
-    Ok(Call::new(tables, flows, potentials, total_cost, work, refusal))
+    Ok(Call::new(problem, flows, potentials, total_cost, work, refusal))
 }
 
 /// The refusal `refusal` points to, lent for the call.
@@ -135,22 +165,23 @@ pub(crate) unsafe fn refusal_ref<'a>(refusal: *const Refusal) -> Result<&'a Refu
     unsafe { value_ref(refusal) }
 }
 
-/// The `capacity` bytes from `buffer`, lent as storage to be written for the call; empty where `buffer` is null or
-/// `capacity` is zero.
+/// The `capacity` bytes from `buffer`, lent as storage to be written for the call; empty where `buffer` is null,
+/// whatever `capacity` is, or `capacity` is zero.
 ///
 /// # Errors
-/// Returns [`PointerFault::Invalid`] where `capacity` passes `isize::MAX` bytes.
+/// Returns [`PointerFault::Invalid`] where `buffer` is not null and `capacity` passes `isize::MAX` bytes.
 ///
 /// # Safety
-/// `buffer` is null, or `capacity` is zero, or `buffer` points to writable storage for `capacity` bytes within one
-/// object that nothing else reads or writes during the call and that overlaps no other argument of the call; their
-/// contents do not matter.
+/// `buffer` is null, or `capacity` is zero or passes `isize::MAX`, or `buffer` points to writable storage for
+/// `capacity` bytes within one object that nothing else reads or writes during the call and that overlaps no other
+/// argument of the call; their contents do not matter.
 pub(crate) unsafe fn bytes_mut<'a>(
     buffer: *mut c_char,
     capacity: usize,
 ) -> Result<&'a mut [MaybeUninit<u8>], PointerFault> {
-    // SAFETY: C guarantees `buffer` is null or points to writable storage for `capacity` bytes of its own; a `char`
-    // has the size and alignment of a byte.
+    // SAFETY: C guarantees `buffer` is null, or `capacity` is zero or past `isize::MAX` and checked before any byte is
+    // lent, or `buffer` points to writable storage for `capacity` bytes of its own; a `char` has the size and
+    // alignment of a byte.
     let bytes = unsafe { optional_output_table(buffer.cast::<u8>(), capacity) }?;
 
     Ok(bytes.unwrap_or_default())
@@ -247,6 +278,21 @@ unsafe fn optional_table<'a, T>(start: *const T, length: usize) -> Result<Option
     unsafe { table(start, length) }.map(Some)
 }
 
+/// Storage for one value at `pointer`, lent to be written.
+///
+/// # Errors
+/// As [`checked`] for one entry.
+///
+/// # Safety
+/// `pointer` is null, or points to writable storage for one value that nothing else reads or writes during the call.
+pub(crate) unsafe fn output<'a, T>(pointer: *mut T) -> Result<&'a mut MaybeUninit<T>, PointerFault> {
+    checked(pointer.cast_const(), 1)?;
+
+    // SAFETY: `pointer` is aligned and not null, and C guarantees it is writable storage for one value of its own; as
+    // `MaybeUninit`, its contents need not be a value.
+    Ok(unsafe { &mut *pointer.cast::<MaybeUninit<T>>() })
+}
+
 /// Storage for one value at `pointer`, lent to be written; `None` where `pointer` is null.
 ///
 /// # Errors
@@ -254,7 +300,7 @@ unsafe fn optional_table<'a, T>(start: *const T, length: usize) -> Result<Option
 ///
 /// # Safety
 /// `pointer` is null, or points to writable storage for one value that nothing else reads or writes during the call.
-unsafe fn optional_output<'a, T>(pointer: *mut T) -> Result<Option<&'a mut MaybeUninit<T>>, PointerFault> {
+pub(crate) unsafe fn optional_output<'a, T>(pointer: *mut T) -> Result<Option<&'a mut MaybeUninit<T>>, PointerFault> {
     match checked(pointer.cast_const(), 1) {
         Err(PointerFault::Null) => Ok(None),
         Err(fault) => Err(fault),
@@ -273,7 +319,10 @@ unsafe fn optional_output<'a, T>(pointer: *mut T) -> Result<Option<&'a mut Maybe
 /// # Safety
 /// Where `length` is above zero, `start` is null or points to writable storage for `length` entries within one
 /// object that nothing else reads or writes during the call.
-unsafe fn output_table<'a, T>(start: *mut T, length: usize) -> Result<&'a mut [MaybeUninit<T>], PointerFault> {
+pub(crate) unsafe fn output_table<'a, T>(
+    start: *mut T,
+    length: usize,
+) -> Result<&'a mut [MaybeUninit<T>], PointerFault> {
     if length == 0 {
         return Ok(&mut []);
     }
@@ -305,9 +354,35 @@ unsafe fn optional_output_table<'a, T>(
     unsafe { output_table(start, length) }.map(Some)
 }
 
+/// The value `output` holds, read back by a test after the call under test was given it.
+///
+/// # Safety
+/// `output` holds a value: the test made it with `MaybeUninit::new`, and the call under test, which writes an output
+/// only whole, never made it uninitialised again; or the test made it uninitialised and the call under test wrote it,
+/// as that call's doc says it does for the answer it gave.
+#[cfg(test)]
+pub(crate) unsafe fn written<T: Copy>(output: &MaybeUninit<T>) -> T {
+    // SAFETY: the caller guarantees `output` holds a value.
+    unsafe { output.assume_init() }
+}
+
+/// The values `entries` hold, read back by a test after the call under test was given them.
+///
+/// # Safety
+/// Every entry holds a value, as [`written`] asks of one.
+#[cfg(test)]
+pub(crate) unsafe fn written_entries<T: Copy>(entries: &[MaybeUninit<T>]) -> Vec<T> {
+    entries
+        .iter()
+        // SAFETY: the caller guarantees every entry holds a value.
+        .map(|entry| unsafe { written(entry) })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::Solver;
     use crate::status::Status;
 
     /// A pointer one byte past `start`: never aligned for a type wider than a byte, and never read or written.
@@ -380,21 +455,37 @@ mod tests {
     }
 
     #[test]
-    fn test_an_output_table_writes_through_storage_that_held_no_values() {
-        let mut storage = [MaybeUninit::<u64>::uninit(); 3];
+    fn test_an_output_table_is_lent_for_its_length_and_written_through() {
+        let mut storage = [MaybeUninit::new(7_u64); 4];
 
-        // SAFETY: the pointer is the start of `storage`, which has room for three, outlives the slice and is not
+        // SAFETY: the pointer is the start of `storage`, which has room for four, outlives the slice and is not
         // otherwise used while it is held.
         let lent = unsafe { output_table(storage.as_mut_ptr().cast::<u64>(), 3) }.expect("the storage should be lent");
+        assert_eq!(lent.len(), 3);
         lent.write_copy_of_slice(&[2, 2, 2]);
 
-        // SAFETY: every entry of `storage` was just written.
-        assert_eq!(unsafe { storage.assume_init_ref() }, &[2, 2, 2]);
+        // SAFETY: the test made every entry with `MaybeUninit::new`, and the slice lent wrote only whole values.
+        assert_eq!(unsafe { written_entries(&storage) }, [2, 2, 2, 7], "the three lent entries were written");
+    }
+
+    #[test]
+    fn test_an_output_is_refused_where_null_or_misaligned_and_lent_otherwise() {
+        let mut storage = [MaybeUninit::new(7_u64); 2];
+
+        // SAFETY: a null pointer is checked and never written.
+        assert!(matches!(unsafe { output(ptr::null_mut::<u64>()) }, Err(PointerFault::Null)));
+        // SAFETY: a misaligned pointer is checked and never written.
+        assert!(matches!(unsafe { output(misaligned(storage.as_ptr()).cast::<u64>()) }, Err(PointerFault::Invalid)));
+        // SAFETY: the pointer is the start of `storage`, which has room for one value, and is not otherwise used.
+        unsafe { output(storage.as_mut_ptr().cast::<u64>()) }.expect("the storage should be lent").write(9);
+
+        // SAFETY: the test made both entries with `MaybeUninit::new`, and the output lent wrote only a whole value.
+        assert_eq!(unsafe { written_entries(&storage) }, [9, 7], "the first entry was written");
     }
 
     #[test]
     fn test_an_optional_output_is_none_where_null_and_refused_where_misaligned() {
-        let mut storage = [MaybeUninit::<Int128>::uninit(); 2];
+        let mut storage = [MaybeUninit::new(Int128 { low: 7, high: 7 }); 2];
 
         // SAFETY: a null pointer is checked and never written.
         assert!(matches!(unsafe { optional_output(ptr::null_mut::<Int128>()) }, Ok(None)));
@@ -405,16 +496,19 @@ mod tests {
         let lent = unsafe { optional_output(storage.as_mut_ptr().cast::<Int128>()) };
         lent.expect("the storage should be lent").expect("the pointer is not null").write(Int128 { low: 14, high: 0 });
 
-        // SAFETY: the first entry of `storage` was just written.
-        assert_eq!(unsafe { storage[0].assume_init() }, Int128 { low: 14, high: 0 });
+        let expected = [Int128 { low: 14, high: 0 }, Int128 { low: 7, high: 7 }];
+        // SAFETY: the test made both entries with `MaybeUninit::new`, and the output lent wrote only a whole value.
+        assert_eq!(unsafe { written_entries(&storage) }, expected, "the first entry was written");
     }
 
     #[test]
-    fn test_the_bytes_of_a_buffer_are_empty_where_it_is_null_and_refused_past_isize_max() {
+    fn test_the_bytes_of_a_buffer_are_empty_where_it_is_null_and_refused_past_isize_max_otherwise() {
         let mut buffer = [MaybeUninit::<c_char>::uninit(); 4];
 
         // SAFETY: a null pointer is checked and never written.
         assert!(unsafe { bytes_mut(ptr::null_mut(), 4) }.is_ok_and(|bytes| bytes.is_empty()));
+        // SAFETY: a null pointer is checked and never written, whatever the capacity.
+        assert!(unsafe { bytes_mut(ptr::null_mut(), usize::MAX) }.is_ok_and(|bytes| bytes.is_empty()));
         // SAFETY: a capacity past `isize::MAX` is checked and the buffer never written.
         assert!(matches!(unsafe { bytes_mut(buffer.as_mut_ptr().cast(), usize::MAX) }, Err(PointerFault::Invalid)));
         // SAFETY: the pointer is the start of `buffer`, which has room for four bytes, outlives the slice and is not
@@ -478,25 +572,56 @@ mod tests {
     }
 
     #[test]
-    fn test_a_solver_handle_is_lent_and_freed_and_null_or_misaligned_refused_and_ignored() {
-        let handle = solver_handle();
+    fn test_a_handle_is_lent_and_freed_and_null_or_misaligned_refused_and_ignored() {
+        let handle = handle(Solver::new());
         assert!(!handle.is_null());
 
-        // SAFETY: the handle is the live solver `solver_handle` answered, used by nothing else.
-        let solver = unsafe { solver_mut(handle) }.expect("the handle should be lent");
-        assert_eq!(solver.reserve(2, 1), Status::Reserved);
-        // SAFETY: the handle is not freed since, and the solver lent from it is no longer used.
-        unsafe { free_solver(handle) };
+        // SAFETY: the handle is the live solver `handle` answered, used by nothing else.
+        let solver = unsafe { handle_mut(handle) }.expect("the handle should be lent");
+        assert_eq!(solver.reserve(2, 1), Status::Ok);
+        // SAFETY: the handle is live, and the solver lent from it to change is no longer used.
+        assert!(unsafe { handle_ref(handle.cast_const()) }.is_ok());
+        // SAFETY: the handle is not freed since, and nothing lent from it is used any more.
+        unsafe { free_handle(handle) };
 
         // SAFETY: a null pointer is checked and never read.
-        assert!(matches!(unsafe { solver_mut(ptr::null_mut()) }, Err(PointerFault::Null)));
+        assert!(matches!(unsafe { handle_mut(ptr::null_mut::<Solver>()) }, Err(PointerFault::Null)));
+        // SAFETY: a null pointer is checked and never read.
+        assert!(matches!(unsafe { handle_ref(ptr::null::<Solver>()) }, Err(PointerFault::Null)));
         let misaligned = ptr::dangling_mut::<Solver>().cast::<u8>().wrapping_add(1).cast::<Solver>();
         // SAFETY: a misaligned pointer is checked and never read.
-        assert!(matches!(unsafe { solver_mut(misaligned) }, Err(PointerFault::Invalid)));
+        assert!(matches!(unsafe { handle_mut(misaligned) }, Err(PointerFault::Invalid)));
+        // SAFETY: a misaligned pointer is checked and never read.
+        assert!(matches!(unsafe { handle_ref(misaligned.cast_const()) }, Err(PointerFault::Invalid)));
         // SAFETY: freeing null does nothing.
-        unsafe { free_solver(ptr::null_mut()) };
+        unsafe { free_handle(ptr::null_mut::<Solver>()) };
         // SAFETY: a misaligned pointer is checked and never freed.
-        unsafe { free_solver(misaligned) };
+        unsafe { free_handle(misaligned) };
+    }
+
+    #[test]
+    fn test_a_lent_problem_is_none_of_a_null_pointer_and_its_tables_otherwise() {
+        let (tails, heads, supplies) = ([0_usize], [1_usize], [2_i64, -2]);
+        let (capacities, costs) = ([5_u64], [1_i64]);
+        let problem = Problem {
+            node_count: 2,
+            arc_count: 1,
+            tails: tails.as_ptr(),
+            heads: heads.as_ptr(),
+            lower_bounds: ptr::null(),
+            capacities: capacities.as_ptr(),
+            costs: costs.as_ptr(),
+            supplies: supplies.as_ptr(),
+        };
+
+        // SAFETY: every table points to the entries its count states, and outlives the problem lent.
+        let lent = unsafe { lent_problem(&raw const problem) }.expect("the problem should be lent");
+        assert_eq!((lent.node_count(), lent.arc_count(), lent.problem().supplies), (2, 1, &supplies[..]));
+        // SAFETY: a null pointer is checked and never read.
+        assert!(matches!(unsafe { lent_problem(ptr::null()) }, Err(PointerFault::Null)));
+        let refused = Problem { costs: ptr::null(), ..problem };
+        // SAFETY: the null table is checked and never read; the others outlive the problem lent.
+        assert!(matches!(unsafe { lent_problem(&raw const refused) }, Err(PointerFault::Null)));
     }
 
     #[test]

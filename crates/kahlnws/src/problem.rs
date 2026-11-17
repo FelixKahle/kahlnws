@@ -10,7 +10,7 @@ use core::slice;
 use derive_more::{From, Into};
 use itertools::izip;
 
-use crate::ranges::{INDEX_LIMIT, NET_SUPPLY_LIMIT, cost_bound, cost_total_with, root_cost};
+use crate::ranges::{INDEX_LIMIT, NET_SUPPLY_LIMIT, cost_bound, cost_total_with, root_cost, within_cost_bound};
 
 /// One min-cost flow problem, borrowed: arcs `0..tails.len()` between nodes `0..supplies.len()`.
 ///
@@ -163,7 +163,7 @@ pub(crate) struct NodeId(usize);
 /// - `n + 1` and `m + n` are at most `u32::MAX`;
 /// - every tail and head is below `n`;
 /// - every lower bound is at most its capacity, every cost within plus or minus `cost_bound(n)`;
-/// - the costs' magnitudes times the capacities add up to at most `i128::MAX`;
+/// - the costs' magnitudes times the capacities add up to `cost_total`, at most `i128::MAX`;
 /// - the supplies add up to zero;
 /// - `largest_cost` is the largest magnitude of a cost.
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +172,8 @@ pub(crate) struct CheckedProblem<'a> {
     problem: Problem<'a>,
     /// The largest magnitude of a cost, `C`, in units of cost; zero without arcs.
     largest_cost: u64,
+    /// The magnitudes of the costs times the capacities, added up, in units of cost times units of flow.
+    cost_total: u128,
 }
 
 /// One arc of a [`CheckedProblem`].
@@ -225,18 +227,16 @@ impl<'a> Problem<'a> {
             return Err(breach);
         }
 
-        let largest_cost = match self.lower_bounds {
-            Some(lower_bounds) => {
-                largest_cost_of_arcs_in_range(self.arc_numbers(lower_bounds.iter().copied()), node_count)
-            }
-            None => largest_cost_of_arcs_in_range(self.arc_numbers(iter::repeat(0)), node_count),
+        let ArcSums { largest_cost, cost_total } = match self.lower_bounds {
+            Some(lower_bounds) => arc_sums_in_range(self.arc_numbers(lower_bounds.iter().copied()), node_count),
+            None => arc_sums_in_range(self.arc_numbers(iter::repeat(0)), node_count),
         }?;
 
         if let Some(breach) = balance_breach(self.supplies) {
             return Err(breach);
         }
 
-        Ok(CheckedProblem { problem: *self, largest_cost })
+        Ok(CheckedProblem { problem: *self, largest_cost, cost_total })
     }
 
     /// The numbers of the arcs in ascending order, each as the problem gives it, the lower bounds read from
@@ -284,8 +284,8 @@ fn size_breach(node_count: usize, arc_count: usize) -> Option<ProblemError> {
     (!fits).then_some(ProblemError::TooLarge { node_count, arc_count })
 }
 
-/// The largest magnitude of a cost of `arcs`, the arcs of a problem of `node_count` nodes in ascending order, once
-/// every arc lies in range; zero without arcs.
+/// The largest magnitude of a cost of `arcs`, the arcs of a problem of `node_count` nodes in ascending order, and the
+/// magnitudes of their costs times their capacities added up, once every arc lies in range; both zero without arcs.
 ///
 /// Generic over the arcs, which come with a problem's lower bounds or with zeros.
 ///
@@ -293,10 +293,7 @@ fn size_breach(node_count: usize, arc_count: usize) -> Option<ProblemError> {
 /// Returns the breach of the lowest arc that has one: its own ([`arc_breach`]) first, then
 /// [`ProblemError::CostTotalBeyondRange`] where the magnitudes of the costs times the capacities, added up to it,
 /// pass `i128::MAX`.
-fn largest_cost_of_arcs_in_range(
-    arcs: impl Iterator<Item = ArcNumbers>,
-    node_count: usize,
-) -> Result<u64, ProblemError> {
+fn arc_sums_in_range(arcs: impl Iterator<Item = ArcNumbers>, node_count: usize) -> Result<ArcSums, ProblemError> {
     let bound = cost_bound(node_count);
     let mut total = 0_u128;
     let mut largest_cost = 0_u64;
@@ -311,7 +308,16 @@ fn largest_cost_of_arcs_in_range(
         largest_cost = largest_cost.max(numbers.cost.unsigned_abs());
     }
 
-    Ok(largest_cost)
+    Ok(ArcSums { largest_cost, cost_total: total })
+}
+
+/// What the check of a problem's arcs sums over them. Plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArcSums {
+    /// The largest magnitude of a cost, in units of cost; zero without arcs.
+    largest_cost: u64,
+    /// The magnitudes of the costs times the capacities, added up, in units of cost times units of flow.
+    cost_total: u128,
 }
 
 /// The first breach of the own numbers of `arc` in a problem of `node_count` nodes, whose cost bound is `bound`: its
@@ -325,7 +331,7 @@ fn arc_breach(arc: usize, numbers: ArcNumbers, node_count: usize, bound: i64) ->
         Some(ProblemError::HeadOutsideNodes { arc, head, node_count })
     } else if lower_bound > capacity {
         Some(ProblemError::LowerAboveCapacity { arc, lower_bound, capacity })
-    } else if !(-bound..=bound).contains(&cost) {
+    } else if !within_cost_bound(cost, bound) {
         Some(ProblemError::CostBeyondBound { arc, cost, node_count })
     } else {
         None
@@ -362,6 +368,12 @@ impl<'a> CheckedProblem<'a> {
     pub(crate) fn root_cost(&self) -> i64 {
         // The costs lie within the cost bound, so the root cost is at most `2^62` and `root_cost` does not panic.
         root_cost(self.node_count(), self.largest_cost())
+    }
+
+    /// The magnitudes of the costs times the capacities, added up, in units of cost times units of flow: at most
+    /// `i128::MAX`.
+    pub(crate) fn cost_total(&self) -> u128 {
+        self.cost_total
     }
 
     /// The supply of each node, in units of flow, one per node; they add up to zero.
@@ -856,6 +868,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_the_cost_total_of_a_checked_problem_by_hand() {
+        // `|3|·4 + |−5|·2 + |0|·2`; no arc adds nothing.
+        assert_eq!(problem_of(&three_nodes()).checked().map(|checked| checked.cost_total()), Ok(22));
+        assert_eq!(nodes_only(&[0]).checked().map(|checked| checked.cost_total()), Ok(0));
+
+        // Four loops at one node, of the cost bound `B = 2^62 − 1` of one node: `B` and `−B` at `2^64 − 1`, 2 at
+        // `2^64 − 1`, 1 at `2^63 − 1`. Their total is `2^127 − 2^65 − 2^63 + 2 + 2^65 − 2 + 2^63 − 1 = 2^127 − 1`.
+        let (bound, wide) = (cost_bound(1), u64::MAX);
+        let arcs = [(0, 0, 0, wide, bound), (0, 0, 0, wide, -bound), (0, 0, 0, wide, 2), (0, 0, 0, (1 << 63) - 1, 1)];
+        let network = MincostNetwork::from_arcs(&[0], &arcs);
+        let checked = problem_of(&network).checked().expect("the total at i128::MAX should be admitted");
+        assert_eq!(checked.cost_total(), i128::MAX.cast_unsigned());
+    }
+
+    #[test]
     fn test_the_root_cost_of_a_checked_problem_by_hand() {
         // Three nodes and a largest cost of 5: `(3 − 1) · 5 + 1`.
         let network = three_nodes();
@@ -921,25 +948,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_largest_cost_of_arcs_in_range_by_hand() {
+    fn test_arc_sums_in_range_by_hand() {
         let bound = cost_bound(3);
-        assert_eq!(largest_cost_of_arcs_in_range(iter::empty(), 3), Ok(0));
+        assert_eq!(arc_sums_in_range(iter::empty(), 3), Ok(ArcSums { largest_cost: 0, cost_total: 0 }));
 
+        // `|3|·4 + |−7|·2 + |5|·0`.
         let arcs = [numbers(0, 1, 0, 4, 3), numbers(1, 2, 1, 2, -7), numbers(2, 0, 0, 0, 5)];
-        assert_eq!(largest_cost_of_arcs_in_range(arcs.into_iter(), 3), Ok(7));
+        assert_eq!(arc_sums_in_range(arcs.into_iter(), 3), Ok(ArcSums { largest_cost: 7, cost_total: 26 }));
 
         let at_bound = [numbers(0, 1, 0, 1, -bound), numbers(1, 1, 0, 1, bound)];
-        assert_eq!(largest_cost_of_arcs_in_range(at_bound.into_iter(), 3), Ok(bound.unsigned_abs()));
+        let sums = ArcSums { largest_cost: bound.unsigned_abs(), cost_total: 2 * u128::from(bound.unsigned_abs()) };
+        assert_eq!(arc_sums_in_range(at_bound.into_iter(), 3), Ok(sums));
 
         // Arc 1's own breach is reported, arc 2's never read.
         let breaches = [numbers(0, 1, 0, 4, 3), numbers(1, 2, 3, 2, 1), numbers(5, 0, 0, 0, 0)];
         let breach = ProblemError::LowerAboveCapacity { arc: 1, lower_bound: 3, capacity: 2 };
-        assert_eq!(largest_cost_of_arcs_in_range(breaches.into_iter(), 3), Err(breach));
+        assert_eq!(arc_sums_in_range(breaches.into_iter(), 3), Err(breach));
 
         // Loops at the bound of one node and capacity `u64::MAX`, each nearly `2^126`: the third passes `i128::MAX`.
         let full = [numbers(0, 0, 0, u64::MAX, cost_bound(1)); 4];
         let breach = ProblemError::CostTotalBeyondRange { arc: 2 };
-        assert_eq!(largest_cost_of_arcs_in_range(full.into_iter(), 1), Err(breach));
+        assert_eq!(arc_sums_in_range(full.into_iter(), 1), Err(breach));
     }
 
     #[test]

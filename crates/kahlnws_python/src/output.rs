@@ -1,7 +1,8 @@
 // Copyright 2026 Felix Kahle
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The buffers the caller lends a solve to write the columns of its answer to, checked before anything is written.
+//! The buffers the caller lends a solve or a network's optimum to write the columns of an answer to, checked before
+//! anything is written.
 
 use pyo3::buffer::{Element, PyBuffer, PyUntypedBuffer};
 use pyo3::exceptions::PyTypeError;
@@ -13,7 +14,7 @@ use crate::argument::{Argument, ArgumentError, Output, raised_writing, type_name
 use crate::column::{Held, dimensions_of};
 use crate::items::Items;
 
-/// A buffer the caller lends for one column of the answer, checked to take it.
+/// A buffer the caller lends for one column of an answer, checked to take it.
 ///
 /// # Invariant
 /// Only [`OutputBuffer::new`] makes one: the buffer has one dimension, is writable, holds items exactly of type `T`
@@ -44,15 +45,15 @@ pub(crate) enum OutputBuffer<T> {
 /// The bytes of memory a buffer's items cover, from its lowest byte to one past its highest; empty for a buffer of no
 /// item. Addresses are compared as numbers, with room for any stride.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Extent {
+pub(crate) struct Extent {
     /// The address of its lowest byte.
     start: i128,
     /// One past the address of its highest byte; `start` where it covers none.
     end: i128,
 }
 
-/// The two buffers of one call of `solve_into` or `resolve_into`, checked to take its answer: the flows always, the
-/// potentials where asked for.
+/// The two buffers of one call of `solve_into`, checked to take its answer: the flows always, the potentials where
+/// asked for.
 ///
 /// # Invariant
 /// Only [`Outputs::new`] makes one: each buffer is checked as [`OutputBuffer::new`] checks it, and the two share no
@@ -115,7 +116,7 @@ impl<T: Held + Element> OutputBuffer<T> {
     /// has other than one dimension, holds other items than `T` in the machine's byte order, is read-only, holds
     /// another number of entries than `length`, or is strided with items that cannot be written as they lie, in that
     /// order. Passes on, with a note that names the argument, what Python raises while the buffer is exported.
-    fn new(output: Output, argument: &Bound<'_, PyAny>, length: usize) -> PyResult<(Self, Extent)> {
+    pub(crate) fn new(output: Output, argument: &Bound<'_, PyAny>, length: usize) -> PyResult<(Self, Extent)> {
         let py = argument.py();
         let noted = |error| raised_writing(py, error, output);
         let view = match PyMemoryView::from(argument) {
@@ -153,7 +154,7 @@ impl<T: Held + Element> OutputBuffer<T> {
     /// # Errors
     /// Passes on, with a note that names the argument, what the copy raises: the `BufferError` of a `column` of
     /// another length than the buffer was checked for, which no caller in this crate hands it.
-    fn write(&self, py: Python<'_>, column: &[T]) -> PyResult<()> {
+    pub(crate) fn write(&self, py: Python<'_>, column: &[T]) -> PyResult<()> {
         match self {
             Self::Empty => Ok(()),
             Self::Contiguous { output, bytes } => bytes
@@ -306,7 +307,7 @@ mod tests {
                 ("[0, 0]", 2, "flows is of type list, not a writable buffer"),
                 ("array('q', [0, 0])", 2, "flows holds items of format 'q', not unsigned 64-bit integers"),
                 ("memoryview(bytes(16)).cast('Q')", 2, "flows is read-only"),
-                ("array('Q', [0])", 2, "flows has length 1, not the arc count 2"),
+                ("array('Q', [0])", 2, "flows holds 1 entries for a problem of 2 arcs"),
                 ("memoryview(bytearray(41))[1:].cast('Q')[::2]", 3, "flows is strided"),
             ];
             for (expression, length, message) in cases {

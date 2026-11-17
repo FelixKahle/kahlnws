@@ -27,6 +27,7 @@ line_length = 120
 
 [export.rename]
 "Solver" = "kahlnws_solver"
+"Network" = "kahlnws_network"
 "Problem" = "kahlnws_problem"
 "StatusCode" = "kahlnws_status"
 "Int128" = "kahlnws_int128"

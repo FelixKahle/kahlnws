@@ -4,9 +4,10 @@
 //! The model the tree's tests check against: a rooted tree as each node's parent and the link it hangs by, with every
 //! column a threaded tree derives recomputed from those alone by loops over explicit stacks.
 //!
-//! It knows two changes of a tree, each stated by its parent links: the stem reversed and the entering end hung under
-//! the other end; and the prune, in which the nodes told to hang from the root do so by their root links. It knows
-//! nothing of threads being cut and spliced, so it shares no reasoning with the tree's own updates.
+//! It knows three changes of a tree, each stated by its parent links: the stem reversed and the entering end hung under
+//! the other end; one node hung from the root by its root link, which is a cut, or the turn of a node already there;
+//! and the prune, in which the nodes told to hang from the root do so in turn. It knows nothing of threads being cut
+//! and spliced, so it shares no reasoning with the tree's own updates.
 
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -168,10 +169,22 @@ impl PlainTree {
 
         for (node, &decision) in decisions.iter().enumerate() {
             if let Decision::Root(direction) = decision {
-                tree.parents[node] = root;
-                tree.hangings[node] = (link_count - root + node, direction);
+                tree = tree.hung_from_root(node, direction, link_count);
             }
         }
+
+        tree
+    }
+
+    /// The tree after `node`, below the root of a tree of `link_count` links, hangs from the root by its root link
+    /// `link_count − n + node`, running `direction`, with its subtree: a cut where it hung from another node; where it
+    /// hung from the root already, it keeps its place, a turn where it hung by that link the other way. Every other
+    /// node keeps its parent and its link.
+    pub(super) fn hung_from_root(&self, node: usize, direction: Direction, link_count: usize) -> Self {
+        let root = self.root();
+        let mut tree = self.clone();
+        tree.parents[node] = root;
+        tree.hangings[node] = (link_count - root + node, direction);
 
         tree
     }
@@ -428,6 +441,22 @@ mod tests {
         let turned = tree.pruned(&[Decision::Root(down), Decision::Stay, Decision::Stay], 6);
         assert_eq!((turned.parents, turned.hangings[0]), (vec![3, 0, 1, 3], (3, down)));
         assert_eq!(tree.pruned(&[Decision::Stay; 3], 6), tree);
+    }
+
+    #[test]
+    fn test_a_node_hung_from_the_root_takes_its_subtree_or_turns_by_hand() {
+        // Five nodes and twelve links: the root links are 7 to 11. Node 3, under the root with 1 and 4 below it and 0
+        // below 1: node 1 cut takes 0 with it; node 3 turned down keeps its subtree and its place.
+        let tree = five_nodes();
+        let cut = tree.hung_from_root(1, Direction::Down, 12);
+        assert_eq!(cut.parents, [1, 5, 5, 5, 3, 5]);
+        assert_eq!(cut.hangings[1], (8, Direction::Down));
+        assert_eq!((cut.subtree(1), cut.subtree(3)), (vec![1, 0], vec![3, 4]));
+        assert_eq!([0, 2, 3, 4].map(|node| cut.hangings[node]), [0, 2, 3, 4].map(|node| tree.hangings[node]));
+
+        let turned = tree.hung_from_root(3, Direction::Down, 12);
+        assert_eq!((turned.parents.as_slice(), turned.hangings[3]), (&tree.parents[..], (10, Direction::Down)));
+        assert_eq!(turned.hung_from_root(3, Direction::Up, 12).hangings[3], (10, Direction::Up));
     }
 
     #[test]

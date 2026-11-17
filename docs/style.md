@@ -30,8 +30,8 @@ established, and the hot code relies on it.
 - **Ids are newtypes.** Every kind of id has its own type, a `usize` newtype, and a table keyed by an id is a
   `TiVec<Id, T>`, so one id cannot index another table. A narrower id carries a measured reason in its documentation,
   and its `From<usize>` is written by hand and panics, under `#[track_caller]` and `# Panics`, where a value does not
-  fit. A quantity becomes a newtype where it carries an invariant,
-  could be confused with another quantity of the same primitive, or has a unit.
+  fit. A quantity becomes a newtype where it carries an invariant, could be confused with another quantity of the same
+  primitive, or has a unit.
 - **One fact, one place.** A field exists only if no other field implies it.
 - **Plain data stays plain.** A record without an invariant has public fields and no getters, setters or
   constructors that only set fields. A record with an invariant across its fields keeps them private behind one
@@ -145,8 +145,8 @@ never silenced with `#[allow]` to get a build through; a real false positive or 
 
 ## Manifests and dependencies
 
-- Edition 2024, resolver 3, `rust-version` pinned to the stable toolchain in use, `publish = false` unless a crate is
-  meant for a registry.
+- Edition 2024, resolver 3, no `rust-version`: the workspace builds with a current stable toolchain. `publish = false`
+  unless a crate is meant for a registry.
 - The standard library first, then an established crate that is widely used and has no open soundness issue, and code
   of one's own last; the error-prone parts (parsing, printing, rounding, exact arithmetic) are never hand-written.
 - Every external dependency is declared once in `[workspace.dependencies]`, with a comment saying what it is for,

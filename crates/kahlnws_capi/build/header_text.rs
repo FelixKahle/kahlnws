@@ -26,7 +26,7 @@ pub(crate) const PREAMBLE: &str = "\
 
 /**
  * @def KAHLNWS_NODISCARD
- * @brief Marks a function whose answer, a status or a solver, must not be ignored.
+ * @brief Marks a function whose answer, a status or a handle, must not be ignored.
  *
  * It is the standard attribute under C23 and C++17, the compiler's own under GCC and Clang, nothing otherwise. It
  * follows KAHLNWS_API, after which a standard attribute cannot stand, so it takes the standard form only where

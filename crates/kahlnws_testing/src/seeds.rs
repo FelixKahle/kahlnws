@@ -24,11 +24,11 @@ const TIE_BREAK_MOST: u64 = (1 << 12) - 1;
 /// A family of the benchmark suites' min-cost networks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
-    /// The supply shape, [`supply_sized`](crate::supply_sized); the size is the number of demands.
+    /// The supply shape, [`supply_sized`]; the size is the number of demands.
     Supply,
-    /// The assignment shape, [`assignment_sized`](crate::assignment_sized); the size is the number of demands.
+    /// The assignment shape, [`assignment_sized`]; the size is the number of demands.
     Assignment,
-    /// The square grid with costs, [`costed_grid`](crate::costed_grid); the size is the side.
+    /// The square grid with costs, [`costed_grid`]; the size is the side.
     Grid,
 }
 
